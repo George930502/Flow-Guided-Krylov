@@ -64,5 +64,7 @@ Thumbs.db
 
 # Temporary files
 *.tmp
-*.temppapers/
+*.temp
+
+papers/
 AGENTs.md
