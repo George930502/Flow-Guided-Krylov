@@ -1,0 +1,159 @@
+\ProvidesPackage{jefferymath}
+
+\usepackage{amssymb, amsthm}
+\usepackage{asymptote}
+\usepackage{braket}
+\usepackage{float}
+\usepackage{mathtools} % includes amsmath
+\usepackage{qcircuit}
+\usepackage{tikz-cd}
+\usepackage{xparse}
+
+\usetikzlibrary{calc, decorations.markings}
+
+\def\normal{\triangleleft}
+\def\normaleq{\trianglelefteq}
+
+\DeclareMathOperator{\Ai}{Ai}
+\DeclareMathOperator{\Ann}{Ann}
+\DeclareMathOperator{\Bi}{Bi}
+\DeclareMathOperator{\Aut}{Aut}
+\DeclareMathOperator{\Cl}{Cl}
+\DeclareMathOperator{\coker}{coker}
+\DeclareMathOperator{\disc}{disc}
+\DeclareMathOperator{\dom}{dom}
+\DeclareMathOperator*{\EE}{\mathbb{E}}
+\DeclareMathOperator{\End}{End}
+\DeclareMathOperator{\Ext}{Ext}
+\DeclareMathOperator{\Frac}{Frac}
+\DeclareMathOperator{\Gal}{Gal}
+\DeclareMathOperator{\GL}{GL}
+\DeclareMathOperator{\Hom}{Hom}
+\DeclareMathOperator{\im}{im}
+\DeclareMathOperator{\Li}{Li}
+\DeclareMathOperator{\lcm}{lcm}
+\DeclareMathOperator{\nil}{nil}
+\DeclareMathOperator{\ord}{ord}
+\DeclareMathOperator{\Pol}{Pol}
+\DeclareMathOperator{\poly}{poly}
+\DeclareMathOperator{\Res}{Res}
+\DeclareMathOperator{\rad}{rad}
+\DeclareMathOperator{\res}{res}
+\DeclareMathOperator{\sgn}{sgn}
+\DeclareMathOperator{\sh}{sh}
+\DeclareMathOperator{\Sing}{Sing}
+\DeclareMathOperator{\SL}{SL}
+\DeclareMathOperator{\SO}{SO}
+\DeclareMathOperator{\Spec}{Spec}
+\DeclareMathOperator{\Supp}{Supp}
+\DeclareMathOperator{\Texp}{Texp}
+\DeclareMathOperator{\Tor}{Tor}
+\DeclareMathOperator{\tr}{tr}
+\DeclareMathOperator{\Tr}{Tr}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\Vol}{Vol}
+
+\newcommand{\CC}{\mathbb{C}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\FF}{\mathbb{F}}
+\newcommand{\half}{\ensuremath{\frac{1}{2}}}
+\newcommand{\hyper}{\!{}^*} 
+\newcommand{\infint}{\int_{-\infty}^\infty}
+\newcommand{\hrr}{\hyper\RR}
+\newcommand{\hnn}{\hyper\NN}
+\newcommand{\NN}{\mathbb{N}}
+\newcommand{\nullset}{\varnothing}
+\newcommand{\QQ}{\mathbb{Q}} %TODO fix old files with \Q instead of \QQ
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\RP}{\mathbb{RP}}
+\newcommand{\ZZ}{\mathbb{Z}}
+
+\DeclarePairedDelimiter{\dpdparens}{\lparen}{\rparen}
+\DeclarePairedDelimiter{\dpdbracks}{\lbrack}{\rbrack}
+\DeclarePairedDelimiter{\dpdbraces}{\lbrace}{\rbrace}
+
+\NewDocumentCommand{\parens}{s o m} {
+	\IfBooleanTF{#1}
+	{\dpdparens{#3}} %star = no resize
+	{\IfNoValueTF{#2} {\dpdparens*{#3}} {\dpdparens[#2]{#3}}}
+}
+
+\NewDocumentCommand{\bracks}{s o m} {
+	\IfBooleanTF{#1}
+	{\dpdbracks{#3}} %star = no resize
+	{\IfNoValueTF{#2} {\dpdbracks*{#3}} {\dpdbracks[#2]{#3}}}
+}
+
+\NewDocumentCommand{\braces}{s o m} {
+	\IfBooleanTF{#1}
+	{\dpdbraces{#3}} %star = no resize
+	{\IfNoValueTF{#2} {\dpdbraces*{#3}} {\dpdbraces[#2]{#3}}}
+}
+
+\newcommand{\abs}[1]{\left\lvert#1\right\rvert}
+\newcommand{\angles}[1]{\left\langle#1\right\rangle}
+\newcommand{\cbrt}[1]{\sqrt[3]{#1}}
+\newcommand{\ceil}[1]{\left\lceil#1\right\rceil}
+\newcommand{\floor}[1]{\left\lfloor#1\right\rfloor}
+\newcommand{\inner}[2]{\left\langle#1,#2\right\rangle}
+\newcommand{\legendre}[2]{\left(\frac{#1}{#2}\right)}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+%\newcommand{\span}[1]{\operatorname{span}\left{#1\right}} %\span is primitive used for \multicolumn
+
+% complexity classes
+\newcommand{\cc}[1]{\mathsf{#1}}
+\newcommand{\BQP}{\cc{BQP}}
+\newcommand{\BPP}{\cc{BPP}}
+\newcommand{\EQP}{\cc{EQP}} % exact quantum polynomial... TODO maybe remove?
+\newcommand{\EXP}{\cc{EXP}}
+\newcommand{\IP}{\cc{IP}}
+\newcommand{\MIP}{\cc{MIP}}
+\newcommand{\NEXP}{\cc{NEXP}}
+\newcommand{\NP}{\cc{NP}}
+\newcommand{\PCP}{\cc{PCP}}
+\newcommand{\PSPACE}{\cc{PSPACE}}
+\newcommand{\QCMA}{\cc{QCMA}}
+\newcommand{\QIP}{\cc{QIP}}
+\newcommand{\QMA}{\cc{QMA}}
+
+\newcommand{\dyad}[1]{\ket{#1}\!\bra{#1}} 
+\NewDocumentCommand{\ev}{o m g} { %expectation, want optional to be sizing?
+	\IfNoValueTF{#3} 
+	{\Braket{#2}}
+	{\Braket{#3|#2|#3}}
+}
+\NewDocumentCommand{\mel}{m m m}{\Braket{#1|#2|#3}}
+
+\NewDocumentCommand{\ddelta}{g} { % delta in place of differential
+	\IfNoValueTF{#1}
+	{\delta}
+	{\mathop{\delta{#1}}}
+}
+
+\newcommand{\diffd}{\mathop{}\mathrm{d}} % differential symbol
+\NewDocumentCommand{\dd}{o g} { % differential, optional for power
+	\IfNoValueTF{#2}
+	{\diffd\IfNoValueTF{#1}{}{^{#1}}} % backwards compatible for old \dd
+	{\mathinner{\diffd\IfNoValueTF{#1}{}{^{#1}}{#2}}}
+}
+\NewDocumentCommand{\dv}{o m g} { % derivative, optional argument for power
+	\IfNoValueTF{#3}
+	{\frac{\diffd\IfNoValueTF{#1}{}{^{#1}}}{\diffd{#2}\IfNoValueTF{#1}{}{^{#1}}}}
+	{\frac{\diffd\IfNoValueTF{#1}{}{^{#1}}{#2}}{\diffd{#3}\IfNoValueTF{#1}{}{^{#1}}}}
+}
+\NewDocumentCommand{\pdv}{o m g} { % partial derivative, optional argument for power
+	\IfNoValueTF{#3}
+	{\frac{\partial\IfNoValueTF{#1}{}{^{#1}}}{\partial{#2}\IfNoValueTF{#1}{}{^{#1}}}}
+	{\frac{\partial\IfNoValueTF{#1}{}{^{#1}}{#2}}{\partial{#3}\IfNoValueTF{#1}{}{^{#1}}}}
+}
+%\newcommand{\pdv}[1]{\frac{\partial}{\partial#1}} TODO look into expanddocumentcommand for pdv??
+
+\newcommand{\pmat}[1]{\begin{pmatrix}#1\end{pmatrix}}
+\newcommand{\bmat}[1]{\begin{bmatrix}#1\end{bmatrix}}
+
+%\renewcommand{\AA}{\mathbb{A}} %default AA is A with circ on top like angstrom?
+\newcommand{\grad}{\nabla}
+\renewcommand{\Im}{\operatorname{Im}} %default is fancy script I and R
+\renewcommand{\Re}{\operatorname{Re}}
+
+\DeclareTextFontCommand{\todo}{\bfseries\color{red}} %todo remove from child sty files

@@ -1,0 +1,950 @@
+\documentclass[aps,twocolumn,superscriptaddress,longbibliography,notitlepage]{revtex4-2}
+
+
+\usepackage{jefferymath}
+
+\usepackage[english]{babel}
+\usepackage[colorlinks=false,linkcolor=blue,citecolor=red,plainpages=false,pdfpagelabels]{hyperref}
+
+\usepackage{multirow}
+\usepackage{makecell}
+\usepackage{textcomp}
+\usepackage{url}
+\usepackage{tcolorbox}
+
+\usepackage{lmodern}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{latexsym}
+\usepackage{mathtools}
+\usepackage{siunitx}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\hypersetup{pdfpagemode=UseNone}
+\frenchspacing
+\usepackage[capitalise]{cleveref}
+
+\usepackage{amsthm}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{example}{Example}
+
+\newcommand{\tg}[1]{\begin{tcolorbox}{}
+	#1
+\end{tcolorbox}}
+
+\newcommand{\tre}[1]{\begin{tcolorbox}[colback=gray!10!white,colframe=red!45!black]#1			
+\end{tcolorbox}}
+
+\newcommand{\note}[1]{\textcolor{magenta}{#1}}
+\newcommand{\minh}[1]{{\color{red} [Minh: #1] }}
+\newcommand{\kunal}[1]{{\color{magenta} [Kunal: #1]}}
+\newcommand{\wk}[1]{{\color{blue} [WK: #1]}}
+\newcommand{\jr}[1]{{\color{purple} [J: #1]}}
+
+
+
+\begin{document}
+
+
+\title{Sample-based Krylov Quantum Diagonalization}
+
+
+\author{Jeffery Yu}
+\email{jey@umd.edu}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\affiliation{Joint Center for Quantum Information and Computer Science, NIST/University of Maryland,
+College Park, Maryland 20742, USA}
+\affiliation{Joint Quantum Institute, NIST/University of Maryland,
+College Park, Maryland 20742, USA}
+\author{Javier~Robledo~Moreno}
+\email{j.robledomoreno@ibm.com}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\author{Joseph Iosue}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\affiliation{Joint Center for Quantum Information and Computer Science, NIST/University of Maryland,
+College Park, Maryland 20742, USA}
+\affiliation{Joint Quantum Institute, NIST/University of Maryland,
+College Park, Maryland 20742, USA}
+\author{Luke Bertels}
+\affiliation{Quantum Information Science Section, Oak Ridge National Laboratory, Oak Ridge, TN, 37831, USA}
+\author{Daniel~Claudino
+}
+\affiliation{Quantum Information Science Section, Oak Ridge National Laboratory, Oak Ridge, TN, 37831, USA}
+\author{Bryce~Fuller}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\author{Peter~Groszkowski
+}
+\affiliation{National Center for Computational Sciences, Oak Ridge National Laboratory, Oak Ridge, TN, USA}
+\author{Travis~S~Humble
+}
+\affiliation{Oak Ridge National Laboratory, Oak Ridge, Tennessee, USA}
+\author{Petar~Jurcevic}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\author{William Kirby}
+\affiliation{IBM~Quantum,~IBM~Research~Cambridge,~Cambridge,~MA~02142,~USA}
+\author{Thomas A. Maier}
+\affiliation{Computational~Sciences~and~Engineering~Division,~Oak~Ridge~National~Laboratory,~Oak Ridge,~Tennessee~37831,~USA}
+\author{Mario Motta}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\author{Bibek~Pokharel}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\author{Alireza Seif}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\author{Amir Shehata
+}
+\affiliation{Oak Ridge National Laboratory, Oak Ridge, Tennessee, USA}
+\author{Kevin~J.~Sung}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\author{Minh C. Tran}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\author{Vinay Tripathi}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\author{Antonio~Mezzacapo}
+\email{mezzacapo@ibm.com}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+\author{Kunal Sharma}
+\email{kunals@ibm.com}
+\affiliation{IBM~Quantum,~IBM~T.J.~Watson~Research~Center,~Yorktown~Heights,~NY~10598,~USA}
+
+
+
+\begin{abstract}
+Approximating the ground state of many-body systems is a key computational bottleneck underlying important applications in physics and chemistry. It has long been viewed as a promising application for quantum computers. The most widely known quantum algorithm for ground state approximation, quantum phase estimation, is out of reach of current quantum processors due to its high circuit-depths. 
+Quantum diagonalization algorithms based on subspaces represent alternatives to phase estimation, which are feasible for pre-fault-tolerant and early-fault-tolerant quantum computers.
+Here, we introduce a quantum diagonalization algorithm which combines two key ideas on quantum subspaces: a classical diagonalization based on quantum samples, and subspaces constructed with quantum Krylov states.
+We prove that our algorithm converges in polynomial time under the working assumptions of Krylov quantum diagonalization and sparseness of the ground state.
+We then show numerical investigations of lattice Hamiltonians, which indicate that our method can outperform existing Krylov quantum diagonalization in the presence of shot noise, making our approach well-suited for near-term quantum devices.
+Finally, we carry out the largest ground-state quantum simulation of the single-impurity Anderson model on a system with $41$ bath sites, using $85$ qubits and up to $6 \cdot 10^3$ two-qubit gates on a Heron quantum processor, showing excellent agreement with density matrix renormalization group calculations.
+\end{abstract}
+
+
+\maketitle
+
+
+\section{Introduction}
+
+A significant bottleneck for many computations in physics and chemistry is the efficient estimation of the low-energy spectrum of quantum systems. Fault-tolerant quantum algorithms for this task have been widely touted with the potential to offer advantage over classical methods. The most well-known, quantum phase estimation, requires deep quantum circuits and cannot be executed on pre-fault-tolerant devices~\cite{kitaev1995quantum}.
+An alternative with short-depth circuits, the variational quantum eigensolver~\cite{peruzzo2014variational} requires parametric optimization and stochastic estimation of complex observables, which limits their scaling because of prohibitive runtime connected to the large number of measurements~\cite{wecker2015progress, cerezo2021variational, larocca2024review}.
+Thus, new algorithms are needed for efficiently estimating the spectral properties of physical systems on current quantum computers.
+
+Quantum diagonalization methods based on subspaces have emerged as promising algorithms for estimating spectral properties on pre-fault-tolerant devices~\cite{mcclean2017subspace,parrish2019quantum,motta2020qite_qlanczos,klymko2022realtime,Epperly_2022,shen2023realtimekrylov,yang2023dualgse,yang2023shadow,ohkura2023leveraging,kanno2023quantum,ibm2024chemistry,yoshioka2024diagonalization,motta2023subspace,oumarou2025molecular}. So far, these techniques have allowed scaling of experiments beyond what was possible with variational methods. An experimental implementation of Krylov quantum diagonalization (KQD) was shown on quantum many-body systems of up to 56 spins~\cite{yoshioka2024diagonalization}. KQD involves constructing a subspace by time-evolving a reference state over various time intervals, then classically diagonalizing the Hamiltonian within the corresponding subspace.
+An advantage of this approach is that convergence is guaranteed if one starts with a state which has a polynomial overlap with the ground state, similar to phase estimation. On the other hand, unlike phase estimation, it possesses analytic error bounds even in the presence of noise on the quantum device~\cite{Epperly_2022,kirby2024analysis} and relies on running circuits to simulate quantum dynamics, which can be executed to sizes beyond exact classical solutions~\cite{kim2023evidence,shinjo2024unveiling}.
+
+Subspace algorithms based on individual quantum samples~\cite{kanno2023quantum,ibm2024chemistry, kaliakin2024supramolecular,barison2024ext-sqd,liepuoniute2024triplet,shajan2024SQD-DMET} approximate ground state energies by sampling from a quantum state and performing classical error mitigation and diagonalization in quantum-centric supercomputing environments~\cite{alexeev2023quantum}. Unlike KQD, these sample-based quantum diagonalizations (SQD) do not require time-evolution circuits, making it an appealing approach for chemistry Hamiltonians with a large number of terms. These ideas have been experimentally demonstrated for molecular electronic structure up to sizes not amenable to exact diagonalization~\cite{ibm2024chemistry}. 
+
+
+It is a natural to think of unifying the two frameworks, leveraging the strengths of the KQD and SQD approaches. We call this unified approach \emph{sample-based Krylov quantum diagonalization}~(SKQD), and show that inherits the noise-resistance properties and convergence guarantees.
+
+
+This paper is structured as follows. In \cref{msec:background}, we summarize the Krylov and sample-based quantum diagonalization approaches. We then prove a convergence result of SKQD in \cref{msec:ksqsd-proof}, showing that under the sparsity assumptions for the ground state and given a reference state with polynomial overlap, one can approximate the ground state energy in polynomial time.
+We then numerically study the convergence with respect to the number of measurements with lattice Hamiltonians, finding that SKQD can outperform KQD in the presence of shot noise. 
+Finally, we present experimental results obtained on quantum processors in \cref{msec:ksqsd-experiments}. We compute ground state energies of a single-impurity Anderson model (SIAM)~\cite{Anderson1961} with 41 bath sites (42 electrons in 42 orbitals), simulated using 85 qubits and up to $6 \cdot 10^3$ two-qubit gates to prepare Krylov states. We show excellent agreement between SQKD and Density Matrix Renormalization Group (DMRG)~\cite{white1992DMRG1, white1993DMRG, white2005DMRG} calculations, on system sizes not amenable to exact diagonalization. 
+
+
+\section{Background}\label{msec:background}
+
+
+Let $H$ denote the Hamiltonian of a system of $n$ qubits, acting on an $N = 2^n$-dimensional Hilbert space. We are interested in approximating the ground-state energy of $H$. Let $\ket{\psi_0}$ denote an initial (reference) state. The quantum Krylov subspace $\mathcal{S}$ is generated by the time-evolved states 
+\begin{equation}\label{meq:krylov-basis}
+\ket{\psi_k} \coloneq e^{-ik H \Delta{t}} \ket{\psi_0},
+\end{equation}
+where $k \in \{0, 1, \dots, d-1\}$ and $\Delta{t}$ is a chosen time step. This construction reduces the exponentially large $N$-dimensional Hilbert space to a subspace of dimension~$d$. By projecting the Hamiltonian onto $\mathcal{S}$, we get the following generalized eigenvalue problem:
+\begin{equation}
+\label{eq:gen-eig}
+\mathbf{\widetilde{H}} v = \widetilde{E} \mathbf{\widetilde{S}} v,
+\end{equation}
+where $v$ is a coordinate vector corresponding to the state ${\ket{\widetilde\phi}=\sum_{k=0}^{d-1} v_k\ket{\psi_k} \in \mathcal{S}}$, and 
+\begin{equation}
+\label{eq:gen-eig-mats}
+\mathbf{\widetilde{H}}_{jk} \coloneq \braket{\psi_j | H | \psi_k}, \qquad \mathbf{\widetilde{S}}_{jk} \coloneq \braket{\psi_j | \psi_k}.
+\end{equation}
+
+Let $E_0 \le E_1 \le \dots \le E_{N-1}$ denote eigenvalues of $H$ with corresponding orthonormal eigenstates $\ket{\phi_0}, \dots, \ket{\phi_{N-1}}$. Let $\Delta E_j = E_j - E_0$ for each $0<j<N$ and let $\ket{\psi_0} = \sum_{k=0}^{N-1}\gamma_k \ket{\phi_k}$ be the eigenstate decomposition of the initial state. Let $\widetilde{E}$ denote the ground-state energy approximation obtained from the Krylov quantum subspace approach. From the results of Epperly \emph{et al.} in~\cite{Epperly_2022}, it follows that in the ideal, noise-free case, $0\leq \widetilde{E}-E_0 \leq \varepsilon$, for 
+\begin{align}\label{meq:eps-kqd}
+    \varepsilon = 8 \Delta E_{N-1} \left(\frac{1 - \abs{\gamma_0}^2}{\abs{\gamma_0}^2}\right) \parens{1 + \frac{\pi \Delta E_1}{\Delta E_{N-1}}}^{-(d-1)},
+\end{align}
+where $|\gamma_0|^2 = \abs{\braket{\phi_0 | \psi_0}}^2$ denotes the overlap of the initial state $\ket{\psi_0}$ with the true ground state $\ket{\phi_0}$. This assumes that the timestep in \cref{meq:krylov-basis} is chosen as $\Delta t = \pi/\Delta E_{N-1}$. 
+
+If the initial state has a nontrivial ground-state overlap $\abs{\gamma_0}^2 = \Theta(1)$, and if $H$ has a well-behaved spectrum (i.e., $\Delta E_{N-1}$ not growing too quickly and $\Delta E_1$ not too small), then a constant error $\varepsilon$ as in \cref{meq:eps-kqd} in approximating the ground-state energy can be achieved by setting $d = O(\log(1/\varepsilon))$ (see~\cref{sec:kqd} for a review of this analysis).  
+Moreover, for an analysis of noisy KQD, we refer readers to~\cite{Epperly_2022,kirby2024analysis}. 
+
+We now summarize the SQD framework for approximating ground-state energies, analyzing its behavior against a notion of sparsity of the ground state $\ket{\phi_0}$ of $H$.
+We define sparsity as follows
+\begin{definition}[$(\alpha_L, \beta_L)$-sparsity]
+\label{def:concentration}
+For any state $\ket{\psi}$, let
+\begin{equation}
+    \ket{\psi} = \sum_{j=1}^Ng_j\ket{b_j},
+\end{equation}
+where $(b_1, \dots, b_N)$ is some ordering of length-$N$ bitstrings such that $|g_1|\geq |g_2|\geq \cdots |g_N|$.
+We say that $\ket{\psi}$ exhibits \emph{$(\alpha_L, \beta_L)$-sparsity} on $\ket{b_1}$ through $\ket{b_L}$ if
+\begin{equation}
+    \sum_{j=1}^L |g_j|^2 \geq \alpha_L
+\end{equation}
+and
+\begin{equation}
+    |g_1|^2, \dots, |g_L|^2 \geq \beta_L.
+\end{equation}
+\end{definition}
+
+
+Let $L$ be the smallest possible integer and $\alpha_L^{(0)}, \beta_L^{(0)}$ be the largest possible parameters such that the ground state $\ket{\phi_0}$ exhibits $(\alpha_L^{(0)}, \beta_L^{(0)})$-sparsity.
+If one can prepare a good approximation of the ground state such that all \( L \) bitstrings \( \ket{b_1}, \dots, \ket{b_L} \) can be sampled with high probability, then \(H\) can be represented in the subspace spanned by \( \{\ket{b_j}\}_{j=1}^L \), yielding a projected matrix \(\widehat{\mathbf{H}}\). By classically diagonalizing \(\widehat{\mathbf{H}}\), we obtain an approximation of \(E_0\). In \cite{ibm2024chemistry}, it was shown that using this approach, one can approximate \(E_0\) with an additive error of up to \(\varepsilon' = 2\sqrt{2}\Vert H \Vert \left(1-\sqrt{\alpha_L^{0}}\right)^{1/2}\) and a success probability of at least \(1-\eta\), provided that the number of samples obtained from the state exceeds \(2/\beta^{(0)}_L \log(1/\eta)\).
+
+The KQD approach can achieve good accuracy in estimating the ground-state energy, provided the initial state has a nontrivial overlap with $\ket{\phi_0}$ and the spectrum of $H$ is well-behaved. However, this approach requires estimating the matrix elements of $\widetilde{\mathbf{H}}$ and $\mathbf{\widetilde{S}}$, as defined in \cref{eq:gen-eig-mats}, necessitating $O(1/\epsilon^2)$ samples to achieve error $\epsilon$, 
+and additional sample overhead for noise mitigation. While these challenges do not rule out near-term implementation, as shown by~\cite{yoshioka2024diagonalization}, finding ways to circumvent them is clearly desirable. On the other hand, the SQD approach is more natural for near-term devices, but is constrained to situations where the ground state is sparse and one can prepare a good approximation of it, or at least for its approximate support in the computational basis.
+
+
+\section{Sample-based Krylov Quantum Diagonalization}
+\label{msec:ksqsd-proof}
+
+In the SKQD approach, Krylov basis states in Eq.(\ref{meq:krylov-basis}) are prepared on a quantum device and samples are obtained from them in the computational basis. Then, a target Hamiltonian $H$ is projected and diagonalized in the subspace spanned by the sampled bitstrings, to approximate its ground-state energy.
+
+The requirement for convergence of SKQD is an initial state with $1/\text{poly}(n)$ overlap with the ground state, as in phase estimation, together with a sparse ground state. The only quantum computational resources required are approximate time evolutions and sampling in the computational basis.
+
+
+We prove the convergence as follows. We begin with the sparsity assumption for ground states. Let the ground state $\ket{\phi_0}$ of $H$ exhibits $(\alpha_L^{(0)}, \beta_L^{(0)})$-sparsity, in the sense of \cref{def:concentration}. 
+In this work, we assume the ground state is sparse in the sense that $L = \mathcal{O}(\poly(n))$. We provide a comparison of our sparsity assumption with those proposed in \cite{bravyi2024classical, aaronson2024verifiable} in \cref{sec:app-sparsity-notions}. To implement our approach, we proceed as follows: for each $k \in \{0, 1, \dots, d-1\}$ in \cref{meq:krylov-basis}, we prepare $M = \mathcal{O}(\poly(n))$ copies of the state $\ket{\psi_k}$ and measure each in the computational basis to obtain a sequence of bitstrings $\{a_{km}~|~m=0,1,\dots,M-1\}$. We then classically project $H$ into the subspace spanned by
+\begin{equation}
+    B_{d,M}=\{\ket{a_{km}}~|~k=0,\dots,d-1; m=0,\dots,M-1\},
+\end{equation}
+as in SQD, and denote the resulting matrix as $\widehat{\mathbf{H}}$. Finally, we solve the eigenvalue problem for $\widehat{\mathbf{H}}$, which is of polynomial size and thus can be computed classically. 
+
+To ensure that our approach~--- sampling directly from the Krylov basis states~--- yields a good approximation of $E_0$ with high probability, we prove several key results.
+The proofs themselves are given in \cref{sec:kqd,app:proofs}; here we summarize the main ideas.
+First, we show that if the KQD method achieves an additive error $\varepsilon$ in the energy as in \cref{meq:eps-kqd}, then the error in the corresponding approximate ground state $\ket{\widetilde\phi}$ is
+\begin{equation}
+\label{eq:state_diff}
+    {\norm{\ket{\widetilde\phi} - \ket{\phi_0}}^2 \leq \tilde{\varepsilon} = O\left(\frac{\varepsilon}{\Delta E_1}\right)}.
+\end{equation}
+Next, we show that if the true ground state $\ket{\phi_0}$ exhibits $(\alpha_L^{(0)}, \beta_L^{(0)})$-concentrated, then $\ket{\widetilde\phi}$ also exhibits $(\alpha_L, \beta_L)$-sparsity, with
+\begin{equation}
+\label{eq:alpha_L_beta_L}
+    \alpha_L = \alpha_L^{(0)} - 2 \sqrt{\tilde{\varepsilon} },\quad \beta_L = \beta_L^{(0)} - 2 \sqrt{\tilde{\varepsilon} }.
+\end{equation}
+
+We denote the set of important bitstrings defining the ground state as $B = \{|b_i\rangle\}_{i=1}^L$, where a bitstring’s importance is determined by $|g_i|$, as defined in \cref{def:concentration}. We prove that each bitstring in $B$ has overlap proportional to $|\gamma_0|^2$ with at least one of the Krylov basis states.
+We express each $\ket{\psi_k}$ in the computational basis as $
+\ket{\psi_k} = \sum_{j=1}^N c^{(k)}_j \ket{b_j}$.
+Assume that ${\ket{\widetilde\phi} = \sum_{k=0}^{d-1} d_k \ket{\psi_k}}$, where $\ket{\psi_k}$ is defined in \cref{meq:krylov-basis} and $|d_k| \leq \frac{1}{|\gamma_0|}$ for each $k=0,1,...,d-1$ (note that the latter condition is nontrivial because the $\ket{\psi_k}$ are nonorthogonal, so the squared norms of the $d_k$ need not sum to unity).
+We then show that for each $1 \leq j \leq L$, there exists some $k$ such that
+\begin{equation}
+    |c^{(k)}_j|^2 \geq \frac{|\gamma_0|^2 \beta_L}{d^2},
+\end{equation}
+where one should note that $\beta_L$ also depends on $d$ via \cref{eq:state_diff,eq:alpha_L_beta_L} and the fact that the error $\varepsilon$ from KQD converges with increasing $d$.
+Thus, one can efficiently obtain the $L$ important bitstrings by sampling from Krylov basis states, provided the initial state $\ket{\psi_0}$ has overlap $|\gamma_0|^2 \in \mathcal{O}($1/\text{poly}(n))$ $ with the exact ground state.
+
+Finally, combining these results, we prove the following theorem:
+
+\begin{theorem}\label{mthm:skqd-thm}
+Let $H$ be a Hamiltonian whose ground state $\ket{\phi_0}$ exhibits $(\alpha_L^{(0)}, \beta_L^{(0)})$-sparsity.
+Let $\ket{\widetilde\phi}$ be the lowest energy state supported on the $L$ important bitstrings in $\ket{\phi_0}$.
+The error in estimating the ground state energy of $H$ is bounded by
+\[
+\braket{\widetilde\phi | H | \widetilde\phi} - \braket{\phi_0 | H | \phi_0} \leq \sqrt{8} \norm{H} 
+\left(1 - \sqrt{\alpha_L^{(0)}}\right)^{1/2},
+\]
+provided all $L$ important bitstrings are sampled. The success probability of sampling all $L$ important bitstrings is at least $1 - \eta$ as long as the number of samples from each Krylov basis state exceeds $\left(d^2 \log(L/\eta)\right)/\left(|\gamma_0|^2 (\beta_L^{(0)} - 2\sqrt{\tilde{\varepsilon}})\right)$, where
+\[
+\tilde{\varepsilon} = 2-2\sqrt{1-\varepsilon/\Delta E_1}
+\]
+with $\varepsilon$ defined in \cref{meq:eps-kqd}.
+\end{theorem}
+
+Thus, our algorithm can approximate the ground state energy of $H$ accurately, as long as the sparsity parameter $\alpha_L^{(0)}$ is close to one. Additionally, the number of samples required to find all $L$ important bitstrings is inversely proportional to $|\gamma_0|^2$, a requirement similar to the KQD method, as discussed in \cref{msec:background}. 
+To establish an insight on the practical performance of SKQD, we first showcase numerical simulations on a lattice model. These simulations use the shifted Krylov space given by \cref{eq:krylov-basis-shifted} and the usual $\Delta{t} = \pi/\Delta{E_{N-1}}$ in the context of \cref{thm:krylov}.
+
+We consider a perturbed transverse field Ising model
+\begin{equation}
+\label{eq:ising}
+H = -\sum_{j=1}^{n-1} Z_j Z_{j+1} - h_1 \sum_{j=1}^n X_j - h_2 Z_1.
+\end{equation}
+When $h_1 = h_2 = 0$, the ground states are spanned by the bitstrings $\ket{0^n}$ and $\ket{1^n}$. A positive $h_2$ breaks the degeneracy in favor for $\ket{0^n}$. In \cref{sec:sparsity-ising}, for $h_1 = h$ and $h_2=0$, we show that if $h = O((k/n)^a)$ for any $a > 1/2$, then the ground state of $H_n(h)$ is fully supported on $O(n^k)$ bitstrings.
+
+
+\begin{figure}[t]
+\leavevmode\centering
+\includegraphics[width=\columnwidth]{ising-h01-single}
+\caption{\textbf{Comparison of SKQD and KQD methods.} For a perturbed transverse field Ising model Hamiltonian $H$ with equal transverse field and perturbation $h_1 = h_2 = 0.1$, and initial state $\ket{\chi_0} = \ket{0^n}$, the SKQD approach (markers) achieves lower error compared to the standard KQD method. We evaluate the SKQD approach with varying numbers of samples measured per Krylov state, denoted by $M$, and set the number of Krylov basis states to $d=15$. In the KQD approach (dashed lines), we incorporate Gaussian noise with a standard deviation of $\frac{1}{\sqrt{M}}$, where $M = 5000$, while estimating matrix elements of $H$.}
+\label{fig:krylov-comparison}
+\end{figure}
+
+
+For our numerical simulations, we use the initial state $\ket{\chi_0} = \ket{0^n}$.  In Figure \ref{fig:krylov-comparison}, we compare the performance of SKQD approach with the standard KQD approach. To ensure a fair comparison, we add a Gaussian noise $\mathcal{N}(0, \frac{1}{\sqrt{M}})$ to each matrix element, as described in \cref{eq:gen-eig-mats}. Let $h_1 = h_2 = 0.1$. We run the SKQD approach for $d=15$ different Kyrlov basis states and for varying numbers of samples from each basis state. We perform simulations with different numbers of qubits, as shown in \cref{fig:krylov-comparison}. We  set $M=5000$ to minimize shot noise in the KQD approach while computing each matrix element. Moreover, we selected the best instance for the SKQD approach from 1000 trials.
+\cref{fig:krylov-comparison} demonstrates that our approach (SKQD) outperforms the standard KQD approach across different numbers of qubits.  Thus, our numerical simulations extend beyond the analytical solutions derived in \cref{msec:ksqsd-proof}, showing that the SKQD approach can outperform the standard KQD approach under the sparsity assumption on the ground states.
+
+\section{Experiments on Quantum Computers}\label{msec:ksqsd-experiments}
+
+We now demonstrate the efficacy of SKQD executed using pre-fault-tolerant quantum processors, for describing ground-state properties of fermionic lattice models. We consider the one-dimensional single-impurity Anderson (SIAM) model~\cite{Anderson1961,wu2022disentanglinginteractingsystemsfermionic, Barzykin1998Anderson, Holtzner2009Anderson}.
+The Hamiltonian of the SIAM model is given by:
+\begin{equation}
+    H = H_{\textrm{imp}}+ H_\textrm{bath} + H_\textrm{hyb} ,
+\end{equation}
+where the impurity Hamiltonian is defined as:
+\begin{equation}
+    H_\textrm{imp} = \varepsilon \left( \hat{n}_{d\uparrow} + \hat{n}_{d\downarrow} \right) + U \hat{n}_{d\uparrow}\hat{n}_{d\downarrow},
+\end{equation}
+the bath Hamiltonian corresponds to a 1D chain of length $L$ with open boundary conditions:
+\begin{equation}\label{eq: bath Ham}
+    H_\textrm{bath} = -t \sum_{\substack{\mathbf{j} = 0\\ \sigma\in \{\uparrow, \downarrow\}}}^{L-1} \left(\hat{c}^\dagger_{\mathbf{j}, \sigma}\hat{c}_{\mathbf{j}+1, \sigma} + \hat{c}^\dagger_{\mathbf{j}+1, \sigma}\hat{c}_{\mathbf{j}, \sigma} \right),
+\end{equation}
+and the hybridization term describes the hopping between the first bath site and the impurity:
+\begin{equation}
+    H_\textrm{hyb} = V\sum_{\sigma \in \{\uparrow, \downarrow \}} \left(\hat{d}^\dagger_\sigma \hat{c}_{0, \sigma} + \hat{c}^\dagger_{0, \sigma} \hat{d}_{\sigma} \right),
+\end{equation}
+where $c^\dagger_{\mathbf{j},\sigma}/c_{\mathbf{j},\sigma}$ are the fermionic creation/annihilation operators for the $\mathbf{j}^{\textrm{th}}$ bath site with spin $\sigma$, $\hat{d}^\dagger_{\sigma}/\hat{d}_{\sigma}$ are creation/annihilation operators for the impurity mode, and $\hat{n}_{d\sigma} = \hat{d}^\dagger_{\sigma} \hat{d}_{\sigma}$. In all cases we choose the Hamiltonian parameters to satisfy $t = -V = 1$ and $\varepsilon = -U/2$ (to maintain particle-hole symmetry in the impurity). We work in the sector of the Fock space corresponding to half-filling with equal number of spin-up and spin-down electrons.
+
+Due to the approximate translational symmetry present in the bath, we do not expect the ground state to be sparse in the position basis (Eq.~\ref{eq: bath Ham}). Since the bath is non-interacting, there exists a single-particle basis transformation that diagonalizes $H_\textrm{bath}$. We refer to the transformed basis as the \textit{momentum basis}, whose fermionic modes are labeled by the sub-index $\mathbf{k}$ :
+\begin{equation}
+    \hat{c}^\dagger_{\mathbf{k}, \sigma} = \sum_{\mathbf{j} = 0}^{L-1} \Xi_{\mathbf{jk}} \hat{c}^\dagger_{\mathbf{j}, \sigma},
+\end{equation}
+where $\mathbf{k} = 0, \hdots, L-1$ and $\Xi\in \mathbb{R}^{L \times L}$ the orthonormal matrix that diagonalizes the $L \times L$ hopping matrix $T$:
+\begin{equation}
+    T = 
+    \begin{bmatrix}
+        0 & -t & 0 & 0 \hdots & 0 \\
+        -t & 0 & -t & 0 \hdots & 0 \\
+        0 & \ddots & \ddots & \ddots & 0 \\
+        0 & \hdots & -t & 0 & -t\\
+        0 & \hdots &  0& -t & 0\\
+    \end{bmatrix}.
+\end{equation}
+Note that while we refer to this basis as the momentum basis, each column in $\Xi$ does not exactly to a basis vector of the discrete Fourier transform in a one-dimensional domain with $L$ points, due to the choice of open boundary conditions. In the momentum basis, the bath and hybridization Hamiltonians take the form:
+\begin{equation}
+    H_\textrm{bath} = \sum_{\substack{\mathbf{k} = 0 \\ \sigma \in \{\uparrow, \downarrow\}}}^{L-1} \varepsilon_\mathbf{k} \hat{n}_{\mathbf{k}, \sigma},
+\end{equation}
+with $\varepsilon_\mathbf{k}$ the eigenvalues of $T$, and:
+\begin{equation}
+    H_\textrm{hyb} =  \sum_{\substack{\mathbf{k} = 0 \\ \sigma \in \{\uparrow, \downarrow\}}}^{L-1} V_{\mathbf{k}} \left(\hat{d}^\dagger_\sigma \hat{c}_{\mathbf{k}, \sigma} + \hat{c}^\dagger_{\mathbf{k}, \sigma} \hat{d}_{\sigma} \right).
+\end{equation}
+With $V_\mathbf{k} = V \cdot \Xi_{0\mathbf{k}} $. Note that the locality of the hybridization term is lost in favor of a sparse representation of the ground state. The effect of the non-locality of the hybridization hopping is reflected in more involved circuits for the time evolution. However, as described in the subsequent sections, an approximate compilation into shallow circuits of Givens rotations is possible. 
+
+Motivated by the observation that the basis that diagonalizes the one-body reduced density matrix yields the set of orbitals in which the wave function is closest to a single Slater determinant, an additional single-particle transformation, defined by the orthonormal $(L+1) \times (L+1)$ matrix with components $\widetilde{\Xi}_{\mathbf{k},p}$, is applied to the Hamiltonian, that block-diagonalizes the 1-body reduced density matrix $\Gamma_{\mathbf{kk}'}$ obtained from an SKQD calculation run in the momentum basis:
+\begin{equation}
+    \hat{a}^\dagger_{p,\sigma} = \widetilde{\Xi}_{d, p} \hat{d}^\dagger_\sigma + \sum_{\mathbf{k} = 0}^{L-1} \widetilde{\Xi}_{\mathbf{k}, p} \hat{c}^\dagger_{\mathbf{k},\sigma}.
+\end{equation}
+The first block contains the impurity mode, the bath $\mathbf{k}$-mode that corresponds to the Fermi level $\mathbf{k}_f$, and the two $\mathbf{k}$-modes surrounding the Fermi level ($\mathbf{k}_f-1$ and $\mathbf{k}_f+1$). The hybridization of the impurity mode with three bath modes turns the two-body onsite interaction onto an off-diagonal interaction term on the impurity mode and the bath modes labeled by $\mathbf{k}_f-1, \mathbf{k}_f, \mathbf{k}_f+1$, and zero otherwise. The second block comprises $\mathbf{k}$-modes  in the Fermi sea excluding the Fermi level and one level below: $\mathbf{k} = 0, \hdots, \mathbf{k}_f-2$. The last block contains the remaining modes in the bath: $\mathbf{k} = \mathbf{k}_f + 2, \hdots, L-1$. This third basis is referred to as $\mathbf{k}$\textit{-adjacent natural orbitals}. The resulting Hamiltonian has the generic form of the interacting-electron Hamiltonian:
+\begin{equation}\label{eq: interacting electron ham}
+    H = \sum_{\substack{p, q \\ \sigma}} h_{pq} \hat{a}^\dagger_{p\sigma} \hat{a}_{q\sigma}  +  \sum_{\substack{p, q, r, s \\ \sigma \tau}} \frac{h_{pqrs}}{2} \hat{a}^\dagger_{p\sigma} \hat{a}^\dagger_{q\tau} \hat{a}_{s\tau} \hat{a}_{r\sigma},
+\end{equation}
+with $p,q,r,s = 0, \hdots, L$. Figure~\ref{fig: impurity bases} depicts the Hamiltonian in the three bases described above, as well as the workflow to go from the position basis to the $\mathbf{k}$-adjacent natural orbitals.
+
+Although the time evolution in the basis of $\mathbf{k}$-adjacent natural orbitals requires much deeper circuits in general, the one- and two-body matrix elements $h_{pq}$ and $h_{pqrs}$ have some structure that is exploited to achieve lower-depth quantum circuits, as described in the following sections.
+
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.99\linewidth]{impurity.pdf}
+\caption{\textbf{SQKD experimental workflow for the ground state of SIAM.} From left to right: the SIAM with a one-dimensional bath geometry, with the corresponding one-body matrix elements of the Hamiltonian $h_{pq}$. The bath is diagonalized by a single-particle change of basis, where the bath modes become approximately plane-wave states with different energies $\varepsilon_\mathbf{k}$. In this basis there are non-zero hopping matrix elements from the impurities to all bath modes, as shown by the $h_{pq}$ colormap. SKQD is run in the momentum basis. The first step is the compilation of the free-fermion time evolution into a shallow circuit of Givens rotations. Then, measurement realizations are collected from the quantum device at each Trotter step, followed by an SQD ground-state estimation that uses the configuration recovery procedure, as introduced in Ref.~\cite{ibm2024chemistry}. The one-body reduced density matrix $\Gamma_{\mathbf{kk}'}$ is used to identify $\mathbf{k}$-adjacent natural orbitals, where the impurity mode is only allowed to be mixed with the bath modes corresponding to $\mathbf{k}_f$ and $\mathbf{k}_f\pm 1$. The resulting Hamiltonian is one where the one-body matrix elements $h_{pq}$ are close to diagonal deep in the Fermi sea and for large values of $\mathbf{k}$, and with off-diagonal two-body matrix elements. SKQD is run in this new basis, requiring the approximate compilation of the free-fermion evolution, and the efficient compilation into a constant-depth circuit of the off-diagonal two-body terms. As in the momentum basis, SQD is run on samples at different time steps using the configuration recovery procedure. }
+\label{fig: impurity bases}
+\end{figure*}
+
+
+We use the Jordan-Wigner~\cite{JordanWigner1928} encoding to map the fermionic degrees of freedom into the quantum processor. As described in Eq.~\ref{meq:krylov-basis}, the quantum computer is in charge of producing states $|\psi_k\rangle = \exp\left(-i k \Delta t H \right) |\psi_0\rangle$, with $k = 0, \hdots, d-1$, and to collect projective measurements in the computational basis. The second-order Trotter-Suzuki decomposition is used to realize each $|\psi_k\rangle$:
+\begin{equation}
+    |\psi_k\rangle \approx \left[e^{-i\frac{\Delta t}{2} H_2} e^{-i\Delta t H_1} e^{-i\frac{\Delta t}{2} H_2} \right]^k\ket{\psi_0},
+\end{equation}
+where $H_1$ and $H_2$ correspond to the one- and two-body terms of the interacting-electron Hamiltonian respectively. 
+
+Since $e^{-i\Delta t H_1} = \exp\left(-i \Delta t \sum_{pq,\sigma} h_{pq} \hat{a}^\dagger_{p\sigma} \hat{a}_{q\sigma} \right)$ is a fermionic Gaussian unitary, it can be realized exactly by a brickwork circuit of Givens rotations, applied to adjacent pairs of qubits, whose depth is equal to the number of fermionic modes in each spin-species, where the qubits are arranged in a one-dimensional chain~\cite{wecker_solving_2015,Kivlichan2018GivensSlater,jiang_correlated_2018} (see Fig.~\ref{fig: layout}). As shown in Fig.~\ref{fig: impurity bases}, $h_{pq}$ is close to diagonal both in the momentum basis and in the basis of $\mathbf{k}$-adjacent natural orbitals. Additionally, we require $\Delta t \ll 1$, yielding a $e^{-i\Delta t H_1}$ unitary that is close to the identity. This observation is used to approximately compile $e^{-i\Delta t H_1}$ into a depth-3 brickwork circuit of Givens rotations $G$, as shown in Fig.~\ref{fig: impurity bases}. The angles of the Givens rotations are obtained by maximizing the Hilbert-Schmidt norm of the $(L+1) \times (L+1)$ matrix $G^\dagger \cdot \Lambda$, where $\Lambda$ is the matrix exponential of $\left[-i (\Delta t) h\right]$, with $h$ being the $(L+1) \times (L+1)$ matrix with components $h_{pq}$. The optimization in the space of Gaussian unitaries is performed using gradient descent~\cite{moreno2023orbitalOptims} with the \textit{Adam}~\cite{kingma2014Adam} update rule.
+
+The compilation of $e^{-i\frac{\Delta t}{2} H_2}$ into a quantum circuit is simple when $H_2$ is diagonal, which is the case in the position and momentum bases. In this case, $e^{-i\frac{\Delta t}{2} H_2} = \exp\left(-i\frac{\Delta t}{2} U \hat{n}_{d\uparrow} \hat{n}_{d\downarrow} \right)$. In the Jordan-Wigner encoding, this is a controlled-phase gate between the two qubits representing the spin-up and spin-down impurity degrees of freedom. This gate is applied via an auxiliary qubit (green in Fig.~\ref{fig: layout}) that connects the spin-up and spin-down chains of qubits. 
+
+In the basis of $\mathbf{k}$-adjacent natural orbitals, $H_2$ is no longer diagonal. Consequently, its time evolution would naively require circuit depths growing as $\mathcal
+{O} \left( (L+1)^4\right)$. By construction, $H_2$ can be diagonalized by a single-particle basis transformation that mixes only 4 fermionic modes (impurity, $\mathbf{k}_f$ and $\mathbf{k}_f\pm 1$). This basis transformation can be achieved by the application of six Givens rotation gates acting on 4 adjacent qubits (see Fig.~\ref{fig: impurity bases}). After this transformation has been applied, $H_2$ is diagonal and its time evolution is realized as described in the previous paragraph. This is depicted in Fig.~\ref{fig: impurity bases}.
+
+For each spin-species, the initial state $\ket{\psi_0}$ is given by the superposition of all possible excitations of the three electrons closest to the Fermi level into the 4 closest empty modes starting from the state $|0000\hdots 01 \hdots 1111\rangle$, and realized by the application of 7 Givens gates, as shown in Fig.~\ref{fig: layout}.
+
+For our experiments, we choose $L = 29$ (see Appendix~\ref{Appending 29}) and $L = 41$ bath sites and consider values of the onsite repulsion: $U = 1, 3, 7, 10$. $L = 29$ requires $60$ qubits under the Jordan-Wigner representation, $30$ for each spin species, while $L = 41$ requires 84 qubits, 42 for each spin species. The projection and diagonalization step are accompanied by the self-consistent configuration recovery procedure introduced in Ref.~\cite{ibm2024chemistry}. In all cases we consider $d = 25$ Trotter steps with $\Delta t = 0.1$.
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.99\linewidth]{layout_85.pdf}
+\caption{\textbf{Quantum circuits and device layout. }\textbf{Top:} Circuit preparing the initial state $\ket{\psi_0}$ for the time evolution. \textbf{Bottom:} Qubit layout for the 85-qubit experiment (41 bath sites and a single impurity). The blue (red) chain corresponds to spin-up (down) fermionic modes. The green qubit connects the two sets of degrees of freedom.}
+\label{fig: layout}
+\end{figure}
+
+The experiments were run on IBM Quantum's \textit{ibm\_fez}, a Heron r2 processor with 156 fixed-frequency transmon qubits with tunable couplers on a heavy-hex lattice layout. $L=29$ required 61 qubits to implement, while $L=41$ required 85 qubits. Each Krylov dimension was sampled with $\num{1e5}$ shots. We implemented $L=29$ on both the momentum basis and the $\mathbf{k}$-adjacent basis. For the $\mathbf{k}$-adjacent basis, the average median error rates were: readout-error $\num{1.33e-2}$, single-qubit error $\num{2.40e-4}$ and two-qubit gate-error $\num{2.73e-3}$, with the latter two characterized by randomized benchmarking. The average relaxation and dephasing times were $138.5 \ \mu \text{s}$ and $101.25 \ \mu \text{s}$. Likewise, for the momentum basis circuits had readout-error $\num{1.48e-2}$, single-qubit error $\num{2.60e-4}$ and two-qubit gate-error $\num{2.77e-3}$. $T_1=131 \ \mu \text{s}$ and $T_2 = 89.25 \ \mu \text{s}$ were slightly lower for these experiments than for the $\mathbf{k}$-adjacent basis ones. The number of two-qubits grew linearly with Trotter steps/Krylov dimension with a slope of 312 and 208 for the momentum and $\mathbf{k}$-adjacent basis respectively. The maximum number of two-qubit gates here were 5976 gates and 3281 gates respectively. For $L=41$, we only considered the $\mathbf{k}$-adjacent basis. For these runs, we had average $T_1=131.5 \ \mu \text{s}$ and $T_2 = 96.25 \ \mu \text{s}$. The error rates were: readout-error $\num{1.53e-2}$, single-qubit error $\num{2.6e-4}$ and two-qubit gate-error $\num{2.80e-3}$. The two-qubit gates increased linearly at a rate of 337 gates per Trotter step and the maximum number of two-qubit gates was 6153.  
+
+
+To benchmark the accuracy of the quantum experiments, we choose DMRG as a reference classical method, since it is one of the \textit{state-of-the-art} approximate methods for single-band, single-impurity models~\cite{Holtzner2009Anderson, wu2022disentanglinginteractingsystemsfermionic, varbench}. Each DMRG run performed 20 sweeps. The first four sweeps have a maximum bond dimension of $250$, the next four sweeps have a maximum bond dimension of $400$, and the remaining $12$ sweeps a maximum bond dimension of $500$. At each sweep we add noise of amplitude $10^{-4}$ in the first four sweeps, $10^{-5}$ in the next four sweeps, $10^{-7}$ in the next four sweeps, and $0$ in the remaining.
+
+Several physical properties are compared between the DMRG and SKQD estimations. The first is the relative error in the SKQD ground-state energy estimation, defined as $|(E_\textrm{SKQD}-E_\textrm{DMRG})/E_\textrm{DMRG}|$. Additionally, we compare the estimation of other relevant physical properties, such as two-point correlation functions. The first one being the staggered spin-spin correlation functions:
+\begin{equation}\label{eq: spin correlation}
+    \bar{C}_\textrm{S}(\mathbf{j}) = (-1)^\mathbf{j} \bigg[ \left\langle \hat{\vec{S}}_d \cdot \hat{\vec{S}}_\mathbf{j} \right\rangle - \left\langle \hat{\vec{S}}_d \right\rangle \cdot \left\langle \hat{\vec{S}}_\mathbf{j} \right\rangle \bigg],
+\end{equation}
+where the spin operators are defined as: $\hat{S}^\mu_\mathbf{j} = \sum_{\alpha \beta} \sigma^\mu_{\alpha \beta} \hat{c}^\dagger_{\mathbf{j}, \alpha} \hat{c}_{\mathbf{j}, \beta}$, with $\mu = x, y, z$, and $\hat{S}^\mu_d = \sum_{\alpha \beta} \sigma^\mu_{\alpha \beta} \hat{d}^\dagger_{\alpha} \hat{d}_{\beta}$. The second one is the staggered density-density correlation function:
+\begin{equation}\label{eq: density correlation}
+    \bar{C}_\textrm{n}(\mathbf{j}) = (-1)^\mathbf{j} \sum_{\sigma \in \{\uparrow, \downarrow \}}\bigg[ \left\langle \hat{n}_{d\sigma}  \hat{n}_{\mathbf{j}\sigma} \right\rangle - \left\langle \hat{n}_{d\sigma} \right\rangle  \left\langle  \hat{n}_{\mathbf{j}\sigma} \right\rangle \bigg].
+\end{equation}
+These correlation functions are relevant to study phenomena like the Kondo screening length~\cite{Barzykin1998Anderson, Borda2007Anderson, Holtzner2009Anderson}, or their universal collapse for different values of $U$~\cite{Holtzner2009Anderson, wu2022disentanglinginteractingsystemsfermionic}.
+
+Figure~\ref{fig: dmrg vs sqd} (a) shows the relative (to DMRG) error in the SKQD ground-state energy estimation as a function of the subspace dimension on the SKQD eigenstate solver $D$. The Hartree-Fock (HF) and coupled cluster with single and double excitations (CCSD) errors are also shown for reference. The SKQD relative error decreases from values $\sim 10^{-4}$ to $\sim 10^{-5}$ as $U$ increases from $U = 1$ to $U = 10$. This is a consequence of the increased ground-state sparsity for larger values of $U$. 
+
+Panel (b) of Fig.~\ref{fig: dmrg vs sqd} compares the values of $\bar{C}_\textrm{S}(\mathbf{j})$ obtained from SKQD to those obtained with DMRG. The SKQD estimations are in excellent agreement with the DMRG values for most values of $\mathbf{j}$, the distance between the impurity spin and the bath spin. There are small deviations for odd values of $\mathbf{j}$ at larger values of $\mathbf{j}$, where the value of the correlation is negligible.
+
+Panel (c) in Fig.~\ref{fig: dmrg vs sqd} compares the values of $\bar{C}_\textrm{n}(\mathbf{j})$ obtained from SKQD to those obtained with DMRG, for even values of $\mathbf{j}$. The SKQD estimations are in excellent agreement with the DMRG values for all values of $\mathbf{j}$.
+
+Appendix~\ref{Appending 29} contains the same analysis on a system with $L = 29$ bath sites. We see that the accuracy in the SIAM with $L = 41$ bath sites is not significantly worse than the accuracy in the system with $L = 29$ bath sites. This shows that the accuracy of SKQD with configuration recovery on the SIAM is not strongly dependent on the system size. Appendix~\ref{signal} shows that there is a valuable signal coming from the quantum device that SQD with configuration recovery extracts successfully, by comparing the energies obtained by running the post processing on samples obtained from the device and samples drawn from the uniform distribution.
+
+The low relative errors in the ground-state energy estimation, and the agreement in the correlation functions show that SKQD is an excellent method to study the low-energy physics of lattice models whose ground state is sparse. These experiments correspond to the largest impurity model ground-state simulations using quantum computers to date, in contrast to prior experiments which only consider a small number of bath sites. The description of tens to hundreds of bath sites is a minimal requirement to be able to understand the properties of real materials showing strong correlation. We show excellent agreement with DMRG on system sizes that are well beyond system sizes amenable to exact-diagonalization methods.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=1\linewidth]{DMRG_vs_SKQD_85.pdf}
+\caption{\textbf{Experiments on quantum processors.} SKQD vs DMRG in the SIAM with 41 bath sites (85-qubit experiment). Different rows correspond to different values of the onsite repulsion $U$ in the impurity. \textbf{(a)} Relative error in the ground state energy estimation using SKQD, as a function of the subspace dimension $D$. The DMRG estimation is taken as the ground truth. The Hartree-Fock (HF) and coupled cluster with single and double excitations (CCSD) errors are also included for reference. The dots correspond to the SKQD estimation in the $\mathbf{k}$-adjacent natural orbitals. \textbf{(b)} Comparison of the two-point spin correlation functions (see Eq.~\ref{eq: spin correlation}) obtained with DMRG and SKQD. \textbf{(c)} Comparison of the two-point density correlation functions (see Eq.~\ref{eq: density correlation}) obtained with DMRG and SKQD.}
+\label{fig: dmrg vs sqd}
+\end{figure*}
+
+
+
+
+\section{Discussion}
+
+We now elaborate on our results, discussing SKQD in the context of existing quantum algorithms for ground state problems for pre-fault-tolerant and early-fault-tolerant quantum processors. 
+
+We obtained our ground-state energy estimations via sampling from Krylov states: This means that in order to keep low circuit depths, one must address lattice problems which are amenable to be mapped easily using the layout of the quantum processor. As a consequence, chemistry use cases are out of reach for SKQD in the near-term, and should be addressed, in a sample-based approach, using a circuit ansatz such as the local unitary coupled Jastrow used in~\cite{ibm2024chemistry}. However, on lattice problems, SKQD resolves practically every issue of algorithms for ground states: it does not require optimization of ansatzaes, it does not incur in the quantum measurement problem, and it is robust to noisy samples since one can use configuration recovery and a classical diagonalization overhead to effectively remove the effect of noise. 
+
+SKQD shares many convergence properties with the standard Krylov quantum diagonalization~\cite{yoshioka2024diagonalization}. However, it requires reduced circuit depths since it doesn't need to execute Hadamard tests as subroutines, and has improved noise resistance properties, as mentioned before. 
+Additionally, as we have shown, SKQD can outperform the standard KQD in terms of measurement overhead. 
+While our convergence proofs requires sparsity of the ground state, in practice one could use SKQD for non-sparse ground states, in scenarios where basis states are captured by the Krylov circuits. 
+
+Finally, we performed experiments with circuits up to 85 qubits and $6 \cdot 10^3$ two-qubit gates simulating the ground-state properties of the single-impurity Anderson model, obtaining excellent agreement with DMRG calculations of the same system. This confirms that SKQD can be used as to probe ground state physics on pre-fault-tolerant quantum computers, exceeding the reach of existing quantum methods for lattice problems.
+
+
+
+\bigskip
+
+\textit{Note added.} While finalizing our paper, we noticed two independent papers on arXiv that share some of the ideas presented here~\cite{sugisaki2024SKQD,mikkelsen2024SKQD}.   
+
+
+\section{Code and data availability}
+The simulation of the time evolution of fermionic Hamiltonians is carried out with the library \texttt{ffsim}~\cite{ffsim}, while configuration recovery, projection and diagonalization are carried out with the python package \texttt{qiskit-addon-sqd}~\cite{sqd_addon}. Quantum circuits are generated and transpiled using \texttt{qiskit}~\cite{qiskit2024}. DMRG calculations are performed using the \texttt{block2} package~\cite{block2}. HF and CCSD calculations are performed using the PySCF library~\cite{sun2018pyscf,sun2020recent}.
+
+\begin{acknowledgments}
+    We acknowledge helpful discussions with 
+    Jay Gambetta,
+    Toshinari Itoko,
+    and Caleb Johnson. We acknowledge the use of tacokit and are grateful to Zlatko Minev for development of the package and troubleshooting support. This research was supported by the Quantum Science Center, a National Quantum Science Initiative of the Department of Energy (DOE), managed by the Oak Ridge National Laboratory (ORNL).  The work by T.A.M. (model selection and analysis) was supported by the U.S. Department of Energy, Office of Science, Basic Energy Sciences, Materials Sciences and Engineering Division. D.C. and L.B. acknowledge support from the Laboratory Directed Research and Development Program of Oak Ridge National Laboratory, managed by UT-Battelle, LLC, for the US Department of Energy. This material is based upon work supported by the U.S. Department of Energy, Office of Science, National Quantum Information Science Research Centers, Quantum Science Center (QSC). This research used resources of the Oak Ridge Leadership Computing Facility, which is a DOE Office of Science User Facility supported under Contract DE-AC05-00OR22725.
+\end{acknowledgments}
+
+
+
+
+\onecolumngrid
+\newpage 
+
+
+\appendix
+
+
+\vspace{0.5in}
+
+
+\clearpage
+\begin{center}
+	{\large \textbf{Appendix for ``Sample-based Krylov Quantum Diagonalization''} }
+\end{center}
+
+
+\section{Krylov Quantum Diagonalization}\label{sec:kqd}
+
+Let $\mathcal{H}$ denote an $N$-dimensional Hilbert space, where $N=2^n$ and $n$ denotes the number of qubits. Let $H$ be a Hermitian operator on $\mathcal{H}$ with eigenvalues $E_0 \le E_1 \le \dots \le E_{N-1}$ and corresponding orthonormal eigenstates $\ket{\phi_0}, \dots, \ket{\phi_{N-1}}$. Our goal is to estimate $E_0$. In general, the eigenvalue problem for an $N$-dimensional operator is computationally challenging, so we approximate $E_0$ by considering the corresponding eigenvalue problem in a subspace. In particular, given some initial state $\ket{\psi_0}$, consider the \emph{Krylov subspace} $\mathcal{S}$ spanned by
+\begin{equation}\label{eq:krylov-basis}
+\ket{\psi_k} \coloneq e^{-ikH\,\Delta{t}} \ket{\psi_0}, \quad k \in \{0, 1, \dots, d-1\},
+\end{equation}
+for some chosen time step $\Delta{t}$ and dimension $d$.
+
+We then solve the following generalized eigenvalue problem
+\begin{equation}
+\label{eq:gen-eig-app}
+\mathbf{\widetilde{H}} v = \widetilde{E} \mathbf{\widetilde{S}} v,
+\end{equation}
+where $v$ is a coordinate vector corresponding to the state ${\ket{\phi}\coloneq\sum_{k=0}^{d-1} v_k\ket{\psi_k} \in \mathcal{S}}$, and 
+\begin{equation}
+\label{eq:gen-eig-mats-app}
+\mathbf{\widetilde{H}}_{jk} \coloneq \braket{\psi_j | H | \psi_k}, \qquad \mathbf{\widetilde{S}}_{jk} \coloneq \braket{\psi_j | \psi_k}.
+\end{equation}
+
+\medskip 
+
+Let 
+\begin{equation}\label{eq:delta_ej}
+    \Delta E_j = E_j - E_0
+\end{equation}
+for each $0 < j < N$ and let 
+\begin{align}\label{eq:ref-state}
+    \ket{\psi_0} = \sum_{k=0}^{N-1} \gamma_k \ket{\phi_k}
+\end{align}
+be the eigenstate decomposition of the initial state. For completeness, we recall the accuracy of estimating the ground state energy using the Krylov quantum diagonalization approach from \cite{Epperly_2022}. 
+
+\begin{theorem}[Theorem 3.1 in \cite{Epperly_2022}]
+\label{thm:krylov}
+Let $\Delta{t} = \frac{\pi}{\Delta E_{N-1}}$ and $d$ denote the Krylov dimension as defined in \cref{eq:krylov-basis}. Assume that $d$ is odd; for even $d$ we can use the bound for $d-1$. Then the approximate ground state energy $\widetilde{E}_0$ obtained from the method described in Eqs.~\eqref{eq:krylov-basis}--\eqref{eq:gen-eig-mats-app} satisfies
+\begin{equation} 
+\label{eq:krylov-error}
+0 \le \widetilde{E}_0 - E_0 \le 8 \Delta E_{N-1} \left(\frac{1 - \abs{\gamma_0}^2}{\abs{\gamma_0}^2}\right) \parens{1 + \frac{\pi \Delta E_1}{\Delta E_{N-1}}}^{-(d-1)},
+\end{equation}
+where $\gamma_0$ denotes the coefficient of $\ket{\phi_0}$ in \cref{eq:ref-state} and $\Delta E_j$ is defined in \cref{eq:delta_ej}.
+\end{theorem}
+
+Note that the accuracy in approximating $E_0$ improves exponentially with the dimension $d$ of the Krylov subspace. Moreover, the accuracy is inversely proportional to the overlap $(|\gamma_0|^2)$ of the initial state with the ground state of $H$. We summarize proof steps for \cref{eq:krylov-error} below. 
+
+
+\begin{itemize}
+\item First, note that if $d$ is odd, then the projection of the Hamiltonian into the Krylov subspace as we have defined it is the same as the projection of the Hamiltonian into the shifted Krylov space spanned by
+\begin{equation}\label{eq:krylov-basis-shifted}
+\ket{\psi_k} = e^{-ikH\,\Delta{t}} \ket{\psi_0}, \quad k \in \braces{-\frac{d-1}{2}, -\frac{d-1}{2}+1, \dots, \frac{d-1}{2}-1, \frac{d-1}{2}}.
+\end{equation}
+This follows because the Gram matrices $\widetilde{\textbf{S}}$ of the two spaces are identical since time evolutions are unitary, and the Hamiltonian projection matrices $\widetilde{\textbf{H}}$ are identical because the time evolutions commute with the full Hamiltonian $H$.
+\item For any $0 < a < \pi$ and positive integer $d$, there exists a trigonometric polynomial $p^*$ of degree $d_\text{poly}=\frac{d-1}{2}$ satisfying $p^*(0) = 1$ and
+\begin{equation}
+\label{eq:trig-poly-bound}
+\abs{p^*(\theta)} \le 2(1+a)^{-d_\text{poly}}\quad \forall \theta \in (-\pi, \pi) \setminus (-a, a).
+\end{equation}
+This polynomial is explicitly constructed as
+\begin{equation}
+p^*(\theta) = \frac{T_k \parens{1 + 2\frac{\cos\theta - \cos a}{\cos a + 1}} } {T_k\parens{1 + 2 \frac{1 - \cos a}{\cos a + 1}} },
+\end{equation}
+where $T_k$ is the $k$th-Chebyshev polynomial.
+
+\item Let the Fourier expansion of $p^*$ be
+\begin{equation}
+p^*\parens{(E - E_0) \Delta t} = \sum_{k=-d_\text{poly}}^{d_\text{poly}} c_k e^{ik E \Delta{t}}.
+\end{equation}
+Consider the following unnormalized state:
+\begin{equation}\label{eq:ansatz_shifted}
+\ket{\widetilde\phi_K} = \sum_{k=-d_\text{poly}}^{d_\text{poly}} c_k \ket{\psi_k} = \sum_{k=-d_\text{poly}}^{d_\text{poly}} \sum_{j=0}^{N-1} c_k \gamma_j e^{ik E_j \Delta{t}} \ket{\phi_j}.
+\end{equation}
+Moreover, from Section~3.1 in \cite{Epperly_2022} we recall that $\sum_k |c_k|^2 \leq 1$. 
+
+\item
+The norm of $\ket{\widetilde\phi_K}$ is given by
+\begin{equation}
+\label{eq:krylov-norm}
+\abs{\braket{\widetilde\phi_K|\widetilde\phi_K}}^2 = \sum_{j=0}^{N-1} \abs{\gamma_j}^2 \abs{\sum_{k=-d_\text{poly}}^{d_\text{poly}} c_k e^{ik E_j \Delta{t}}}^2
+\ge \abs{\gamma_0}^2 \abs{\sum_{k=-d_\text{poly}}^{d_\text{poly}} c_k e^{ik E_0 \Delta{t}}}^2
+= \abs{\gamma_0}^2 \abs{p^*(0)}^2
+= \abs{\gamma_0}^2.
+\end{equation}
+
+\item Then the energy error of $\ket{\widetilde\phi_K}$ is given by 
+\begin{equation}\label{eq:energy_error_shifted}
+\frac{\braket{\widetilde\phi_K| (H - E_0) |\widetilde\phi_K}}{\braket{\widetilde\phi_K|\widetilde\phi_K}} 
+\le \frac{\sum_{j=0}^{N-1} (E_j-E_0) \abs{\gamma_i}^2 \abs{\sum_{k=-d_\text{poly}}^{d_\text{poly}} e^{ikE_j \Delta{t}}}^2} {\braket{\widetilde\phi_K|\widetilde\phi_K}}
+\le \frac{\sum_{j=0}^{N-1} E_j \abs{\gamma_i}^2 \abs{p^*((E_j-E_0)\Delta{t})}^2} {\abs{\gamma_0}^2}.
+\end{equation}
+Applying (\ref{eq:trig-poly-bound}) with $a = (E_1 - E_0) \Delta{t} = \frac{\pi \Delta E_1}{\Delta E_{N-1}}$ gives
+\begin{equation}
+p^*((E_j-E_0)\Delta{t}) \le 2\parens{1 + \frac{\pi\Delta{E_1}}{\Delta{E_{N-1}}}}^{-d}
+\end{equation}
+for each $1 \le j \le N-1$. The $j=0$ term cancels upon taking the difference with $E_0$ for the energy error.
+
+\item Since $\ket{\widetilde\phi_K}$ is explicitly defined in \cref{eq:ansatz_shifted} as an element of the shifted Krylov space \cref{eq:krylov-basis-shifted}, the lowest energy in the shifted Krylov space is upper bounded by the energy of $\ket{\widetilde\phi_K}$.
+Finally, as we noted above, the projection of the Hamiltonian into the shifted Krylov space is identical to its projection into the original, unshifted Krylov space, so the lowest energies of the two projections are the same.
+Hence, the energy error from finding the lowest energy of the projected Hamiltonian in our Krylov subspace is upper bounded by the energy error \cref{eq:energy_error_shifted} of $\ket{\widetilde\phi_K}$.
+
+\end{itemize}
+
+Thus, for an initial state with a nontrivial ground state overlap $\abs{\gamma_0}^2 = \Theta(1)$ and for a Hamiltonian $H$ that has a well-behaved spectrum, (i.e., $\Delta E_{N-1}$ not growing too quickly and $\Delta E_1$ not too small), a constant error $\widetilde{E}_0 - E_0 \le \eps$ can be achieved by taking $d = O(\log(1/\eps))$.
+
+
+
+
+\section{Proofs and Relevant Details for \cref{msec:ksqsd-proof}}
+\label{app:proofs}
+
+In this section we prove the performance guarantees for the Krylov diagonalization via quantum unitary sampling approach. As discussed in the main text, we prepare $d$ different states on a quantum computer and collect $M$ samples from each of them by measuring in the computational basis. In particular, let $\ket{\psi_0}$ denote the initial reference state. Then we get $M$ samples from each Krylov basis state $\ket{\psi_k}$ as defined in \cref{eq:krylov-basis}. In particular, we get a sequence of bitstrings $\{a_{km}\}_{k=0}^{M-1}$ for each $k$. Finally, we solve the eigenvalue problem in the subspace spanned by $\{a_{km}~|~k=0,1,\dots,d-1;m=0,1,\dots,M-1\}$.
+
+\medskip
+
+We analyze our algorithm as follows.
+We first recall \cref{def:concentration} for convenience:
+
+\noindent
+\textbf{\cref{def:concentration}}~($(\alpha_L, \beta_L)$-sparsity).
+For any state $\ket{\psi}$, let
+\begin{equation}
+\label{eq:ground-state-amp-app}
+    \ket{\psi} = \sum_{j=1}^Ng_j\ket{b_j},
+\end{equation}
+where $\{b_j\}$ is some ordering of length-$N$ bitstrings such that $|g_1|\geq |g_2|\geq \cdots |g_N|$.
+We say that $\ket{\psi}$ exhibits \emph{$(\alpha_L, \beta_L)$-sparsity} on $\ket{b_1}$ through $\ket{b_L}$ if
+\begin{equation}
+\label{eq:alpha_def}
+    \sum_{j=1}^L |g_j|^2 \geq \alpha_L
+\end{equation}
+and
+\begin{equation}
+    |g_1|^2, \dots, |g_L|^2 \geq \beta_L.
+\end{equation}
+
+
+Since $|g_i|^2 \geq \beta_L, \forall i$, it implies that   $\alpha_L \ge L \beta_L$, but $\alpha_L$ may be much larger in general. Here, we separate the two as $\alpha_L$ will govern the rate of convergence for successful runs while $\beta_L$ will govern the probability of success.
+
+Below, we restate \cref{mthm:skqd-thm} and prove it using several lemmas in \cref{sec:proof-main-thm}. 
+
+\noindent
+\textbf{Theorem \ref{mthm:skqd-thm}.}
+\emph{
+Let $H$ be a Hamiltonian whose ground state $\ket{\phi_0}$ exhibits $(\alpha_L^{(0)}, \beta_L^{(0)})$-sparsity.
+Let $\ket{\widetilde\phi}$ be the lowest energy state supported on the $L$ important bitstrings in $\ket{\phi_0}$.
+The error in estimating the ground state energy of $H$ is bounded by
+\[
+\braket{\widetilde\phi | H | \widetilde\phi} - \braket{\phi_0 | H | \phi_0} \leq \sqrt{8} \norm{H} 
+\left(1 - \sqrt{\alpha_L^{(0)}}\right)^{1/2},
+\]
+provided all $L$ important bitstrings are sampled. The success probability of sampling all $L$ important bitstrings is at least $1 - \eta$ as long as the number of samples from each Krylov basis state exceeds $\left(d^2 \log(L/\eta)\right)/\left(|\gamma_0|^2 (\beta_L^{(0)} - 2\sqrt{\tilde{\varepsilon}})\right)$, where
+\[
+\tilde{\varepsilon} = 2-2\sqrt{1-\varepsilon/\Delta E_1}
+\]
+with $\varepsilon$ defined in \cref{meq:eps-kqd}.
+}
+
+
+
+As discussed in \cref{sec:kqd}, we choose $d$ according to (\ref{eq:krylov-error}) so that the error for the Krylov quantum diagonalization approach is bounded by $\eps$.
+If we were to run the Krylov method on the $\{\ket{\psi_k}\}$, we would obtain a state $\ket{\psi} \in \mathcal{S}$ with 
+\begin{equation}
+\label{eq:krylov-eps}
+    0\le\braket{\psi | H | \psi} - \braket{\phi_0 | H | \phi_0} = \widetilde{E}_0 - E_0 < \eps.
+\end{equation}
+By the proof of Theorem \ref{thm:krylov}, there exists $\ket{\widetilde\phi_K} \in \mathcal{S}$ defined by \eqref{eq:ansatz_shifted}, which is not necessarily the lowest energy state in $\mathcal{S}$, but which satisfies \eqref{eq:krylov-error} and also satisfies the following inequality :
+\begin{equation}\label{eq:coeff-property}
+\ket{\widehat\phi_K} = \sum_{k=0}^{d-1} d_k \ket{\psi_k}, \qquad \abs{d_k} \le \frac{1}{|\gamma_0|},
+\end{equation}
+where $\ket{\widehat\phi_K}$ is the normalized version of $\ket{\widetilde\phi_K}$ in \cref{eq:ansatz_shifted}. Therefore, $d_k = c_k/|\langle\widetilde\phi_K|\widetilde\phi_K\rangle|$, which implies that $|d_k| = |c_k|/|\langle\widetilde\phi_K|\widetilde\phi_K\rangle| \leq 1/|\gamma_0|$, where we invoked the condition that $\sum_k |c_k|^2 \leq 1$ (from Section~3.1 in \cite{Epperly_2022}) and $|\langle\widetilde\phi_K|\widetilde\phi_K\rangle|\geq |\gamma_0|$. 
+
+
+Note that to prove \cref{eq:krylov-eps}, we do not actually need to solve the generalized eigenvalue problem to obtain $\ket{\psi}$, but only to have a state satisfying \eqref{eq:krylov-error}, so we will use $\ket{\widetilde\phi_K}$  for our analysis due to its additional structure as in \cref{eq:coeff-property}.
+
+
+\medskip
+
+In \cref{lem:state-close}, we prove that a state that has a low energy error with respect to the ground state energy is also close to the ground state in 2-norm distance. We then show in \cref{lem:state-conc-close} that if $\ket{\phi_0}$ exhibits sparsity and if $\ket{\psi}$ is close to $\ket{\phi_0}$, then $\ket{\psi}$ also exhibits sparsity.
+
+state close to a concentrated state is also concentrated. 
+
+
+\begin{lemma}[A state with low energy is close to the ground state]\label{lem:state-close}
+
+Let $H$ be a Hamiltonian with ground state $\ket{\phi_0}$ and spectral gap $\Delta E_1$. If $\ket{\psi}$ is a state such that $\braket{\psi | H | \psi} - \braket{\phi_0 | H | \phi_0} < \eps$ and $\braket{\psi|\phi_0}$ is real, then
+\begin{equation}
+\norm{\ket{\psi} - \ket{\phi_0}}^2 < 2\left(1 - \sqrt{1 - \frac{\eps}{\Delta E_1}}\right) = O\parens{\frac{\eps}{\Delta E_1}}.
+\end{equation}
+
+\end{lemma}
+
+\begin{proof}
+Let $\ket{\psi} = \chi_0 \ket{\phi_0} + \chi^\perp\ket{\phi^\perp}$, where $\ket{\phi^\perp}$ is normalized and orthogonal to $\ket{\phi_0}$, such that ${\abs{\chi_0}^2 + \abs{\chi^\perp}^2 = 1}$. We can write $\braket{\psi | H | \psi} - \braket{\phi_0 | H | \phi_0} < \eps$ as
+\begin{align}
+\eps > \abs{\chi_0}^2 E_0 + \abs{\chi^\perp}^2 \braket{\phi^\perp | H | \phi^\perp} - E_0 
+& = (\abs{\chi_0}^2 - 1) E_0 + (1 - \abs{\chi_0}^2) \braket{\phi^\perp | \mathcal{H} | \phi^\perp} \\
+& \ge (1 - \abs{\chi_0}^2) \Delta E_1.
+\end{align}
+Thus $\abs{\chi_0}^2 > 1 - \frac{\eps}{\Delta E_1}$, giving
+\begin{equation}
+\norm{\ket{\psi} - \ket{\phi_0}}^2 = \abs{\chi_0 - 1}^2 + \abs{\chi^\perp}^2 
+= 2 - 2\chi_0
+< 2 - 2\sqrt{1 - \frac{\eps}{\Delta E_1}}.
+\end{equation}
+Expanding to the first order in $\frac{\eps}{\Delta E_1}$ gives an error bound of $\frac{\eps}{\Delta E_1} + O(\eps^2)$.
+\end{proof}
+
+
+\begin{lemma}\label{lem:state-conc-close}
+If $\ket{\phi_0}$ exhibits $(\alpha_L^{(0)}, \beta_L^{(0)})$-sparsity and $\norm{\ket{\psi} - \ket{\phi_0}}^2 < \eps$, then $\ket{\psi}$ exhibits $(\alpha_L, \beta_L)$-sparsity for
+\begin{equation}
+\label{eq:modified_alpha_beta}
+\alpha_L = \alpha_L^{(0)} - 2\sqrt{\eps} \qquad \beta_L = \beta_L^{(0)} - 2\sqrt{\eps}.
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+Expand $\ket{\psi}$ and $\ket{\phi_0}$ in the computational basis as $\ket{\psi} = \sum_{j=1}^N a_j \ket{b_j}$ and $\ket{\phi_0} = \sum_{j=1}^N c_j \ket{b_j}$, respectively. Then
+\begin{align}
+\sum_{j=1}^L \abs{a_j}^2 = \sum_{j=1}^L \abs{c_j + (a_j - c_j)}^2 &= \sum_{j=1}^L \abs{c_j}^2 + \sum_{j=1}^L \abs{a_j - c_j}^2 + 2\sum_{j=1}^L \Re\parens{c_j (a_j - c_j)} \\
+& \ge \alpha_L^{(0)} + 0 - 2 \sum_{j=1}^L \abs{c_j} \abs{a_j - c_j} \\
+& \ge \alpha_L^{(0)} - 2 \sqrt{\sum_j \abs{c_j}^2 \sum_k \abs{a_k - c_k}^2} \\
+& \ge \alpha_L^{(0)} - 2\sqrt{\eps},
+\end{align}
+showing that we may take $\alpha_L = \alpha_L^{(0)} - 2\sqrt{\eps}$. In the last line we replaced $\sum_{j=1}^L |c_j|^2 \leq 1$ and used the fact that $\norm{\ket{\psi} - \ket{\phi_0}}^2 < \eps$.
+
+We now prove a similar condition for $\beta_L$. Since $\norm{\ket{\psi} - \ket{\phi_0}}^2 < \eps$, we must have $\abs{a_j - c_j} < \sqrt{\eps}$ for each $1 \le j \le N$. 
+Then for each $1 \le j \le L$, we have
+\begin{align}
+\abs{a_j}^2 = \abs{c_j + (a_j - c_j)}^2 &= \abs{c_j}^2 + \abs{a_j - c_j}^2 + 2 \Re(c_j (a_j - c_j)) \\
+&\ge \beta_L^{(0)} + 0 - 2\abs{c_j} \abs{a_j - c_j} \\
+&\ge \beta_L^{(0)} - 2\sqrt{\eps}.
+\end{align}
+Thus we may take $\beta_L = \beta_L^{(0)} - 2\sqrt{\eps}$.
+\end{proof}
+
+
+
+We have shown in \cref{lem:state-conc-close} that if the Krylov quantum diagonalization (KQD) approach has $\varepsilon$ energy error and if the true ground state exhibits $(\alpha_L^{(0)}, \beta_L^{(0)})$-sparsity, then a solution to the KQD approach exhibits $(\alpha_L, \beta_L)$-sparsity for $\alpha_L, \beta_L$ given by \eqref{eq:modified_alpha_beta}. Using this result, we now prove in \cref{lem:nontrivial-bitstring} and \cref{lem:pfail} that with a high probability, each bitstring (among the $L$ important bitstrings) corresponding to the ground state $\ket{\phi_0}$ appears nontrivially in at least one of the Krylov basis states. This is crucial for establishing a bound on the error corresponding the Krylov diagonalization via quantum unitary sampling approach. 
+
+
+\begin{lemma}
+[Each concentrated bitstring appears nontrivially in at least one basis state]
+\label{lem:conc-bitstring-prob} 
+Let $\ket{\widehat\phi_K}$ satisfy $(\alpha_L, \beta_L)$-sparsity as in \cref{def:concentration} and $\ket{\widehat\phi_K} = \sum\limits_{k=0}^{d-1} d_k \ket{\psi_k}$ as in \cref{eq:coeff-property}. If each $\ket{\psi_k}$ is represented in the computational basis as
+\(
+\ket{\psi_k} = \sum_{j=1}^{N} c^{(k)}_{j} \ket{b_j}
+\) for each $k=0,1,...,d-1$, then for each $j=0,1,\dots,L-1$ there exists some $c^{(k)}_j$ such that $\abs{c^{(k)}_{j}}^2 \ge p$ with
+\begin{equation}
+p = \frac{|\gamma_0|^2 \beta_L}{d^2}.
+\end{equation}
+Here, $|\gamma_0|^2$ denotes the overlap of the KQD initial state $\ket{\psi_0}$ with the ground state, as defined in \cref{eq:krylov-basis}. 
+\end{lemma}\label{lem:nontrivial-bitstring}
+
+\begin{proof}
+Let $\ket{\widehat{\phi}_K} = \sum_{j=1}^N a_j \ket{b_j}$ in the computational basis. For each $1 \le j \le L$, we have
+\begin{equation}\label{eq:coeff-large}
+\sum_{k=0}^{d-1} \abs{c^{(k)}_{j}} \ge \sum_{k=0}^{d-1} |\gamma_0|\abs{d_k} \abs{c^{(k)}_{j}} 
+\ge |\gamma_0|\abs{\sum_{k=0}^{d-1} d_k c^{(k)}_{j}} 
+= |\gamma_0| \abs{a_j}
+\ge |\gamma_0| \sqrt{\beta_L},
+\end{equation}
+where the first inequality follows from $|d_k||\gamma_0|\leq 1$, as in \cref{eq:coeff-property}, and
+the last inequality follows from \cref{lem:state-conc-close}.
+Therefore, \cref{eq:coeff-large} implies that there must be some $k$ for which $\abs{c^{(k)}_{j}} \ge \frac{|\gamma_0| \sqrt{\beta_L}}{d}$, or equivalently $\abs{c^{(k)}_{j}}^2 \ge \frac{|\gamma_0|^2 \beta_L}{d^2}$, as desired.
+\end{proof}
+
+
+\begin{lemma}\label{lem:pfail}
+If we make $M$ measurements from each $\ket{\psi_k}$, the probability of not obtaining all $\ket{b_0},\ket{b_1},...,\ket{b_{L-1}}$ among the sampled bitstrings is bounded by
+\begin{equation}
+p_{\operatorname{fail}} \le L (1-p)^M \le L e^{-Mp}.
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+The $M$ measurements are independent, so the probability of not obtaining a particular bitstring $\ket{b_j}$ for $j\in\{0,1,...,L-1\}$ is $(1-p)^M$. The probability of not obtaining at least one of the $L$ bitstrings follows from union bound.
+\end{proof}
+
+
+We now recall a result from \cite{ibm2024chemistry} relating the energy of a state defined in a subspace to the ground state energy on the full $n$-qubit space. 
+
+\begin{lemma}[Appendix B.1 from \cite{ibm2024chemistry}]
+\label{lem:conc-error-bound}
+Let $\ket{\widetilde\phi} = \frac{1}{C} \sum_{j=0}^{L-1} c_j \ket{b_j}$, where $C = \sqrt{\sum_{j=0}^{L-1} \abs{c_j}^2}$ is the normalization constant and $\sum_{j=0}^{N-1} c_j \ket{b_j}$ defines the ground state in the computational basis in decreasing order of coefficient magnitude, as in \cref{def:concentration}. This state has energy close to the ground state energy, with difference bounded by
+\begin{equation}
+\braket{\widetilde\phi | H | \widetilde\phi} - \braket{\phi_0 | H | \phi_0} \le 2\sqrt{2} \norm{H} \parens{ 1 - \sqrt{\alpha_L^{(0)}} }^{1/2}.
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+First, we rewrite the error in energy. Let $\ket{\phi'} = \ket{\widetilde\phi}-\ket{\phi_0} $. Then we get 
+\begin{equation}
+\braket{\widetilde\phi | H | \widetilde\phi} - \braket{\phi_0 | H | \phi_0}
+= \langle{\widetilde\phi}\vert H |\phi'\rangle + \langle \phi' \vert H  |\phi_0\rangle~.
+\end{equation}
+Then we have
+\begin{equation}
+\label{eq:partial_bound}
+\braket{\widetilde\phi | H | \widetilde\phi} - \braket{\phi_0 | H | \phi_0}
+\le |\bra{\widetilde\phi} H |\phi'\rangle|+ \abs{\langle \phi' \vert H  |\phi_0\rangle}
+\le 2 \norm{\ket{\widetilde\phi}} \norm{H |\phi'\rangle}
+\le 2 \cdot 1 \cdot \norm{H} \norm{|\phi'\rangle}.
+\end{equation}
+
+
+Finally, we calculate the norm difference as
+\begin{equation}
+\norm{\ket{\widetilde\phi} - \ket{\phi_0}}^2 
+= \sum_{j=0}^{L-1} \parens{\frac{1}{C} - 1}^2 \abs{c_j}^2 + \sum_{L}^{N-1} \abs{c_j}^2 
+= \parens{1 - \frac{2}{C} + \frac{1}{C^2}} C^2 + (1-C^2)
+= 2 - 2C,
+\end{equation}
+and we have $C \ge \sqrt{\alpha_L^{(0)}}$ by \eqref{eq:alpha_def}, so $\norm{\ket{\widetilde\phi} - \ket{\phi_0}} \le \sqrt{2} \parens{1 - \sqrt{\alpha_L^{(0)}}}^{1/2}$.
+Since $\ket{\phi'}$ is defined to be $\ket{\widetilde\phi} - \ket{\phi_0}$, plugging the above into \eqref{eq:partial_bound} completes the proof.
+\end{proof}
+
+
+
+\subsection{Proof of \cref{mthm:skqd-thm}}\label{sec:proof-main-thm}
+
+From Theorem \ref{thm:krylov}, we have a state $\ket{\psi}$ with $\braket{\psi | H | \psi} - \braket{\phi_0 | H | \phi_0} < \eps$ with
+\begin{equation}
+\eps = 8 \Delta E_{N-1} \left(\frac{1 - \abs{\gamma_0}^2}{\abs{\gamma_0}^2}\right) \parens{1 + \frac{\pi \Delta E_1}{\Delta E_{N-1}}}^{-(d-1)}.
+\end{equation}
+Let 
+\begin{align}\label{eq:eps-prime}
+    \varepsilon' = \sqrt{1-\varepsilon/\Delta E_1}.
+\end{align} 
+Then, from \cref{lem:state-close}, we get 
+\begin{equation}
+\norm{\ket{\psi} - \ket{\phi_0}}^2 < 2 - 2\varepsilon'.
+\end{equation}
+
+Given $\ket{\phi_0}$ is $(\alpha_L^{(0)}, \beta_L^{(0)})$-concentrated, by Lemma \ref{lem:state-conc-close} $\ket{\psi}$ is $(\alpha_L, \beta_L)$-concentrated with parameters
+\begin{equation}
+\alpha_L = \alpha_L^{(0)} - 2\sqrt{2 - 2\varepsilon'} \qquad
+\beta_L = \beta_L^{(0)} - 2\sqrt{2 - 2\varepsilon'}
+\end{equation}
+Hence by Lemma \ref{lem:conc-bitstring-prob}, for each of the $L$ important bitstrings $b_j$ with $j=0,1,...,L-1$, we will be able to sample $b_j$ with probability at least
+\begin{equation}\label{eq:final-p}
+p = \frac{\abs{\gamma_0}^2}{d^2} \parens{\beta_L^{(0)} - 2\sqrt{2 - 2\varepsilon'}}
+\end{equation}
+from at least one of the $\ket{\psi_k}$. Given $M$ measurements, the probability of failing to sample $b_j$ is at most $(1-p)^M$. Repeating this for each concentrated bitstring $b_j$, the probability of failing to sample all $L$ bitstrings $b_1$ through $b_L$ is
+\begin{equation}
+p_{\text{fail}} \le L(1-p)^M \le Le^{-Mp} = L \exp\parens{-\frac{M\abs{\gamma_0^2}}{d^2} \parens{\beta_L^{(0)} - 2\sqrt{2 - 2\sqrt{1 - \frac{\eps}{\Delta E_1}}}}}
+\end{equation}
+by union bound and by using $p$ from \cref{eq:final-p} and $\varepsilon'$ from \cref{eq:eps-prime}. If we succeed in sampling all $L$ bitstrings, then the state $\ket{\widetilde\phi}$ as defined in Lemma \ref{lem:conc-error-bound} exists in the sampled subspace, so the calculated energy will be bounded by
+\begin{equation}
+\braket{\widetilde\phi | H | \widetilde\phi} - \braket{\phi_0 | H | \phi_0} \le 2\sqrt{2} \norm{H} \parens{ 1 - \sqrt{\alpha_L^{(0)}} }^{1/2},
+\end{equation}
+which completes the proof of \cref{mthm:skqd-thm}.
+
+\section{Experiments on a single impurity and 29 bath sites}\label{Appending 29}
+The aim of this section is to study the accuracy of SKQD for in the SIAM for different system sizes than the one shown in the main text. In particular we consider the $L = 29$ bath-site model. As in the main text, we benchmark the accuracy of SKQD against DMRG. Each DMRG run performed 20 sweeps. The first four sweeps have a maximum bond dimension of $250$, the next four sweeps have a maximum bond dimension of $400$, and the remaining $12$ sweeps a maximum bond dimension of $500$. At each sweep we add noise of amplitude $10^{-4}$ in the first four sweeps, $10^{-5}$ in the next four sweeps, $10^{-7}$ in the next four sweeps, and $0$ in the remaining. 
+
+We analyze the relative error in the ground state energy and the agreement in the prediction of the two-point spin and density correlation functions (see Eqs.~\ref{eq: spin correlation} and~\ref{eq: density correlation}).
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=1\linewidth]{DMRG_vs_SKQD.pdf}
+\caption{SKQD vs DMRG in the SIAM with 29 bath sites (61-qubit experiment). Different rows correspond to different values of the onsite repulsion $U$ in the impurity. \textbf{(a)} Relative error in the ground state energy estimation using SKQD, as a function of the subspace dimension $D$. The DMRG estimation is taken as the ground truth. The Hartree-Fock (HF) and coupled cluster with single and double excitations (CCSD) are also included for reference. The dots correspond to the SKQD estimation in the $\mathbf{k}$-adjacent natural orbitals. \textbf{(b)} Comparison of the two-point spin correlation functions (see Eq.~\ref{eq: spin correlation}) obtained with DMRG and SKQD. \textbf{(c)} Comparison of the two-point density correlation functions (see Eq.~\ref{eq: density correlation}) obtained with DMRG and SKQD. }
+\label{fig: dmrg vs sqd appendix}
+\end{figure*}
+
+Figure~\ref{fig: dmrg vs sqd appendix} (a) shows the relative (to DMRG) error in the SKQD ground-state energy estimation as a function of the subspace dimension on the SKQD eigenstate solver $D$. The Hartree-Fock (HF) and coupled cluster with single and double excitations (CCSD) errors are also shown for reference. The SKQD relative error decreases from values $\sim 10^{-5}$ to $\sim 10^{-6}$ as $U$ increases from $U = 1$ to $U = 10$. This is a consequence of the increased ground-state sparsity for larger values of $U$. 
+
+Panel (b) of Fig.~\ref{fig: dmrg vs sqd appendix} compares the values of $\bar{C}_\textrm{S}(\mathbf{j})$ obtained from SKQD to those obtained with DMRG. The SKQD estimations are in excellent agreement with the DMRG values for most values of $\mathbf{j}$, the distance between the impurity spin and the bath spin. There are small deviations for odd values of $\mathbf{j}$ at larger values of $\mathbf{j}$, where the value of the correlation is negligible.
+
+Panel (c) in Fig.~\ref{fig: dmrg vs sqd appendix} compares the values of $\bar{C}_\textrm{n}(\mathbf{j})$ obtained from SKQD to those obtained with DMRG, for even values of $\mathbf{j}$. The SKQD estimations are in excellent agreement with the DMRG values for all values of $\mathbf{j}$.
+
+The accuracy for the system size presented in this Appendix ($L = 29$), does not significantly differ from the accuracy on the larger system size ($L = 41$) shown in the main text. We conclude that the accuracy of SKQD does not significantly deteriorate with system size in the SIAM.
+
+\section{Signal in the quantum experiments}\label{signal}
+Given the large circuit sizes of our experiments and the effect of noise, we investigate whether there is a useful signal coming out of the quantum circuits, comparing the outcome of SKQD (with configuration recovery) run on samples coming from the device and uniform random samples. The random samples are drown from the uniform distribution in the space of bitstrings whose length is the same as the number of fermionic modes in the system.
+
+This test is conducted on the SIAM with $L = 41$ bath sites and the same values of $U$ as the ones shown in the main text: $U = 1, 3, 7, 10$. The subspace dimension chosen to project and diagonalize the Hamiltonian is $D = 2.56\cdot 10^6$ electronic configurations, and the total number of sampled bitstrings is the same in both cases: $2.5\cdot 10^6$.
+\begin{figure*}[t]
+\centering
+\includegraphics[width=.9\linewidth]{energy_error_vs_85_uniform.pdf}
+\caption{Signal in the quantum experiments. Relative error in the SKQD ground-state energy estimation for different values of $U$. The error is computed relative to the DMRG energy. SKQD is run both on samples coming from the quantum device and the uniform distribution. The HF and CCSD relative errors are included for reference.}
+\label{fig: skqd vs uniform}
+\end{figure*}
+
+Figure~\ref{fig: skqd vs uniform} shows the relative (to DMRG) error in the ground-state energy obtained from running SKQD on samples drawn from the device and samples drawn from the uniform distribution for different values of $U$. The relative error in the ground-state energy is orders of magnitude lower in the SKQD estimation run on samples coming from the quantum device. We therefore conclude that SKQD with configuration recovery is capable of extracting an useful signal from the device. 
+
+
+
+
+\section{Sparsity in the Ising model}\label{sec:sparsity-ising}
+
+
+In this section, we prove the sparsity of the ground state in the computational basis for a particular Hamiltonian. We consider the transverse field Ising model with periodic boundary conditions
+\begin{equation}
+    H_n(h) = -\sum_{i=0}^{n-1} Z_i Z_{i+1} - h \sum_{i=0}^{n-1} X_i.
+\end{equation}
+
+\begin{theorem}
+    \label{thm:tfim-sparsity}
+    If $h = O((k/n)^a)$ for any $a > 1/2$, then in the limit $n\rightarrow\infty$ the ground state of $H_n(h)$ is fully supported on the $O(n^k)$ $Z$-basis states with Hamming weight at most $k$.
+\end{theorem}
+\begin{proof}
+We will ignore the degeneracy of the ground state for simplicity, but the result holds without this assumption by symmetry.
+Let $\ket{\phi_n(h)}$ be the ground state of $H_n(h)$.
+With this assumption, the ground state is $\ket{\phi_n(0)} = \ket{00\dots0}$ and $\lim_{h\to\infty}\ket{\phi_n(h)} = \ket{++\dots +}$.
+Thus, intuitively, $h$ controls the sparsity of the ground state in the computational basis.
+
+Let $|x|$ be the Hamming weight of the bit string $x$, and define
+\begin{align}
+    &M_n(h) = \frac{1}{n} \sum_{i=0}^{n-1} \bra{\phi_n(h)} Z_i \ket{\phi_n(h)} \\
+    %
+    &M(h) = \lim_{n\to\infty} M_n(h)\\
+    %
+    &\bar S_n(k, h) = \sum_{\substack{x \in \{0,1\}^n \\ |x| \leq k}} \abs{\braket{x|\phi_n(h)}}^2 \\
+    %
+    &S_n(k, h) = 1 - \bar S_n(k, h).
+\end{align}
+$S_n(k, h)$ is a proxy for sparsity -- it being small implies that there is very little weight on states outside of the $d$-dimensional subspace defined by Hamming weight less than $k$, where $d = \sum_{w=0}^k \binom{n}{w}$.
+
+
+Define $\alpha_x$ by $\ket{\phi_n(h)} = \sum_{x\in \{0,1\}^n} \alpha_x \ket x$.
+Furthermore, define $\bar P_n(w, h) = \sum_{\substack{x\in \{0,1\}^n \\ |x| = w}} |\alpha_x|^2$, so that $\bar S_n(k, h) = \sum_{w=0}^k \bar P_n(w, h)$.
+Then 
+\begin{align}
+    M_n(h)
+    %
+    &= \frac{1}{n}\sum_{i=0}^{n-1} \sum_{x,y\in \{0,1\}^n} \bar\alpha_x \alpha_y \bra x Z_i \ket y \\
+    %
+    &= \frac{1}{n}\sum_{i=0}^{n-1} \sum_{x\in \{0,1\}^n} |\alpha_x|^2 (-1)^{x_i} \\
+    %
+    &= \frac{1}{n} \sum_{w=0}^n \sum_{\substack{x\in \{0,1\}^n \\ |x|=w}} |\alpha_x|^2 \sum_{i=0}^{n-1} (-1)^{x_i} \\
+    %
+    &= \frac{1}{n} \sum_{w=0}^n \sum_{\substack{x\in \{0,1\}^n \\ |x|=w}} |\alpha_x|^2  (n-2w) \\
+    %
+    &= \sum_{w=0}^n \bar P_n(w, h) (1-2w/n) \\
+    %
+    &= \sum_{w=0}^k \bar P_n(w, h) (1-2w/n) + \sum_{w=k+1}^{n} \bar P_n(w, h) (1-2w/n)\\
+    %
+    &\leq \bar S_n(k, h) + \sum_{w=k+1}^{n} \bar P_n(w, h) (1-2w/n) \\
+    %
+    &\leq \bar S_n(k, h) + (1-2(k+1)/n) \sum_{w=k+1}^{n} \bar P_n(w, h)  \\
+    %
+    &= \bar S_n(k, h) + (1-2(k+1)/n) S_n(k, h)  \\
+    %
+    &= 1 - \frac{2(k+1)}{n} S_n(k, h).
+\end{align}
+It follows that 
+\begin{equation}
+    \label{eq:sparsity}
+    S_n(k, h) \leq \min\left(\frac{n(1-M_n(h))}{2k+2}, 1 \right) .
+\end{equation}
+
+
+If $S_n(k, h) \to 0$ as $n\to\infty$, then the subspace of Hamming weight $\leq k$ bitstrings is fully capturing the ground state.
+The dimension of this space is $d = \sum_{w=0}^k \binom{n}{w}$, which is $\sim n^k$ for constant $k$.
+
+\cref{eq:sparsity} implies that if $M_n(h) = 1 - O((k/n)^a)$ for any $a > 1$, the ground state is fully supported on $O(n^k)$ bitstrings (ie.~if $M_n(h) = 1 - O((k/n)^a)$ for $a>1$, then $S_n(k, h)$ decays to zero with increasing $n$).
+From the phase diagram of the transverse field Ising model, we know \cite[Eq.~3.12]{pfeuty1970the-one-dimensi} that $M(h) = (1-h^2)^{1/8}$ for $0 \leq h \leq 1$, and $M_n(h) \to M(h)$ converges continuously with $n\to\infty$.
+It follows that $h^2 = O((k/n)^a)$ for $a > 1$ suffices.
+This completes the proof.
+\end{proof}
+
+
+\begin{corollary}
+    \label{cor:tfim-sparsity-disordered}
+    If $h = O((n/k)^a)$ for any $a > 1/2$, then in the limit $n\rightarrow\infty$ the ground state of $H_n(h)$ is fully supported on $O(n^k)$ $X$-basis states.
+\end{corollary}
+\begin{proof}
+    Apply a Hadamard matrix on each qubit to get a transformed Hamiltonian 
+    $H_n'(h) = - \sum_{i=0}^{n-1} X_i X_{i+1} - h \sum_{i=0}^{n-1} Z_i$.
+    Then, by \cref{thm:tfim-sparsity}, as $n\rightarrow\infty$ the ground state of $H_n'(h)$ is fully supported on $O(n^k)$ $X$-basis states if $1/h = O((k/n)^a)$ for any $a > 1/2$.
+\end{proof}
+
+
+\cref{thm:tfim-sparsity} proves that the ground state of the transverse field Ising model is sparse in a product state basis (the $Z$-basis) deep in the ordered phase.
+Meanwhile, \cref{cor:tfim-sparsity-disordered} proves that the ground state is sparse in a product state basis (the $X$-basis) deep in the disordered phase.
+
+
+
+
+\section{Comparison with Alternative Notions of Sparsity}\label{sec:app-sparsity-notions}
+
+ Note that our definition of sparseness (or peakedness), as defined in \cref{msec:ksqsd-proof} differs from those in \cite{bravyi2024classical, aaronson2024verifiable}. In \cite{aaronson2024verifiable}, a unitary circuit \( C \) is defined as \(\delta\)-peaked if there exists at least one bitstring \( s \in \{0,1\}^n \) such that \( |\langle s |C|0\rangle|^2 \geq \delta \). The focus of \cite{aaronson2024verifiable} was on random peaked circuits and determining whether such circuits can be distinguished from fully random circuits in classical polynomial time. Similarly, \cite{bravyi2024classical} defines a circuit family \( \{U_n\} \) as peaked if for some \( a \in \mathbb{Z}_{\geq 0} \), each \( U_n \) is \(\delta\)-peaked for \( n \geq 0 \) with \( \delta = n^{-a} \). In this context, an \( n \)-qubit circuit is considered peaked if it has an output probability that is at least inverse-polynomial in \( n \). In \cite{bravyi2024classical}, the authors developed classical algorithms for sampling and estimating output probabilities of constant-depth peaked quantum circuits. In contrast, our definition of sparsity requires the weight to be concentrated on $L$ bitstrings, rather than requiring at least one bitstring to have high probability.
+
+
+
+\bibliographystyle{unsrt}
+\bibliography{refs}
+
+
+
+	
+  
+\end{document}

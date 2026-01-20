@@ -1,0 +1,29 @@
+\RequirePackage{jefferymath}
+
+\usepackage[shortlabels]{enumitem} %messes up beamer bullets
+\usepackage{fancyhdr}
+\usepackage[margin=1in]{geometry}
+\usepackage[none]{hyphenat}
+\usepackage{lastpage}
+
+\usepackage{framed}
+\usepackage{mdframed}
+\usepackage{verbatim}
+
+\usepackage{listings} % TODO move out
+\lstset{tabsize=4}
+
+\makeatletter
+\@ifpackageloaded{hyperref} {} {
+\usepackage[colorlinks=true]{hyperref} %normally load last but there are exceptions, check README
+}
+\makeatother
+\usepackage[capitalize]{cleveref}
+
+%\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+%\setlength{\floatsep}{-10pt} %distance between floats... where has this been applied so far?
+\setlength{\belowcaptionskip}{-20pt}
+%\setlength{\textfloatsep}{-20pt}
+
+\DeclareTextFontCommand{\todo}{\bfseries\color{red}} %todo remove from child sty files

@@ -1,0 +1,266 @@
+\begin{thebibliography}{10}
+
+\bibitem{kitaev1995quantum}
+A~Yu Kitaev.
+\newblock Quantum measurements and the {A}belian stabilizer problem.
+\newblock {\em arXiv preprint quant-ph/9511026}, 1995.
+
+\bibitem{peruzzo2014variational}
+Alberto Peruzzo, Jarrod McClean, Peter Shadbolt, Man-Hong Yung, Xiao-Qi Zhou, Peter~J Love, Al{\'a}n Aspuru-Guzik, and Jeremy~L O’brien.
+\newblock A variational eigenvalue solver on a photonic quantum processor.
+\newblock {\em Nature Communications}, 5(1):4213, 2014.
+
+\bibitem{wecker2015progress}
+Dave Wecker, Matthew~B Hastings, and Matthias Troyer.
+\newblock Progress towards practical quantum variational algorithms.
+\newblock {\em PRA}, 92(4):042303, 2015.
+
+\bibitem{cerezo2021variational}
+Marco Cerezo, Andrew Arrasmith, Ryan Babbush, Simon~C Benjamin, Suguru Endo, Keisuke Fujii, Jarrod~R McClean, Kosuke Mitarai, Xiao Yuan, Lukasz Cincio, et~al.
+\newblock Variational quantum algorithms.
+\newblock {\em Nature Reviews Physics}, 3(9):625--644, 2021.
+
+\bibitem{larocca2024review}
+Martin Larocca, Supanut Thanasilp, Samson Wang, Kunal Sharma, Jacob Biamonte, Patrick~J Coles, Lukasz Cincio, Jarrod~R McClean, Zo{\"e} Holmes, and M~Cerezo.
+\newblock A review of barren plateaus in variational quantum computing.
+\newblock {\em arXiv preprint arXiv:2405.00781}, 2024.
+
+\bibitem{mcclean2017subspace}
+Jarrod~R. McClean, Mollie~E. Kimchi-Schwartz, Jonathan Carter, and Wibe~A. de~Jong.
+\newblock Hybrid quantum-classical hierarchy for mitigation of decoherence and determination of excited states.
+\newblock {\em Phys. Rev. A}, 95:042308, Apr 2017.
+
+\bibitem{parrish2019quantum}
+Robert~M Parrish and Peter~L McMahon.
+\newblock Quantum filter diagonalization: Quantum eigendecomposition without full quantum phase estimation.
+\newblock {\em {arXiv preprint, arXiv:1909.08925}}, 2019.
+
+\bibitem{motta2020qite_qlanczos}
+Mario Motta, Chong Sun, Adrian T.~K. Tan, Matthew~J. O'Rourke, Erika Ye, Austin~J. Minnich, Fernando G. S.~L. Brand{\~a}o, and Garnet Kin-Lic Chan.
+\newblock Determining eigenstates and thermal states on a quantum computer using quantum imaginary time evolution.
+\newblock {\em Nature Physics}, 16(2):205--210, 2020.
+
+\bibitem{klymko2022realtime}
+Katherine Klymko, Carlos Mejuto-Zaera, Stephen~J. Cotton, Filip Wudarski, Miroslav Urbanek, Diptarka Hait, Martin Head-Gordon, K.~Birgitta Whaley, Jonathan Moussa, Nathan Wiebe, Wibe~A. de~Jong, and Norm~M. Tubman.
+\newblock Real-time evolution for ultracompact {H}amiltonian eigenstates on quantum hardware.
+\newblock {\em PRX Quantum}, 3:020323, May 2022.
+
+\bibitem{Epperly_2022}
+Ethan~N. Epperly, Lin Lin, and Yuji Nakatsukasa.
+\newblock A theory of quantum subspace diagonalization.
+\newblock {\em SIAM Journal on Matrix Analysis and Applications}, 43(3):1263–1290, August 2022.
+
+\bibitem{shen2023realtimekrylov}
+Yizhi Shen, Katherine Klymko, James Sud, David~B. Williams-Young, Wibe A.~de Jong, and Norm~M. Tubman.
+\newblock Real-{T}ime {K}rylov {T}heory for {Q}uantum {C}omputing {A}lgorithms.
+\newblock {\em {Quantum}}, 7:1066, July 2023.
+
+\bibitem{yang2023dualgse}
+Bo~Yang, Nobuyuki Yoshioka, Hiroyuki Harada, Shigeo Hakkaku, Yuuki Tokunaga, Hideaki Hakoshima, Kaoru Yamamoto, and Suguru Endo.
+\newblock Dual-{GSE}: Resource-efficient generalized quantum subspace expansion.
+\newblock {\em {arXiv preprint, arXiv:2309.14171}}, 2023.
+
+\bibitem{yang2023shadow}
+Ruyu Yang, Tianren Wang, Bing-Nan Lu, Ying Li, and Xiaosi Xu.
+\newblock Shadow-based quantum subspace algorithm for the nuclear shell model.
+\newblock {\em {arXiv preprint, arXiv:2306.08885}}, 2023.
+
+\bibitem{ohkura2023leveraging}
+Yasuhiro Ohkura, Suguru Endo, Takahiko Satoh, Rodney~Van Meter, and Nobuyuki Yoshioka.
+\newblock Leveraging hardware-control imperfections for error mitigation via generalized quantum subspace.
+\newblock {\em {arXiv preprint, arXiv:2303.07660}}, 2023.
+
+\bibitem{kanno2023quantum}
+Keita Kanno, Masaya Kohda, Ryosuke Imai, Sho Koh, Kosuke Mitarai, Wataru Mizukami, and Yuya~O Nakagawa.
+\newblock Quantum-selected configuration interaction: Classical diagonalization of {H}amiltonians in subspaces selected by quantum computers.
+\newblock {\em {arXiv preprint, arXiv:2302.11320}}, 2023.
+
+\bibitem{ibm2024chemistry}
+Javier Robledo-Moreno, Mario Motta, Holger Haas, Ali Javadi-Abhari, Petar Jurcevic, William Kirby, Simon Martiel, Kunal Sharma, Sandeep Sharma, Tomonori Shirakawa, Iskandar Sitdikov, Rong-Yang Sun, Kevin~J. Sung, Maika Takita, Minh~C. Tran, Seiji Yunoki, and Antonio Mezzacapo.
+\newblock Chemistry beyond exact solutions on a quantum-centric supercomputer.
+\newblock {\em {arXiv preprint, arXiv:2405.05068}}, 2024.
+
+\bibitem{yoshioka2024diagonalization}
+Nobuyuki Yoshioka, Mirko Amico, William Kirby, Petar Jurcevic, Arkopal Dutt, Bryce Fuller, Shelly Garion, Holger Haas, Ikko Hamamura, Alexander Ivrii, Ritajit Majumdar, Zlatko Minev, Mario Motta, Bibek Pokharel, Pedro Rivero, Kunal Sharma, Christopher~J. Wood, Ali Javadi-Abhari, and Antonio Mezzacapo.
+\newblock Diagonalization of large many-body {H}amiltonians on a quantum processor.
+\newblock {\em {arXiv preprint, arXiv:2407.14431}}, 2024.
+
+\bibitem{motta2023subspace}
+Mario Motta, William Kirby, Ieva Liepuoniute, Kevin~J Sung, Jeffrey Cohn, Antonio Mezzacapo, Katherine Klymko, Nam Nguyen, Nobuyuki Yoshioka, and Julia~E Rice.
+\newblock Subspace methods for electronic structure simulations on quantum computers.
+\newblock {\em Electronic Structure}, 6(1):013001, 2024.
+
+\bibitem{oumarou2025molecular}
+Oumarou Oumarou, Pauline~J Ollitrault, Cristian~L Cortes, Maximilian Scheurer, Robert~M Parrish, and Christian Gogolin.
+\newblock Molecular properties from quantum krylov subspace diagonalization.
+\newblock {\em arXiv preprint arXiv:2501.05286}, 2025.
+
+\bibitem{kirby2024analysis}
+William Kirby.
+\newblock Analysis of quantum {K}rylov algorithms with errors.
+\newblock {\em {arXiv preprint, arXiv:2401.01246}}, 2024.
+
+\bibitem{kim2023evidence}
+Youngseok Kim, Andrew Eddins, Sajant Anand, Ken~Xuan Wei, Ewout Van Den~Berg, Sami Rosenblatt, Hasan Nayfeh, Yantao Wu, Michael Zaletel, Kristan Temme, et~al.
+\newblock Evidence for the utility of quantum computing before fault tolerance.
+\newblock {\em Nature}, 618(7965):500--505, 2023.
+
+\bibitem{shinjo2024unveiling}
+Kazuya Shinjo, Kazuhiro Seki, Tomonori Shirakawa, Rong-Yang Sun, and Seiji Yunoki.
+\newblock Unveiling clean two-dimensional discrete time quasicrystals on a digital quantum computer.
+\newblock {\em arXiv preprint arXiv:2403.16718}, 2024.
+
+\bibitem{kaliakin2024supramolecular}
+Danil Kaliakin, Akhil Shajan, Javier~Robledo Moreno, Zhen Li, Abhishek Mitra, Mario Motta, Caleb Johnson, Abdullah~Ash Saki, Susanta Das, Iskandar Sitdikov, et~al.
+\newblock Accurate quantum-centric simulations of supramolecular interactions.
+\newblock {\em arXiv preprint arXiv:2410.09209}, 2024.
+
+\bibitem{barison2024ext-sqd}
+Stefano Barison, Javier~Robledo Moreno, and Mario Motta.
+\newblock Quantum-centric computation of molecular excited states with extended sample-based quantum diagonalization.
+\newblock {\em arXiv preprint arXiv:2411.00468}, 2024.
+
+\bibitem{liepuoniute2024triplet}
+Ieva Liepuoniute, Kirstin~D Doney, Javier Robledo-Moreno, Joshua~A Job, Will~S Friend, and Gavin~O Jones.
+\newblock Quantum-centric study of methylene singlet and triplet states.
+\newblock {\em arXiv preprint arXiv:2411.04827}, 2024.
+
+\bibitem{shajan2024SQD-DMET}
+Akhil Shajan, Danil Kaliakin, Abhishek Mitra, Javier~Robledo Moreno, Zhen Li, Mario Motta, Caleb Johnson, Abdullah~Ash Saki, Susanta Das, Iskandar Sitdikov, et~al.
+\newblock Towards quantum-centric simulations of extended molecules: sample-based quantum diagonalization enhanced with density matrix embedding theory.
+\newblock {\em arXiv preprint arXiv:2411.09861}, 2024.
+
+\bibitem{alexeev2023quantum}
+Yuri Alexeev, Maximilian Amsler, Paul Baity, Marco~Antonio Barroca, Sanzio Bassini, Torey Battelle, Daan Camps, David Casanova, Frederic~T Chong, Charles Chung, et~al.
+\newblock Quantum-centric supercomputing for materials science: A perspective on challenges and future directions.
+\newblock {\em arXiv preprint arXiv:2312.09733}, 2023.
+
+\bibitem{Anderson1961}
+P.~W. Anderson.
+\newblock Localized magnetic states in metals.
+\newblock {\em Phys. Rev.}, 124:41--53, Oct 1961.
+
+\bibitem{white1992DMRG1}
+Steven~R. White.
+\newblock Density matrix formulation for quantum renormalization groups.
+\newblock {\em Phys. Rev. Lett.}, 69:2863--2866, Nov 1992.
+
+\bibitem{white1993DMRG}
+Steven~R. White.
+\newblock Density-matrix algorithms for quantum renormalization groups.
+\newblock {\em Phys. Rev. B}, 48:10345--10356, Oct 1993.
+
+\bibitem{white2005DMRG}
+Steven~R. White.
+\newblock Density matrix renormalization group algorithms with a single center site.
+\newblock {\em Phys. Rev. B}, 72:180403, Nov 2005.
+
+\bibitem{bravyi2024classical}
+Sergey Bravyi, David Gosset, and Yinchen Liu.
+\newblock Classical simulation of peaked shallow quantum circuits.
+\newblock In {\em Proceedings of the 56th Annual ACM Symposium on Theory of Computing}, pages 561--572, 2024.
+
+\bibitem{aaronson2024verifiable}
+Scott Aaronson and Yuxuan Zhang.
+\newblock On verifiable quantum advantage with peaked circuit sampling.
+\newblock {\em {arXiv preprint, arXiv:2404.14493}}, 2024.
+
+\bibitem{wu2022disentanglinginteractingsystemsfermionic}
+Ang-Kun Wu, Benedikt Kloss, Wladislaw Krinitsin, Matthew~T Fishman, JH~Pixley, and EM~Stoudenmire.
+\newblock Disentangling interacting systems with fermionic gaussian circuits: Application to quantum impurity models.
+\newblock {\em Physical Review B}, 111(3):035119, 2025.
+
+\bibitem{Barzykin1998Anderson}
+Victor Barzykin and Ian Affleck.
+\newblock Screening cloud in the $k$-channel kondo model: Perturbative and large-$k$ results.
+\newblock {\em Phys. Rev. B}, 57:432--448, Jan 1998.
+
+\bibitem{Holtzner2009Anderson}
+Andreas Holzner, Ian~P. McCulloch, Ulrich Schollw\"ock, Jan von Delft, and Fabian Heidrich-Meisner.
+\newblock Kondo screening cloud in the single-impurity anderson model: A density matrix renormalization group study.
+\newblock {\em Phys. Rev. B}, 80:205114, Nov 2009.
+
+\bibitem{JordanWigner1928}
+P.~Jordan and E.~Wigner.
+\newblock {\"U}ber das paulische {\"a}quivalenzverbot.
+\newblock {\em Zeit. Phys}, 47(9):631--651, Sep 1928.
+
+\bibitem{wecker_solving_2015}
+Dave Wecker, Matthew~B. Hastings, Nathan Wiebe, Bryan~K. Clark, Chetan Nayak, and Matthias Troyer.
+\newblock Solving strongly correlated electron models on a quantum computer.
+\newblock {\em Phys. Rev. A}, 92:062318, Dec 2015.
+
+\bibitem{Kivlichan2018GivensSlater}
+Ian~D. Kivlichan, Jarrod McClean, Nathan Wiebe, Craig Gidney, Al\'an Aspuru-Guzik, Garnet Kin-Lic Chan, and Ryan Babbush.
+\newblock Quantum simulation of electronic structure with linear depth and connectivity.
+\newblock {\em Phys. Rev. Lett.}, 120:110501, Mar 2018.
+
+\bibitem{jiang_correlated_2018}
+Zhang Jiang, Kevin~J. Sung, Kostyantyn Kechedzhi, Vadim~N. Smelyanskiy, and Sergio Boixo.
+\newblock Quantum algorithms to simulate many-body physics of correlated fermions.
+\newblock {\em Phys. Rev. Applied}, 9:044036, Apr 2018.
+
+\bibitem{moreno2023orbitalOptims}
+Javier~Robledo Moreno, Jeffrey Cohn, Dries Sels, and Mario Motta.
+\newblock Enhancing the expressivity of variational neural, and hardware-efficient quantum states through orbital rotations.
+\newblock {\em arXiv preprint arXiv:2302.11588}, 2023.
+
+\bibitem{kingma2014Adam}
+Diederik~P Kingma.
+\newblock Adam: A method for stochastic optimization.
+\newblock {\em arXiv preprint arXiv:1412.6980}, 2014.
+
+\bibitem{varbench}
+Dian Wu, Riccardo Rossi, Filippo Vicentini, Nikita Astrakhantsev, Federico Becca, Xiaodong Cao, Juan Carrasquilla, Francesco Ferrari, Antoine Georges, Mohamed Hibat-Allah, Masatoshi Imada, Andreas~M. Läuchli, Guglielmo Mazzola, Antonio Mezzacapo, Andrew Millis, Javier~Robledo Moreno, Titus Neupert, Yusuke Nomura, Jannes Nys, Olivier Parcollet, Rico Pohle, Imelda Romero, Michael Schmid, J.~Maxwell Silvester, Sandro Sorella, Luca~F. Tocchio, Lei Wang, Steven~R. White, Alexander Wietek, Qi~Yang, Yiqi Yang, Shiwei Zhang, and Giuseppe Carleo.
+\newblock Variational benchmarks for quantum many-body problems.
+\newblock {\em Science}, 386(6719):296--301, 2024.
+
+\bibitem{Borda2007Anderson}
+L\'aszl\'o Borda.
+\newblock Kondo screening cloud in a one-dimensional wire: Numerical renormalization group study.
+\newblock {\em Phys. Rev. B}, 75:041307, Jan 2007.
+
+\bibitem{sugisaki2024SKQD}
+Kenji Sugisaki, Shu Kanno, Toshinari Itoko, Rei Sakuma, and Naoki Yamamoto.
+\newblock Hamiltonian simulation-based quantum-selected configuration interaction for large-scale electronic structure calculations with a quantum computer.
+\newblock {\em arXiv preprint arXiv:2412.07218}, 2024.
+
+\bibitem{mikkelsen2024SKQD}
+Mathias Mikkelsen and Yuya~O Nakagawa.
+\newblock Quantum-selected configuration interaction with time-evolved state.
+\newblock {\em arXiv preprint arXiv:2412.13839}, 2024.
+
+\bibitem{ffsim}
+{The ffsim developers}.
+\newblock {ffsim: Faster simulations of fermionic quantum circuits.}
+
+\bibitem{sqd_addon}
+Caleb Johnson, Stefano Barison, Bryce Fuller, James~R. Garrison, Jennifer~R. Glick, Abdullah~Ash Saki, Antonio Mezzacapo, Javier Robledo-Moreno, Max Rossmannek, Paul Schweigert, Iskandar Sitdikov, and Kevin~J. Sung.
+\newblock {Qiskit addon: sample-based quantum diagonalization}.
+\newblock \url{https://github.com/Qiskit/qiskit-addon-sqd}, 2024.
+
+\bibitem{qiskit2024}
+Ali Javadi-Abhari, Matthew Treinish, Kevin Krsulich, Christopher~J. Wood, Jake Lishman, Julien Gacon, Simon Martiel, Paul~D. Nation, Lev~S. Bishop, Andrew~W. Cross, Blake~R. Johnson, and Jay~M. Gambetta.
+\newblock Quantum computing with {Q}iskit, 2024.
+
+\bibitem{block2}
+Huanchen Zhai, Henrik~R. Larsson, Seunghoon Lee, Zhi-Hao Cui, Tianyu Zhu, Chong Sun, Linqing Peng, Ruojing Peng, Ke~Liao, Johannes Tölle, Junjie Yang, Shuoxue Li, and Garnet Kin-Lic Chan.
+\newblock Block2: A comprehensive open source framework to develop and apply state-of-the-art dmrg algorithms in electronic structure and beyond.
+\newblock {\em The Journal of Chemical Physics}, 159(23):234801, 12 2023.
+
+\bibitem{sun2018pyscf}
+Qiming Sun, Timothy~C Berkelbach, Nick~S Blunt, George~H Booth, Sheng Guo, Zhendong Li, Junzi Liu, James~D McClain, Elvira~R Sayfutyarova, Sandeep Sharma, et~al.
+\newblock {PySCF: the Python-based simulations of chemistry framework}.
+\newblock {\em WIREs Comput. Mol. Sci}, 8(1):e1340, 2018.
+
+\bibitem{sun2020recent}
+Qiming Sun, Xing Zhang, Samragni Banerjee, Peng Bao, Marc Barbry, Nick~S Blunt, Nikolay~A Bogdanov, George~H Booth, Jia Chen, Zhi-Hao Cui, et~al.
+\newblock Recent developments in the {PySCF} program package.
+\newblock {\em J. Chem. Phys}, 153(2):024109, 2020.
+
+\bibitem{pfeuty1970the-one-dimensi}
+Pierre Pfeuty.
+\newblock The one-dimensional {I}sing model with a transverse field.
+\newblock {\em Annals of Physics}, 57(1):79--90, 1970.
+
+\end{thebibliography}
