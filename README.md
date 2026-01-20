@@ -346,11 +346,11 @@ Then solve the generalized eigenvalue problem for the ground state.
 
 ## References
 
-1. **NF-NQS**: "Improved Ground State Estimation in Quantum Field Theories via Normalising Flow-Assisted Neural Quantum States"
+1. **NF-NQS**: "Improved Ground State Estimation in Quantum Field Theories via Normalising Flow-Assisted Neural Quantum States" - [arXiv:2506.12128](https://arxiv.org/abs/2506.12128)
 
-2. **SKQD**: "Sample-based Krylov Quantum Diagonalization" (Yu et al., IBM Quantum)
+2. **SKQD**: "Sample-based Krylov Quantum Diagonalization" (Yu et al., IBM Quantum) - [arXiv:2501.09702](https://arxiv.org/html/2501.09702v1)
 
-3. **Neural Quantum States**: Carleo & Troyer, "Solving the quantum many-body problem with artificial neural networks", Science 2017
+3. **Neural Quantum States**: Carleo & Troyer, "Solving the quantum many-body problem with artificial neural networks", Science 2017 - [arXiv:1606.02318](https://arxiv.org/abs/1606.02318)
 
 ## License
 
