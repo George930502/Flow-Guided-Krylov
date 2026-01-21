@@ -114,9 +114,16 @@ class SampleBasedKrylovDiagonalization:
         self.cumulative_basis: List[torch.Tensor] = []
         self.energies: List[float] = []
 
+    @property
+    def device(self) -> torch.device:
+        """Get device from Hamiltonian (for GPU-aware Hamiltonians)."""
+        if hasattr(self.hamiltonian, 'device'):
+            return torch.device(self.hamiltonian.device)
+        return torch.device('cpu')
+
     def _create_neel_state(self) -> torch.Tensor:
         """Create Néel state |010101...⟩."""
-        state = torch.zeros(self.num_sites, dtype=torch.long)
+        state = torch.zeros(self.num_sites, dtype=torch.long, device=self.device)
         state[::2] = 1  # Odd sites = 1
         return state
 
@@ -138,9 +145,17 @@ class SampleBasedKrylovDiagonalization:
         Returns:
             Evolved state vector
         """
+        # Ensure state vector is on the correct device
+        device = self.device
+        state_vector = state_vector.to(device)
+
         # For small systems, use exact evolution
         if self.num_sites <= 14:
-            H = self.hamiltonian.to_dense()
+            # Get dense Hamiltonian on the same device
+            H = self.hamiltonian.to_dense(device=str(device))
+            # Ensure H is complex for matrix exponential
+            if not H.is_complex():
+                H = H.to(torch.complex64)
             U = torch.linalg.matrix_exp(-1j * self.time_step * H)
 
             for _ in range(num_steps):
@@ -287,10 +302,10 @@ class SampleBasedKrylovDiagonalization:
         probs = torch.abs(state_vector) ** 2
         probs = probs / probs.sum()  # Normalize
 
-        # Sample indices
+        # Sample indices (multinomial on GPU, convert to numpy for counting)
         indices = torch.multinomial(
             probs, num_samples, replacement=True
-        ).numpy()
+        ).cpu().numpy()
 
         # Count occurrences
         unique, counts = np.unique(indices, return_counts=True)
@@ -335,13 +350,14 @@ class SampleBasedKrylovDiagonalization:
 
         self.krylov_samples = []
 
-        # Create initial state vector in Hilbert space
+        # Create initial state vector in Hilbert space on the correct device
         # |ψ_0⟩ = |bitstring⟩
+        device = self.device
         initial_index = int(
-            "".join(str(b.item()) for b in self.initial_state), 2
+            "".join(str(b.item()) for b in self.initial_state.cpu()), 2
         )
         state_vector = torch.zeros(
-            self.hamiltonian.hilbert_dim, dtype=torch.complex64
+            self.hamiltonian.hilbert_dim, dtype=torch.complex64, device=device
         )
         state_vector[initial_index] = 1.0
 
