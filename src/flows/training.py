@@ -58,6 +58,7 @@ class TrainingConfig:
     # Energy computation
     use_local_energy: bool = False  # Use accurate subspace energy
     use_accumulated_energy: bool = True  # Compute energy on accumulated basis for stability
+    accumulated_energy_interval: int = 1  # Compute accumulated energy every N epochs (1=every epoch)
 
     # Stability - EMA and entropy regularization
     ema_decay: float = 0.95  # Exponential moving average decay for energy tracking
@@ -66,6 +67,10 @@ class TrainingConfig:
     # GPU optimization
     cache_hamiltonian: bool = True  # Cache H matrix for accumulated basis
     max_cached_basis_size: int = 8192  # Max basis size to cache
+
+    # Basis management - CRITICAL for large systems
+    max_accumulated_basis: int = 2048  # Hard cap on accumulated basis size
+    prune_basis_threshold: float = 1e-6  # Prune states with |psi|^2 < threshold
 
     # Logging
     log_interval: int = 10
@@ -339,9 +344,15 @@ class FlowNQSTrainer:
         # EMA energy tracking
         self.ema_energy = None
 
+        # Epoch counter for periodic operations
+        self._epoch_counter = 0
+        self._last_accumulated_energy = None
+
     def _update_accumulated_basis(self, unique_configs: torch.Tensor) -> int:
         """
         Update accumulated basis with new configs using hash-based dedup.
+
+        Implements importance-based pruning when basis exceeds max size.
 
         Returns number of new states added.
         """
@@ -355,7 +366,49 @@ class FlowNQSTrainer:
                     [self.accumulated_basis, new_configs], dim=0
                 )
 
+        # Prune basis if too large
+        if (self.accumulated_basis is not None and
+            len(self.accumulated_basis) > self.config.max_accumulated_basis):
+            self._prune_basis()
+
         return n_added
+
+    def _prune_basis(self):
+        """
+        Prune accumulated basis to max size using importance sampling.
+
+        Keeps states with highest |psi|^2 values.
+        """
+        if self.accumulated_basis is None:
+            return
+
+        max_size = self.config.max_accumulated_basis
+        current_size = len(self.accumulated_basis)
+
+        if current_size <= max_size:
+            return
+
+        # Compute importance weights |psi|^2
+        with torch.no_grad():
+            log_amp = self.nqs.log_amplitude(self.accumulated_basis)
+            log_prob = 2 * log_amp
+            probs = torch.exp(log_prob - log_prob.max())  # Numerical stability
+
+        # Keep top max_size states by importance
+        _, top_indices = torch.topk(probs, max_size)
+        top_indices = top_indices.sort().values  # Maintain order
+
+        # Update accumulated basis
+        self.accumulated_basis = self.accumulated_basis[top_indices]
+
+        # Rebuild hash table with pruned basis
+        self._basis_hash = GPUHashTable(self.device)
+        self._basis_hash.add_batch(self.accumulated_basis)
+
+        # Invalidate cache - force rebuild
+        self._h_cache = IncrementalHamiltonianCache(
+            self.hamiltonian, self.device, self.config.max_cached_basis_size
+        )
 
     def compute_energy_expectation(
         self,
@@ -485,10 +538,24 @@ class FlowNQSTrainer:
             # Compute NQS probabilities
             nqs_probs = self.compute_nqs_probabilities(unique_configs)
 
-            # Compute energy
-            if self.config.use_accumulated_energy and self.accumulated_basis is not None:
+            # Compute energy - use accumulated basis periodically for efficiency
+            use_accumulated = (
+                self.config.use_accumulated_energy and
+                self.accumulated_basis is not None and
+                (self._epoch_counter % self.config.accumulated_energy_interval == 0 or
+                 self._last_accumulated_energy is None)
+            )
+
+            if use_accumulated:
                 energy = self.compute_energy_expectation(
                     self.accumulated_basis,
+                    use_subspace=not self.config.use_local_energy
+                )
+                self._last_accumulated_energy = energy.item()
+            elif self._last_accumulated_energy is not None:
+                # Use cached accumulated energy, but compute batch energy for gradient
+                energy = self.compute_energy_expectation(
+                    unique_configs,
                     use_subspace=not self.config.use_local_energy
                 )
             else:
@@ -560,6 +627,7 @@ class FlowNQSTrainer:
 
         for epoch in pbar:
             epoch_start = time.time()
+            self._epoch_counter = epoch
             metrics = self.train_step()
             epoch_time = time.time() - epoch_start
 

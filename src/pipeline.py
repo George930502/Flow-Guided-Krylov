@@ -67,6 +67,11 @@ class PipelineConfig:
     ema_decay: float = 0.95  # EMA decay for stable energy tracking
     entropy_weight: float = 0.01  # Entropy regularization to prevent collapse
 
+    # Basis management (CRITICAL for large systems like LiH, H2O)
+    max_accumulated_basis: int = 2048  # Hard cap on accumulated basis size
+    accumulated_energy_interval: int = 1  # Compute accumulated energy every N epochs
+    prune_basis_threshold: float = 1e-6  # Prune low-importance states
+
     # Inference parameters
     inference_samples: int = 5000
     inference_iterations: int = 2000
@@ -172,6 +177,10 @@ class FlowGuidedKrylovPipeline:
             use_accumulated_energy=self.config.use_accumulated_energy,
             ema_decay=self.config.ema_decay,
             entropy_weight=self.config.entropy_weight,
+            # Basis management (for large systems)
+            max_accumulated_basis=self.config.max_accumulated_basis,
+            accumulated_energy_interval=self.config.accumulated_energy_interval,
+            prune_basis_threshold=self.config.prune_basis_threshold,
         )
 
         # SKQD configuration

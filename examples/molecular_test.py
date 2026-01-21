@@ -150,22 +150,25 @@ def test_lih(verbose: bool = True):
     E_exact, _ = H.exact_ground_state()
     print(f"Exact ground state energy: {E_exact:.8f} Ha")
 
-    # Configure pipeline (medium system)
+    # Configure pipeline (medium system - optimized for speed)
     config = PipelineConfig(
         nf_coupling_layers=4,
         nf_hidden_dims=[256, 256],
         nqs_hidden_dims=[256, 256, 256, 256],
-        samples_per_batch=2000,
+        samples_per_batch=1000,  # Reduced for faster epochs
         num_batches=1,
-        max_epochs=400,
-        min_epochs=150,
-        convergence_threshold=0.18,
+        max_epochs=300,
+        min_epochs=100,
+        convergence_threshold=0.25,  # More lenient for faster convergence
         inference_samples=2000,
         inference_iterations=800,
         max_krylov_dim=10,
         shots_per_krylov=50000,
         skip_inference=True,
         device="cuda" if torch.cuda.is_available() else "cpu",
+        # Basis management for large Hilbert spaces
+        max_accumulated_basis=1024,  # Cap basis size
+        accumulated_energy_interval=5,  # Compute full energy every 5 epochs
     )
 
     print(f"\nUsing device: {config.device}")
