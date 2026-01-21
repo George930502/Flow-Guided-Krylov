@@ -175,7 +175,7 @@ class Hamiltonian(ABC):
         Returns:
             (ground_state_energy, ground_state_vector)
         """
-        H = self.to_dense(device).numpy()
+        H = self.to_dense(device).cpu().numpy()
 
         eigenvalues, eigenvectors = np.linalg.eigh(H)
 
