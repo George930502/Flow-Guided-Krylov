@@ -37,33 +37,51 @@ Stage 3: SKQD Refinement
 
 ## Key Features
 
-- **High Accuracy**: Achieves chemical accuracy on molecular systems
+- **Chemical Accuracy**: Achieves <1 kcal/mol error on H2, LiH, and H2O molecules
+- **Particle Conservation**: Enforces electron number and spin constraints (critical for molecules)
+- **Physics-Guided Training**: Energy importance weighting for faster convergence
+- **Residual Expansion**: Selected-CI style recovery of missing configurations
 - **GPU Accelerated**: Full CUDA support with vectorized operations for fast training
 - **Sparse Time Evolution**: O(nnz) Krylov expansion using scipy.sparse for large systems
-- **Stabilized Training**: Built-in mechanisms to prevent training instabilities
 - **Docker Ready**: Reproducible environment with one command
 - **Flexible**: Works with spin systems and molecular Hamiltonians
 
 ## Molecular Benchmark Results
 
-The pipeline was benchmarked on H2 and LiH molecules, comparing three methods:
+### Enhanced Pipeline (Recommended)
 
-| Molecule | Qubits | Exact (Ha) | Pure SKQD | NF-only | Combined | Chemical Accuracy |
-|----------|--------|------------|-----------|---------|----------|-------------------|
-| H2       | 4      | -1.137284  | 0.00 mHa  | 0.00 mHa | 0.00 mHa | PASS |
-| LiH      | 12     | -7.963743  | 539.21 mHa | 1.64 mHa | 1.66 mHa | FAIL (1.04 kcal/mol) |
+The **enhanced pipeline** achieves chemical accuracy on all tested molecules:
 
-**Key Insights**:
-- **Pure SKQD fails on larger systems**: Without NF guidance, random sampling produces 539 mHa error on LiH (340 kcal/mol!)
-- **NF guidance is critical**: NF-only achieves 1.64 mHa, just slightly above chemical accuracy (1.6 mHa)
-- **Combined method**: The Krylov expansion provides systematic improvement, achieving 1.66 mHa
+| Molecule | Qubits | Electrons | Exact (Ha) | Error (mHa) | Error (kcal/mol) | Status |
+|----------|--------|-----------|------------|-------------|------------------|--------|
+| H2       | 4      | 2 (1α+1β) | -1.137284  | 0.00        | 0.00             | **PASS** |
+| LiH      | 12     | 4 (2α+2β) | -7.963743  | 0.00        | 0.00             | **PASS** |
+| H2O      | 14     | 10 (5α+5β)| -81.123161 | 0.00        | 0.00             | **PASS** |
+
+**Key Enhancements** (over original method):
+1. **Particle-conserving flow**: Enforces N_e and S_z conservation (samples only valid configurations)
+2. **Physics-guided training**: Energy importance weighting for better convergence
+3. **Diversity-aware selection**: Excitation rank bucketing to capture singles, doubles, etc.
+4. **Residual expansion**: Selected-CI style recovery of missing important configurations
 
 Chemical accuracy threshold: **1 kcal/mol = 1.6 mHa**
 
-Run the benchmark yourself:
+Run the enhanced benchmark:
 ```bash
-docker-compose run --rm flow-krylov-gpu python examples/molecular_benchmark.py --molecule all
+docker-compose run --rm flow-krylov-gpu python examples/enhanced_benchmark.py --molecule all
 ```
+
+### Original Pipeline Comparison
+
+The original pipeline (without particle conservation) struggled with larger molecules:
+
+| Molecule | Original NF-NQS | Original SKQD | Enhanced Pipeline | Improvement |
+|----------|-----------------|---------------|-------------------|-------------|
+| H2       | 0.00 mHa        | 0.00 mHa      | 0.00 mHa          | -           |
+| LiH      | 1.64 mHa (FAIL) | 539 mHa       | 0.00 mHa (PASS)   | 100%        |
+| H2O      | 5416 mHa (FAIL) | 1726 mHa      | 0.00 mHa (PASS)   | 100%        |
+
+**Why the original failed on H2O**: H2O has 10 electrons in 7 orbitals (14 qubits). Only 441 configurations out of 16,384 (2.7%) satisfy particle number conservation. Without enforcing this constraint, the flow sampled mostly invalid states.
 
 ## Performance Optimizations
 
@@ -215,6 +233,59 @@ print(f"Combined Energy: {results['combined_energy']:.6f} Ha")
 print(f"Exact Energy:    {exact_energy:.6f} Ha")
 ```
 
+### Enhanced Pipeline (Recommended for Molecules)
+
+For molecular systems, use the enhanced pipeline with particle conservation:
+
+```python
+import torch
+from src.enhanced_pipeline import EnhancedFlowKrylovPipeline, EnhancedPipelineConfig
+from src.hamiltonians.molecular import create_h2o_hamiltonian
+
+# Create H2O molecular Hamiltonian
+H = create_h2o_hamiltonian(oh_length=0.96, angle=104.5)
+
+# Get exact energy for comparison
+exact_energy, _ = H.exact_ground_state()
+
+# Configure the enhanced pipeline
+config = EnhancedPipelineConfig(
+    # Critical: particle-conserving flow for molecules
+    use_particle_conserving_flow=True,
+
+    # Physics-guided training weights
+    teacher_weight=0.35,
+    physics_weight=0.55,  # Higher for strongly correlated systems
+    entropy_weight=0.10,
+
+    # Architecture
+    nf_hidden_dims=[256, 256],
+    nqs_hidden_dims=[256, 256, 256, 256],
+
+    # Training
+    samples_per_batch=1500,
+    max_epochs=400,
+
+    # Diversity selection and residual expansion
+    use_diversity_selection=True,
+    use_residual_expansion=True,
+    residual_iterations=8,
+
+    device="cuda" if torch.cuda.is_available() else "cpu",
+)
+
+# Run the enhanced pipeline
+pipeline = EnhancedFlowKrylovPipeline(H, config=config, exact_energy=exact_energy)
+results = pipeline.run(progress=True)
+
+# Print results
+E_pipeline = results.get('combined_energy', results.get('skqd_energy'))
+error_mha = abs(E_pipeline - exact_energy) * 1000
+print(f"Pipeline Energy: {E_pipeline:.6f} Ha")
+print(f"Exact Energy:    {exact_energy:.6f} Ha")
+print(f"Error: {error_mha:.4f} mHa ({error_mha * 0.6275:.4f} kcal/mol)")
+```
+
 ### Configuration Options
 
 | Parameter | Default | Description |
@@ -275,10 +346,13 @@ This gives an exact variational energy in the subspace, which systematically imp
 ```
 Flow-Guided-Krylov/
 ├── src/
-│   ├── pipeline.py              # Main pipeline orchestration
+│   ├── pipeline.py              # Original pipeline orchestration
+│   ├── enhanced_pipeline.py     # Enhanced pipeline with all improvements
 │   ├── flows/
 │   │   ├── discrete_flow.py     # Normalizing flow for discrete states
-│   │   └── training.py          # Co-training logic with stabilization
+│   │   ├── training.py          # Co-training logic with stabilization
+│   │   ├── particle_conserving_flow.py  # Particle-conserving flow (Gumbel-top-k)
+│   │   └── physics_guided_training.py   # Physics-guided training loss
 │   ├── nqs/
 │   │   ├── base.py              # Neural quantum state interface
 │   │   ├── dense.py             # Dense NQS implementation
@@ -289,12 +363,15 @@ Flow-Guided-Krylov/
 │   │   └── molecular.py         # Molecular Hamiltonians (H2, LiH, H2O)
 │   ├── krylov/
 │   │   ├── skqd.py              # SKQD implementation with sparse evolution
-│   │   └── basis_sampler.py     # Krylov basis sampling
+│   │   ├── basis_sampler.py     # Krylov basis sampling
+│   │   └── residual_expansion.py # Selected-CI style residual expansion
 │   └── postprocessing/
-│       ├── eigensolver.py       # Sparse eigensolvers
-│       └── projected_hamiltonian.py
+│       ├── eigensolver.py       # Sparse eigensolvers (including Davidson)
+│       ├── projected_hamiltonian.py
+│       └── diversity_selection.py  # Excitation rank-aware basis selection
 ├── examples/
-│   ├── molecular_benchmark.py   # H2/LiH benchmark comparison
+│   ├── enhanced_benchmark.py    # Enhanced pipeline benchmark (H2, LiH, H2O)
+│   ├── molecular_benchmark.py   # Original benchmark comparison
 │   ├── molecular_test.py        # Molecular system tests
 │   └── h2_example.py            # H2 molecule example
 ├── tests/                       # Unit tests
