@@ -135,8 +135,8 @@ class SampleBasedKrylovDiagonalization:
         """
         Apply time evolution U^num_steps = (e^{-iHΔt})^num_steps.
 
-        Uses exact exponentiation for classical simulation.
-        For quantum hardware, this would use Trotter decomposition.
+        Uses sparse matrix exponential for efficiency with large Hilbert spaces.
+        Falls back to dense for very small systems where overhead dominates.
 
         Args:
             state_vector: Full state vector in Hilbert space
@@ -149,8 +149,8 @@ class SampleBasedKrylovDiagonalization:
         device = self.device
         state_vector = state_vector.to(device)
 
-        # For small systems, use exact evolution
-        if self.num_sites <= 14:
+        # For very small systems (<=6 qubits), dense is faster due to less overhead
+        if self.num_sites <= 6:
             # Get dense Hamiltonian on the same device
             H = self.hamiltonian.to_dense(device=str(device))
             # Ensure H is complex for matrix exponential
@@ -162,9 +162,92 @@ class SampleBasedKrylovDiagonalization:
                 state_vector = U @ state_vector
 
             return state_vector
+        elif self.num_sites <= 16:
+            # For medium systems (7-16 qubits), use sparse matrix exponential
+            # This is MUCH faster than dense for 12+ qubits
+            return self._sparse_time_evolution(state_vector, num_steps)
         else:
             # For larger systems, use Trotter decomposition
             return self._trotter_evolution(state_vector, num_steps)
+
+    def _sparse_time_evolution(
+        self,
+        state_vector: torch.Tensor,
+        num_steps: int,
+    ) -> torch.Tensor:
+        """
+        Apply time evolution using sparse matrix-vector multiplication.
+
+        Uses scipy.sparse.linalg.expm_multiply for efficient computation
+        of e^{-iHt}|psi> without forming the full matrix exponential.
+
+        This is O(nnz * krylov_size) instead of O(n^3) for dense.
+        """
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.linalg import expm_multiply
+
+        # Build sparse Hamiltonian (cached for reuse)
+        if not hasattr(self, '_sparse_H'):
+            self._sparse_H = self._build_sparse_hamiltonian()
+
+        # Convert state to numpy
+        psi_np = state_vector.cpu().numpy().astype(np.complex128)
+
+        # Apply time evolution num_steps times
+        t = -1j * self.time_step
+        for _ in range(num_steps):
+            # expm_multiply computes e^{At}v efficiently using Krylov methods
+            psi_np = expm_multiply(t * self._sparse_H, psi_np)
+
+        # Convert back to torch
+        return torch.from_numpy(psi_np).to(state_vector.device)
+
+    def _build_sparse_hamiltonian(self):
+        """
+        Build sparse CSR Hamiltonian matrix.
+
+        Uses Hamiltonian's to_sparse() method if available (optimized),
+        otherwise builds manually.
+        """
+        # Prefer the Hamiltonian's own to_sparse method if available
+        if hasattr(self.hamiltonian, 'to_sparse'):
+            print(f"Building sparse Hamiltonian ({self.hamiltonian.hilbert_dim} x {self.hamiltonian.hilbert_dim})...")
+            return self.hamiltonian.to_sparse("cpu")
+
+        # Fallback: build manually
+        from scipy.sparse import csr_matrix
+
+        n = self.hamiltonian.hilbert_dim
+        rows, cols, data = [], [], []
+
+        # Generate all basis states
+        basis = self.hamiltonian._generate_all_configs("cpu")
+
+        print(f"Building sparse Hamiltonian manually ({n} x {n})...")
+        for j in range(n):
+            config_j = basis[j]
+
+            # Diagonal element
+            diag = self.hamiltonian.diagonal_element(config_j).item()
+            rows.append(j)
+            cols.append(j)
+            data.append(diag)
+
+            # Off-diagonal connections
+            connected, elements = self.hamiltonian.get_connections(config_j)
+            if len(connected) > 0:
+                for conn, elem in zip(connected, elements):
+                    # Find index of connected config
+                    i = self.hamiltonian._config_to_index(conn)
+                    rows.append(i)
+                    cols.append(j)
+                    data.append(elem.item() if hasattr(elem, 'item') else elem)
+
+        return csr_matrix(
+            (data, (rows, cols)),
+            shape=(n, n),
+            dtype=np.complex128
+        )
 
     def _trotter_evolution(
         self,

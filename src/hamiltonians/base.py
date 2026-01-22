@@ -203,6 +203,23 @@ class Hamiltonian(ABC):
         from scipy.sparse import csr_matrix
         from scipy.sparse.linalg import eigsh
 
+        H_sparse = self.to_sparse(device)
+        eigenvalues, eigenvectors = eigsh(H_sparse, k=k, which="SA")
+
+        return eigenvalues, eigenvectors
+
+    def to_sparse(self, device: str = "cpu"):
+        """
+        Convert to sparse CSR matrix representation.
+
+        More memory efficient than to_dense() for larger systems.
+        Uses scipy.sparse.csr_matrix format.
+
+        Returns:
+            scipy.sparse.csr_matrix
+        """
+        from scipy.sparse import csr_matrix
+
         # Build sparse matrix
         basis = self._generate_all_configs(device)
         n = self.hilbert_dim
@@ -225,13 +242,9 @@ class Hamiltonian(ABC):
                 i = self._config_to_index(conn)
                 rows.append(i)
                 cols.append(j)
-                data.append(elem.item())
+                data.append(elem.item() if hasattr(elem, 'item') else elem)
 
-        H_sparse = csr_matrix((data, (rows, cols)), shape=(n, n))
-
-        eigenvalues, eigenvectors = eigsh(H_sparse, k=k, which="SA")
-
-        return eigenvalues, eigenvectors
+        return csr_matrix((data, (rows, cols)), shape=(n, n), dtype=np.complex128)
 
     def _config_to_index(self, config: torch.Tensor) -> int:
         """Convert configuration to basis index."""

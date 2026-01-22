@@ -199,70 +199,91 @@ class MolecularHamiltonian(Hamiltonian):
         2. Double excitations: a+_p a+_r a_s a_q (two-body terms)
 
         Returns only configurations with non-zero matrix elements.
+
+        Optimized version: Uses numpy arrays for excitation enumeration
+        and minimizes tensor cloning operations.
         """
         device = self.device
         config = config.to(device)
         n_orb = self.n_orbitals
 
-        connected = []
-        elements = []
+        # Work with numpy for faster loops, convert once at end
+        config_np = config.cpu().numpy()
 
-        # Get occupied/virtual orbitals
-        occ_alpha = (config[:n_orb] == 1).nonzero(as_tuple=True)[0]
-        occ_beta = (config[n_orb:] == 1).nonzero(as_tuple=True)[0]
-        virt_alpha = (config[:n_orb] == 0).nonzero(as_tuple=True)[0]
-        virt_beta = (config[n_orb:] == 0).nonzero(as_tuple=True)[0]
+        connected_list = []
+        elements_list = []
 
-        occ_alpha_list = occ_alpha.tolist()
-        occ_beta_list = occ_beta.tolist()
-        virt_alpha_list = virt_alpha.tolist()
-        virt_beta_list = virt_beta.tolist()
+        # Get occupied/virtual orbitals as numpy arrays (faster iteration)
+        occ_alpha = np.where(config_np[:n_orb] == 1)[0]
+        occ_beta = np.where(config_np[n_orb:] == 1)[0]
+        virt_alpha = np.where(config_np[:n_orb] == 0)[0]
+        virt_beta = np.where(config_np[n_orb:] == 0)[0]
+
+        # Pre-fetch h2e to CPU numpy once (faster indexing)
+        h2e_np = self.h2e.cpu().numpy()
 
         # ===== SINGLE EXCITATIONS (one-body terms) =====
+        occ_alpha_set = set(occ_alpha)
+        occ_beta_set = set(occ_beta)
+        virt_alpha_set = set(virt_alpha)
+        virt_beta_set = set(virt_beta)
+
         for p, q, h_pq in self.single_exc_data:
             # Alpha: q -> p
-            if q in occ_alpha_list and p in virt_alpha_list:
-                new_config = config.clone()
+            if q in occ_alpha_set and p in virt_alpha_set:
+                new_config = config_np.copy()
                 new_config[q] = 0
                 new_config[p] = 1
-                sign = self._jw_sign(config, p, q)
-                connected.append(new_config)
-                elements.append(sign * h_pq)
+                sign = self._jw_sign_np(config_np, p, q)
+                connected_list.append(new_config)
+                elements_list.append(sign * h_pq)
 
             # Beta: q -> p
-            if q in occ_beta_list and p in virt_beta_list:
-                new_config = config.clone()
+            if q in occ_beta_set and p in virt_beta_set:
+                new_config = config_np.copy()
                 new_config[q + n_orb] = 0
                 new_config[p + n_orb] = 1
-                sign = self._jw_sign(config, p + n_orb, q + n_orb)
-                connected.append(new_config)
-                elements.append(sign * h_pq)
+                sign = self._jw_sign_np(config_np, p + n_orb, q + n_orb)
+                connected_list.append(new_config)
+                elements_list.append(sign * h_pq)
 
         # ===== DOUBLE EXCITATIONS (two-body terms) =====
         # Alpha-Alpha
-        for i, q in enumerate(occ_alpha_list):
-            for s in occ_alpha_list[i+1:]:
-                for j, p in enumerate(virt_alpha_list):
-                    for r in virt_alpha_list[j+1:]:
-                        val = self.h2e[p, q, r, s].item() - self.h2e[p, s, r, q].item()
+        n_occ_a = len(occ_alpha)
+        n_virt_a = len(virt_alpha)
+        for i in range(n_occ_a):
+            q = occ_alpha[i]
+            for j in range(i + 1, n_occ_a):
+                s = occ_alpha[j]
+                for k in range(n_virt_a):
+                    p = virt_alpha[k]
+                    for l in range(k + 1, n_virt_a):
+                        r = virt_alpha[l]
+                        val = h2e_np[p, q, r, s] - h2e_np[p, s, r, q]
                         if abs(val) > 1e-12:
-                            new_config = config.clone()
+                            new_config = config_np.copy()
                             new_config[q] = 0
                             new_config[s] = 0
                             new_config[p] = 1
                             new_config[r] = 1
-                            sign = self._jw_sign_double(config, p, r, q, s)
-                            connected.append(new_config)
-                            elements.append(sign * val)
+                            sign = self._jw_sign_double_np(config_np, p, r, q, s)
+                            connected_list.append(new_config)
+                            elements_list.append(sign * val)
 
         # Beta-Beta
-        for i, q in enumerate(occ_beta_list):
-            for s in occ_beta_list[i+1:]:
-                for j, p in enumerate(virt_beta_list):
-                    for r in virt_beta_list[j+1:]:
-                        val = self.h2e[p, q, r, s].item() - self.h2e[p, s, r, q].item()
+        n_occ_b = len(occ_beta)
+        n_virt_b = len(virt_beta)
+        for i in range(n_occ_b):
+            q = occ_beta[i]
+            for j in range(i + 1, n_occ_b):
+                s = occ_beta[j]
+                for k in range(n_virt_b):
+                    p = virt_beta[k]
+                    for l in range(k + 1, n_virt_b):
+                        r = virt_beta[l]
+                        val = h2e_np[p, q, r, s] - h2e_np[p, s, r, q]
                         if abs(val) > 1e-12:
-                            new_config = config.clone()
+                            new_config = config_np.copy()
                             q_idx = q + n_orb
                             s_idx = s + n_orb
                             p_idx = p + n_orb
@@ -271,32 +292,82 @@ class MolecularHamiltonian(Hamiltonian):
                             new_config[s_idx] = 0
                             new_config[p_idx] = 1
                             new_config[r_idx] = 1
-                            sign = self._jw_sign_double(config, p_idx, r_idx, q_idx, s_idx)
-                            connected.append(new_config)
-                            elements.append(sign * val)
+                            sign = self._jw_sign_double_np(config_np, p_idx, r_idx, q_idx, s_idx)
+                            connected_list.append(new_config)
+                            elements_list.append(sign * val)
 
         # Alpha-Beta (no exchange term)
-        for q in occ_alpha_list:
-            for s in occ_beta_list:
-                for p in virt_alpha_list:
-                    for r in virt_beta_list:
-                        val = self.h2e[p, q, r, s].item()
+        for q in occ_alpha:
+            for s in occ_beta:
+                for p in virt_alpha:
+                    for r in virt_beta:
+                        val = h2e_np[p, q, r, s]
                         if abs(val) > 1e-12:
-                            new_config = config.clone()
+                            new_config = config_np.copy()
                             s_idx = s + n_orb
                             r_idx = r + n_orb
                             new_config[q] = 0
                             new_config[s_idx] = 0
                             new_config[p] = 1
                             new_config[r_idx] = 1
-                            sign = self._jw_sign_double(config, p, r_idx, q, s_idx)
-                            connected.append(new_config)
-                            elements.append(sign * val)
+                            sign = self._jw_sign_double_np(config_np, p, r_idx, q, s_idx)
+                            connected_list.append(new_config)
+                            elements_list.append(sign * val)
 
-        if len(connected) == 0:
+        if len(connected_list) == 0:
             return torch.empty(0, self.num_sites, device=device), torch.empty(0, device=device)
 
-        return torch.stack(connected), torch.tensor(elements, device=device)
+        # Convert to torch tensors once at the end
+        connected = torch.from_numpy(np.array(connected_list)).to(device)
+        elements = torch.tensor(elements_list, dtype=torch.float32, device=device)
+
+        return connected, elements
+
+    def _jw_sign_np(self, config: np.ndarray, p: int, q: int) -> int:
+        """
+        Compute Jordan-Wigner sign for a+_p a_q (numpy version).
+
+        Sign = (-1)^(number of occupied sites between p and q)
+        """
+        if p == q:
+            return 1
+        low, high = min(p, q), max(p, q)
+        count = config[low + 1:high].sum()
+        return (-1) ** int(count)
+
+    def _jw_sign_double_np(
+        self, config: np.ndarray, p: int, r: int, q: int, s: int
+    ) -> int:
+        """
+        Compute Jordan-Wigner sign for double excitation a+_p a+_r a_s a_q (numpy version).
+        """
+        total_count = 0
+        total_count += config[:p].sum()
+
+        count_r = config[:r].sum()
+        if q < r:
+            count_r -= config[q]
+        total_count += count_r
+
+        count_s = config[:s].sum()
+        if p < s:
+            count_s += 1
+        if r < s:
+            count_s += 1
+        if q < s:
+            count_s -= config[q]
+        total_count += count_s
+
+        count_q = config[:q].sum()
+        if p < q:
+            count_q += 1
+        if r < q:
+            count_q += 1
+        if s < q:
+            count_q -= config[s]
+        total_count += count_q
+
+        return (-1) ** int(total_count)
 
     def _jw_sign_double(
         self, config: torch.Tensor, p: int, r: int, q: int, s: int
@@ -352,7 +423,8 @@ class MolecularHamiltonian(Hamiltonian):
         """
         Fast Hamiltonian matrix construction.
 
-        Uses vectorized diagonal and hash-based off-diagonal lookup.
+        Uses vectorized diagonal and optimized off-diagonal computation.
+        For large bases (>200 configs), uses integer hash encoding for speed.
 
         Args:
             configs: (n_configs, num_sites) basis configurations
@@ -368,23 +440,83 @@ class MolecularHamiltonian(Hamiltonian):
         # Vectorized diagonal
         H.diagonal().copy_(self.diagonal_elements_batch(configs))
 
-        # Build hash table for O(1) config lookup
-        config_hash = {}
-        for i in range(n_configs):
-            key = tuple(configs[i].cpu().tolist())
-            config_hash[key] = i
+        # Use integer encoding for faster hash lookups (avoid tuple conversion)
+        # Encode config as integer: sum(config[i] * 2^i)
+        powers = (2 ** torch.arange(self.num_sites, device='cpu')).flip(0)
+        configs_cpu = configs.cpu()
+        config_ints = (configs_cpu * powers).sum(dim=1).tolist()
+        config_hash = {config_ints[i]: i for i in range(n_configs)}
 
-        # Off-diagonal elements
+        # Off-diagonal elements with batched processing
         for j in range(n_configs):
             connected, elements = self.get_connections(configs[j])
             if len(connected) > 0:
-                for k in range(len(connected)):
-                    key = tuple(connected[k].cpu().tolist())
-                    if key in config_hash:
-                        i = config_hash[key]
+                # Batch encode connected configs
+                connected_cpu = connected.cpu()
+                connected_ints = (connected_cpu * powers).sum(dim=1).tolist()
+
+                for k, conn_int in enumerate(connected_ints):
+                    if conn_int in config_hash:
+                        i = config_hash[conn_int]
                         H[i, j] = elements[k]
 
         return H
+
+    @torch.no_grad()
+    def get_connections_batch(
+        self, configs: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Batch compute off-diagonal connections for multiple configurations.
+
+        Returns sparse COO format data for efficient matrix construction.
+
+        Args:
+            configs: (n_configs, num_sites) configurations
+
+        Returns:
+            (row_indices, col_indices, values) for sparse matrix
+        """
+        device = self.device
+        configs = configs.to(device)
+        n_configs = configs.shape[0]
+        n_orb = self.n_orbitals
+
+        all_rows = []
+        all_cols = []
+        all_vals = []
+
+        # Integer encoding for fast lookup
+        powers = (2 ** torch.arange(self.num_sites, device='cpu')).flip(0)
+        configs_cpu = configs.cpu()
+        config_ints = (configs_cpu * powers).sum(dim=1).tolist()
+        config_hash = {config_ints[i]: i for i in range(n_configs)}
+
+        for j in range(n_configs):
+            connected, elements = self.get_connections(configs[j])
+            if len(connected) > 0:
+                connected_cpu = connected.cpu()
+                connected_ints = (connected_cpu * powers).sum(dim=1).tolist()
+
+                for k, conn_int in enumerate(connected_ints):
+                    if conn_int in config_hash:
+                        i = config_hash[conn_int]
+                        all_rows.append(i)
+                        all_cols.append(j)
+                        all_vals.append(elements[k].item())
+
+        if len(all_rows) == 0:
+            return (
+                torch.tensor([], dtype=torch.long, device=device),
+                torch.tensor([], dtype=torch.long, device=device),
+                torch.tensor([], dtype=torch.float32, device=device),
+            )
+
+        return (
+            torch.tensor(all_rows, dtype=torch.long, device=device),
+            torch.tensor(all_cols, dtype=torch.long, device=device),
+            torch.tensor(all_vals, dtype=torch.float32, device=device),
+        )
 
     def matrix_elements(
         self,
@@ -539,6 +671,50 @@ class MolecularHamiltonian(Hamiltonian):
             config[i + self.n_orbitals] = 1
 
         return config
+
+    def to_sparse(self, device: str = "cpu"):
+        """
+        Convert to sparse CSR matrix representation.
+
+        Optimized for molecular Hamiltonians using vectorized operations.
+
+        Returns:
+            scipy.sparse.csr_matrix
+        """
+        from scipy.sparse import csr_matrix
+
+        n = self.hilbert_dim
+        rows, cols, data = [], [], []
+
+        # Generate all basis states
+        basis = self._generate_all_configs(device)
+
+        # Batch compute diagonal elements
+        diag_values = self.diagonal_elements_batch(basis).cpu().numpy()
+
+        for j in range(n):
+            # Diagonal
+            rows.append(j)
+            cols.append(j)
+            data.append(diag_values[j])
+
+            # Off-diagonal connections
+            config_j = basis[j]
+            connected, elements = self.get_connections(config_j)
+
+            if len(connected) > 0:
+                for conn, elem in zip(connected, elements):
+                    # Find index of connected config
+                    i = self._config_to_index(conn)
+                    rows.append(i)
+                    cols.append(j)
+                    data.append(elem.item() if hasattr(elem, 'item') else elem)
+
+        return csr_matrix(
+            (data, (rows, cols)),
+            shape=(n, n),
+            dtype=np.complex128
+        )
 
 
 def compute_molecular_integrals(

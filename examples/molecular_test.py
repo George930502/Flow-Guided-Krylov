@@ -127,6 +127,12 @@ def test_lih(verbose: bool = True):
 
     LiH with STO-3G: 12 spin orbitals -> 12 qubits
     Exact ground state energy: ~-7.882 Hartree
+
+    Performance optimizations:
+    - Sparse time evolution in SKQD (avoids O(4096^3) dense matrix exp)
+    - Reduced Krylov dimension (8 instead of 10-12)
+    - Numpy-based excitation computation
+    - Integer hash encoding for fast config lookup
     """
     if not PYSCF_AVAILABLE:
         print("PySCF not available. Install with: pip install pyscf")
@@ -147,28 +153,43 @@ def test_lih(verbose: bool = True):
     print(f"Hilbert space dimension: {H.hilbert_dim}")
 
     # Get exact energy (feasible for 12 qubits)
+    print("Computing exact ground state energy...")
     E_exact, _ = H.exact_ground_state()
     print(f"Exact ground state energy: {E_exact:.8f} Ha")
 
-    # Configure pipeline (medium system - optimized for speed)
+    # Configure pipeline (balanced for LiH: fast + accurate)
+    #
+    # Performance optimizations applied:
+    # 1. Sparse time evolution in SKQD (scipy.sparse.linalg.expm_multiply)
+    #    - O(nnz * krylov) instead of O(4096^3) dense matrix exponential
+    # 2. Numpy-based excitation computation in get_connections()
+    #    - Avoids torch tensor overhead in Python loops
+    # 3. Integer hash encoding for fast config lookup
+    #    - O(1) lookup instead of tuple conversion overhead
+    #
+    # Accuracy settings:
+    # 1. max_accumulated_basis=1536 - good coverage without excessive memory
+    # 2. max_krylov_dim=8 - sufficient for LiH with sparse evolution
+    # 3. convergence_threshold=0.22 - balance between speed and NF quality
+    #
     config = PipelineConfig(
         nf_coupling_layers=4,
         nf_hidden_dims=[256, 256],
         nqs_hidden_dims=[256, 256, 256, 256],
-        samples_per_batch=1000,  # Reduced for faster epochs
+        samples_per_batch=1200,  # Good coverage
         num_batches=1,
-        max_epochs=300,
-        min_epochs=100,
-        convergence_threshold=0.25,  # More lenient for faster convergence
+        max_epochs=250,
+        min_epochs=80,
+        convergence_threshold=0.22,  # Balanced threshold
         inference_samples=2000,
         inference_iterations=800,
-        max_krylov_dim=10,
+        max_krylov_dim=8,   # Sparse evolution makes this fast
         shots_per_krylov=50000,
         skip_inference=True,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        # Basis management for large Hilbert spaces
-        max_accumulated_basis=1024,  # Cap basis size
-        accumulated_energy_interval=5,  # Compute full energy every 5 epochs
+        # Basis management - balanced for speed and accuracy
+        max_accumulated_basis=1536,  # Good coverage without excessive cost
+        accumulated_energy_interval=8,  # Less frequent but still accurate
     )
 
     print(f"\nUsing device: {config.device}")
