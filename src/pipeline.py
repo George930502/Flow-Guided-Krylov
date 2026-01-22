@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 try:
     from .nqs.dense import DenseNQS
     from .flows.discrete_flow import DiscreteFlowSampler
-    from .flows.training import FlowNQSTrainer, TrainingConfig, InferenceNQSTrainer
+    from .flows.training import FlowNQSTrainer, TrainingConfig
     from .hamiltonians.base import Hamiltonian
     from .hamiltonians.spin import TransverseFieldIsing, HeisenbergHamiltonian
     from .hamiltonians.molecular import MolecularHamiltonian
@@ -32,7 +32,7 @@ try:
 except ImportError:
     from nqs.dense import DenseNQS
     from flows.discrete_flow import DiscreteFlowSampler
-    from flows.training import FlowNQSTrainer, TrainingConfig, InferenceNQSTrainer
+    from flows.training import FlowNQSTrainer, TrainingConfig
     from hamiltonians.base import Hamiltonian
     from hamiltonians.spin import TransverseFieldIsing, HeisenbergHamiltonian
     from hamiltonians.molecular import MolecularHamiltonian
@@ -72,11 +72,10 @@ class PipelineConfig:
     accumulated_energy_interval: int = 1  # Compute accumulated energy every N epochs
     prune_basis_threshold: float = 1e-6  # Prune low-importance states
 
-    # Inference parameters
-    inference_samples: int = 5000
-    inference_iterations: int = 2000
-    inference_lr: float = 1e-3
-    skip_inference: bool = True  # Skip inference phase (use co-trained NQS directly)
+    # Note: Inference NQS phase was removed as it's redundant.
+    # SKQD performs direct diagonalization in the basis, making amplitude
+    # refinement unnecessary. The co-trained NQS provides sufficient
+    # intermediate energy tracking during training.
 
     # SKQD parameters
     max_krylov_dim: int = 12
@@ -101,12 +100,12 @@ class FlowGuidedKrylovPipeline:
        - Normalizing Flow learns to sample high-probability basis states
        - NQS learns amplitude/phase structure
 
-    2. **Basis Extraction**: Freeze NF and sample a high-quality basis set
+    2. **Basis Extraction**: Collect unique basis states from training
 
-    3. **Inference NQS Training**: Refine amplitudes on the fixed basis
-
-    4. **SKQD Refinement**: Use Krylov time evolution to systematically
+    3. **SKQD Refinement**: Use Krylov time evolution to systematically
        expand and improve the basis, achieving convergence to ground truth
+       - Direct diagonalization in the combined NF+Krylov basis
+       - No amplitude refinement needed (exact variational energy)
 
     Example usage:
     ```python
@@ -223,7 +222,7 @@ class FlowGuidedKrylovPipeline:
 
     def extract_basis(
         self,
-        n_samples: Optional[int] = None,
+        n_samples: int = 5000,
     ) -> torch.Tensor:
         """
         Stage 2: Extract basis from trained NF.
@@ -231,15 +230,15 @@ class FlowGuidedKrylovPipeline:
         Prefers accumulated basis from training (preserves important states),
         otherwise samples fresh from the frozen flow.
 
+        Args:
+            n_samples: Number of samples for fresh sampling (fallback only)
+
         Returns:
             Unique basis configurations, shape (n_basis, num_sites)
         """
         print("=" * 60)
         print("Stage 2: Basis Extraction")
         print("=" * 60)
-
-        if n_samples is None:
-            n_samples = self.config.inference_samples
 
         self.flow.eval()
 
@@ -258,90 +257,16 @@ class FlowGuidedKrylovPipeline:
 
         return unique_basis
 
-    def refine_nqs(
-        self,
-        basis: Optional[torch.Tensor] = None,
-        progress: bool = True,
-    ) -> Dict[str, list]:
-        """
-        Stage 3: Train fresh NQS on fixed basis.
-
-        After the flow has converged, we train a new NQS to accurately
-        learn the amplitudes within the discovered subspace.
-
-        Returns:
-            Inference training history
-        """
-        print("=" * 60)
-        print("Stage 3: Inference NQS Training")
-        print("=" * 60)
-
-        if basis is None:
-            basis = self.nf_basis
-
-        # Create fresh NQS for inference
-        inference_nqs = DenseNQS(
-            num_sites=self.num_sites,
-            hidden_dims=self.config.nqs_hidden_dims,
-        ).to(self.config.device)
-
-        trainer = InferenceNQSTrainer(
-            flow=self.flow,
-            nqs=inference_nqs,
-            hamiltonian=self.hamiltonian,
-            lr=self.config.inference_lr,
-            device=self.config.device,
-        )
-
-        history = trainer.train(
-            num_iters=self.config.inference_iterations,
-            n_samples=self.config.inference_samples,
-        )
-
-        self.inference_nqs = inference_nqs
-        self.results["inference_history"] = history
-        self.results["inference_energy"] = history["energies"][-1]
-
-        return history
-
-    def _compute_cotrained_energy(self):
-        """
-        Compute energy using co-trained NQS on accumulated basis.
-
-        Used when skip_inference=True to get energy estimate without
-        training a fresh NQS (which often performs worse).
-        """
-        import torch
-
-        basis = self.nf_basis.to(self.config.device)
-
-        # Compute Hamiltonian matrix in basis
-        H_matrix = self.hamiltonian.matrix_elements(basis.cpu(), basis.cpu())
-        H_matrix = H_matrix.to(self.config.device)
-
-        # Get wavefunction amplitudes from co-trained NQS
-        with torch.no_grad():
-            psi = self.nqs.psi(basis)
-            psi_norm = psi / torch.sqrt(torch.sum(torch.abs(psi)**2))
-
-            if psi.is_complex():
-                energy = torch.real(torch.conj(psi_norm) @ H_matrix @ psi_norm)
-            else:
-                energy = psi_norm @ H_matrix @ psi_norm
-
-        self.results["inference_energy"] = energy.item()
-        print(f"Co-trained NQS energy on basis: {energy.item():.6f}")
-
     def run_skqd(
         self,
         use_nf_basis: bool = True,
         progress: bool = True,
     ) -> Dict[str, list]:
         """
-        Stage 4: Run SKQD for systematic energy refinement.
+        Stage 3: Run SKQD for systematic energy refinement.
 
         Uses Krylov time evolution to expand the basis and improve
-        the energy estimate through subspace projection.
+        the energy estimate through direct diagonalization.
 
         Args:
             use_nf_basis: Whether to include NF-discovered basis
@@ -351,7 +276,7 @@ class FlowGuidedKrylovPipeline:
             SKQD results with energies vs Krylov dimension
         """
         print("=" * 60)
-        print("Stage 4: Sample-Based Krylov Quantum Diagonalization")
+        print("Stage 3: Sample-Based Krylov Quantum Diagonalization")
         print("=" * 60)
 
         if use_nf_basis and hasattr(self, "nf_basis"):
@@ -410,17 +335,9 @@ class FlowGuidedKrylovPipeline:
         # Stage 2: Basis extraction
         self.extract_basis()
 
-        # Stage 3: Inference NQS training (optional)
-        if not self.config.skip_inference:
-            self.refine_nqs(progress=progress)
-        else:
-            print("=" * 60)
-            print("Stage 3: Skipped (using co-trained NQS)")
-            print("=" * 60)
-            # Use energy from co-trained NQS on accumulated basis
-            self._compute_cotrained_energy()
-
-        # Stage 4: SKQD refinement
+        # Stage 3: SKQD refinement
+        # Note: Inference NQS phase was removed - SKQD performs direct diagonalization
+        # in the basis, making amplitude refinement unnecessary.
         self.run_skqd(use_nf_basis=True, progress=progress)
 
         # Summary
@@ -436,9 +353,6 @@ class FlowGuidedKrylovPipeline:
 
         if "nf_nqs_energy" in self.results:
             print(f"NF-NQS Energy:      {self.results['nf_nqs_energy']:.6f}")
-
-        if "inference_energy" in self.results:
-            print(f"Inference Energy:   {self.results['inference_energy']:.6f}")
 
         if "skqd_energy" in self.results:
             print(f"SKQD Energy:        {self.results['skqd_energy']:.6f}")
@@ -469,7 +383,7 @@ class FlowGuidedKrylovPipeline:
             save_path: Path to save figure (optional)
             show: Whether to display the figure
         """
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
         # NF-NQS training
         if "nf_nqs_history" in self.results:
@@ -485,23 +399,9 @@ class FlowGuidedKrylovPipeline:
             ax.set_title("Stage 1: NF-NQS Training")
             ax.legend()
 
-        # Inference training
-        if "inference_history" in self.results:
-            ax = axes[1]
-            energies = self.results["inference_history"]["energies"]
-            ax.plot(energies, "g-", label="Inference NQS")
-            if self.exact_energy is not None:
-                ax.axhline(
-                    self.exact_energy, color="r", linestyle="--", label="Exact"
-                )
-            ax.set_xlabel("Iteration")
-            ax.set_ylabel("Energy")
-            ax.set_title("Stage 3: Inference Training")
-            ax.legend()
-
         # SKQD convergence
         if "skqd_results" in self.results:
-            ax = axes[2]
+            ax = axes[1]
             skqd = self.results["skqd_results"]
 
             if "energies_combined" in skqd:
@@ -535,7 +435,7 @@ class FlowGuidedKrylovPipeline:
 
             ax.set_xlabel("Krylov Dimension")
             ax.set_ylabel("Energy")
-            ax.set_title("Stage 4: SKQD Refinement")
+            ax.set_title("Stage 3: SKQD Refinement")
             ax.legend()
 
         plt.tight_layout()
@@ -555,9 +455,6 @@ class FlowGuidedKrylovPipeline:
             "results": self.results,
         }
 
-        if hasattr(self, "inference_nqs"):
-            checkpoint["inference_nqs_state_dict"] = self.inference_nqs.state_dict()
-
         if hasattr(self, "nf_basis"):
             checkpoint["nf_basis"] = self.nf_basis.cpu()
 
@@ -574,14 +471,5 @@ class FlowGuidedKrylovPipeline:
 
         if "nf_basis" in checkpoint:
             self.nf_basis = checkpoint["nf_basis"].to(self.config.device)
-
-        if "inference_nqs_state_dict" in checkpoint:
-            self.inference_nqs = DenseNQS(
-                num_sites=self.num_sites,
-                hidden_dims=self.config.nqs_hidden_dims,
-            ).to(self.config.device)
-            self.inference_nqs.load_state_dict(
-                checkpoint["inference_nqs_state_dict"]
-            )
 
         print(f"Checkpoint loaded from {path}")

@@ -75,7 +75,6 @@ def test_h2(verbose: bool = True):
         inference_iterations=500,
         max_krylov_dim=8,
         shots_per_krylov=30000,
-        skip_inference=True,
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
@@ -185,7 +184,6 @@ def test_lih(verbose: bool = True):
         inference_iterations=800,
         max_krylov_dim=8,   # Sparse evolution makes this fast
         shots_per_krylov=50000,
-        skip_inference=True,
         device="cuda" if torch.cuda.is_available() else "cpu",
         # Basis management - balanced for speed and accuracy
         max_accumulated_basis=1536,  # Good coverage without excessive cost
@@ -280,7 +278,6 @@ def test_h2o(verbose: bool = True):
         inference_iterations=1000,
         max_krylov_dim=12,
         shots_per_krylov=80000,
-        skip_inference=True,
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
