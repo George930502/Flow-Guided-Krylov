@@ -338,6 +338,10 @@ class SelectedCIExpander:
         """
         Expand basis using perturbation-based selection.
 
+        Includes variational consistency check: if adding configurations
+        increases the energy (violates variational principle), we keep
+        the original basis and return with a warning.
+
         Args:
             current_basis: Current basis configurations
 
@@ -366,14 +370,37 @@ class SelectedCIExpander:
         # Rediagonalize
         new_energy, _ = self._diagonalize(expanded_basis)
 
+        # VARIATIONAL CONSISTENCY CHECK:
+        # Adding configurations should NEVER increase energy (variational principle)
+        # If energy increased, this indicates numerical issues or wrong configs selected
+        energy_improvement = energy - new_energy
+
+        if energy_improvement < -1e-8:  # Allow tiny numerical tolerance
+            # Energy increased - this violates variational principle
+            # Keep the original basis and report the issue
+            stats = {
+                'initial_size': len(current_basis),
+                'final_size': len(current_basis),  # Keep original
+                'configs_added': 0,
+                'initial_energy': energy,
+                'final_energy': energy,  # Keep original energy
+                'energy_improvement': 0.0,
+                'energy_improvement_mha': 0.0,
+                'variational_violation': True,
+                'rejected_energy': new_energy,
+                'rejected_increase_mha': -energy_improvement * 1000,
+            }
+            return current_basis, stats
+
         stats = {
             'initial_size': len(current_basis),
             'final_size': len(expanded_basis),
             'configs_added': len(new_configs),
             'initial_energy': energy,
             'final_energy': new_energy,
-            'energy_improvement': energy - new_energy,
-            'energy_improvement_mha': (energy - new_energy) * 1000,  # in mHa
+            'energy_improvement': energy_improvement,
+            'energy_improvement_mha': energy_improvement * 1000,  # in mHa
+            'variational_violation': False,
         }
 
         return expanded_basis, stats
@@ -382,8 +409,20 @@ class SelectedCIExpander:
         self,
         basis: torch.Tensor,
     ) -> Tuple[float, np.ndarray]:
-        """Diagonalize Hamiltonian in given basis."""
+        """
+        Diagonalize Hamiltonian in given basis.
+
+        Uses float64 precision for numerical stability.
+        Ensures consistent ground state is found across iterations.
+        """
         n_basis = len(basis)
+
+        H_matrix = self.hamiltonian.matrix_elements(basis, basis)
+        # Use float64 for better numerical precision
+        H_np = H_matrix.cpu().numpy().astype(np.float64)
+
+        # Ensure Hermitian symmetry (numerical errors can break this)
+        H_np = 0.5 * (H_np + H_np.T)
 
         # Use sparse solver for large bases
         if n_basis > 500:
@@ -391,17 +430,15 @@ class SelectedCIExpander:
                 from scipy.sparse import csr_matrix
                 from scipy.sparse.linalg import eigsh
 
-                H_matrix = self.hamiltonian.matrix_elements(basis, basis)
-                H_np = H_matrix.cpu().numpy()
                 H_sparse = csr_matrix(H_np)
-
-                eigenvalues, eigenvectors = eigsh(H_sparse, k=1, which='SA', tol=1e-10)
+                # Use tighter tolerance for consistent convergence
+                eigenvalues, eigenvectors = eigsh(
+                    H_sparse, k=1, which='SA', tol=1e-12, maxiter=1000
+                )
                 return float(eigenvalues[0]), eigenvectors[:, 0]
             except Exception:
                 pass  # Fall back to dense
 
-        H_matrix = self.hamiltonian.matrix_elements(basis, basis)
-        H_np = H_matrix.cpu().numpy()
         eigenvalues, eigenvectors = np.linalg.eigh(H_np)
         return float(eigenvalues[0]), eigenvectors[:, 0]
 
@@ -422,7 +459,13 @@ class SelectedCIExpander:
 
         Importance: ε_i = |<i|H|Φ⟩|² / |E - E_i|
 
-        Optimized version with:
+        where <i|H|Φ> = Σⱼ cⱼ <i|H|j> (sum of SIGNED couplings, then square)
+
+        CRITICAL FIX: Previous version incorrectly computed Σⱼ (cⱼ <i|H|j>)²
+        instead of |Σⱼ cⱼ <i|H|j>|². This caused wrong configurations to be
+        selected and energy oscillation (violation of variational principle).
+
+        Optimizations:
         - Hash-based membership checking
         - Coefficient magnitude sorting for early termination
         - BATCHED diagonal energy computation (major speedup)
@@ -446,8 +489,11 @@ class SelectedCIExpander:
         significant_mask = coeff_magnitudes[sorted_indices] > 1e-8
         significant_indices = sorted_indices[significant_mask]
 
-        # PHASE 1: Collect all unique candidates and their couplings (no diagonal calls yet)
-        candidate_coupling_dict = {}  # hash -> (config_tensor, cumulative_coupling_squared)
+        # PHASE 1: Collect all unique candidates and accumulate SIGNED couplings
+        # CRITICAL: We must accumulate signed couplings first, then square
+        # <i|H|Φ> = Σⱼ cⱼ <i|H|j>  (this is a sum of signed terms)
+        # importance = |<i|H|Φ>|² / |E - E_i|
+        candidate_coupling_dict = {}  # hash -> (config_tensor, cumulative_coupling_SIGNED)
 
         for j in significant_indices.tolist():
             coeff_j = coeffs[j].item()
@@ -465,24 +511,28 @@ class SelectedCIExpander:
                 config_hash = hash(connected_np[k].tobytes())
 
                 if config_hash not in basis_hash_set:
+                    # FIXED: Accumulate SIGNED coupling, not squared
                     coupling = coeff_j * elements_np[k]
 
-                    # Aggregate coupling² for this candidate (defer diagonal computation)
                     if config_hash in candidate_coupling_dict:
-                        old_config, old_coupling_sq = candidate_coupling_dict[config_hash]
-                        candidate_coupling_dict[config_hash] = (old_config, old_coupling_sq + coupling**2)
+                        old_config, old_coupling_sum = candidate_coupling_dict[config_hash]
+                        # Accumulate signed couplings (interference can cancel!)
+                        candidate_coupling_dict[config_hash] = (old_config, old_coupling_sum + coupling)
                     else:
-                        candidate_coupling_dict[config_hash] = (connected[k], coupling**2)
+                        candidate_coupling_dict[config_hash] = (connected[k], coupling)
 
         if not candidate_coupling_dict:
             return torch.empty(0, n_sites, device=self.device), torch.empty(0, device=self.device)
 
         # PHASE 2: Batch compute diagonal energies for all candidates at once
         candidates_list = [v[0] for v in candidate_coupling_dict.values()]
-        couplings_sq_list = [v[1] for v in candidate_coupling_dict.values()]
+        couplings_signed_list = [v[1] for v in candidate_coupling_dict.values()]
 
         candidates = torch.stack(candidates_list)
-        couplings_sq = torch.tensor(couplings_sq_list, device=self.device)
+        couplings_signed = torch.tensor(couplings_signed_list, device=self.device)
+
+        # FIXED: Square the accumulated signed coupling (correct PT2 formula)
+        couplings_sq = couplings_signed ** 2
 
         # BATCH diagonal computation - this is the key optimization!
         if hasattr(self.hamiltonian, 'diagonal_elements_batch'):
@@ -493,7 +543,7 @@ class SelectedCIExpander:
                 self.hamiltonian.diagonal_element(c) for c in candidates
             ])
 
-        # Compute PT2 importances
+        # Compute PT2 importances: ε_i = |<i|H|Φ>|² / |E - E_i|
         denominators = torch.abs(energy - E_candidates) + 1e-10
         importances = couplings_sq / denominators
 

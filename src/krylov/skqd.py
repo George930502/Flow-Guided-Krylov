@@ -694,9 +694,11 @@ class SampleBasedKrylovDiagonalization:
         as specified in AGENTs.md for scalability.
 
         Includes numerical stability improvements:
+        - Uses float64 for better precision
         - Regularization for ill-conditioned matrices
         - Hermitian symmetrization
         - SVD-based fallback for problematic cases
+        - Validates result is real (imaginary part should be tiny)
 
         Args:
             basis: Basis states to use (default: use all sampled states)
@@ -715,16 +717,26 @@ class SampleBasedKrylovDiagonalization:
         # Build projected Hamiltonian
         H_proj = self.hamiltonian.matrix_elements(basis, basis)
 
-        # Convert to numpy for sparse solver
-        H_np = H_proj.detach().cpu().numpy()
+        # Convert to numpy with DOUBLE precision for numerical stability
+        H_np = H_proj.detach().cpu().numpy().astype(np.complex128)
         n = H_np.shape[0]
 
         # Ensure Hermitian symmetry (numerical errors can break this)
         H_np = 0.5 * (H_np + H_np.conj().T)
 
+        # Verify Hamiltonian is essentially real (molecular Hamiltonians should be)
+        max_imag = np.abs(H_np.imag).max()
+        if max_imag > 1e-10:
+            # Has significant imaginary part - keep complex
+            pass
+        else:
+            # Essentially real - use real matrix for better stability
+            H_np = H_np.real.astype(np.float64)
+
         # Add small regularization to improve conditioning
+        # NOTE: This shifts ALL eigenvalues up by regularization amount
         if regularization > 0:
-            H_np = H_np + regularization * np.eye(n)
+            H_np = H_np + regularization * np.eye(n, dtype=H_np.dtype)
 
         # Check matrix conditioning
         try:
@@ -939,10 +951,18 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         """
         Run SKQD with NF-augmented basis.
 
+        IMPORTANT: This method combines Krylov-discovered configurations with
+        the NF basis, rather than using the full particle-conserving subspace.
+        This is the correct approach because:
+        1. The NF basis already captures important low-energy configurations
+        2. Krylov time evolution discovers configurations missed by NF
+        3. Combining them gives a better basis than either alone
+
         Includes numerical stability improvements:
         - Uses regularization from config
         - Validates energy is variationally consistent
         - Falls back to best NF-only energy if instability detected
+        - Uses float64 for better numerical precision
 
         Returns:
             Dictionary with results comparing NF-only, Krylov-only, and combined
@@ -972,6 +992,7 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         }
 
         best_energy = E_nf
+        best_basis_size = len(self.nf_basis)
         instability_detected = False
 
         for k in range(1, max_krylov_dim):
@@ -982,28 +1003,37 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                 regularization=self.config.regularization
             )
 
-            # Combined
+            # Combined: NF basis + Krylov-discovered configs
             combined_basis = self.get_combined_basis(k, include_nf=True)
             E_combined, _ = self.compute_ground_state_energy(
                 combined_basis,
                 regularization=self.config.regularization
             )
 
-            # Check for numerical instability (energy jumping unexpectedly)
+            # VARIATIONAL CHECK: Energy should decrease or stay same as basis grows
+            # If energy increases, likely numerical instability
             if k > 1 and len(results["energies_combined"]) > 0:
                 prev_energy = results["energies_combined"][-1]
-                energy_jump = abs(E_combined - prev_energy)
+                energy_change = E_combined - prev_energy
 
-                # Large energy jumps can indicate numerical instability
-                if energy_jump > 1.0:  # 1 Ha is suspicious for Krylov refinement
-                    warning = f"k={k+1}: Large energy jump {energy_jump:.4f} Ha"
+                # Energy should not increase significantly
+                if energy_change > 0.001:  # 1 mHa tolerance
+                    warning = f"k={k+1}: Energy increased by {energy_change*1000:.4f} mHa (numerical instability)"
                     results["numerical_warnings"].append(warning)
                     print(f"WARNING: {warning}")
                     instability_detected = True
 
-            # Track best valid energy
+                # Large energy jumps can indicate numerical instability
+                if abs(energy_change) > 1.0:  # 1 Ha is suspicious for Krylov refinement
+                    warning = f"k={k+1}: Large energy jump {abs(energy_change):.4f} Ha"
+                    results["numerical_warnings"].append(warning)
+                    print(f"WARNING: {warning}")
+                    instability_detected = True
+
+            # Track best valid energy (variational principle)
             if E_combined < best_energy:
                 best_energy = E_combined
+                best_basis_size = len(combined_basis)
 
             results["krylov_dims"].append(k + 1)
             results["energies_krylov"].append(E_krylov)
@@ -1011,11 +1041,19 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             results["basis_sizes_krylov"].append(len(krylov_basis))
             results["basis_sizes_combined"].append(len(combined_basis))
 
+        # Report statistics on Krylov contribution
+        if results["energies_combined"]:
+            krylov_improvement = E_nf - best_energy
+            new_configs = best_basis_size - len(self.nf_basis)
+            if krylov_improvement > 0:
+                print(f"Krylov improvement: {krylov_improvement*1000:.4f} mHa "
+                      f"({new_configs} new configs from Krylov sampling)")
+
         # If instability detected, report the most stable result
         if instability_detected:
-            print(f"Numerical instability detected in SKQD. Best stable energy: {best_energy:.6f}")
+            print(f"Numerical instability detected. Best stable energy: {best_energy:.6f}")
             results["best_stable_energy"] = best_energy
         else:
-            results["best_stable_energy"] = results["energies_combined"][-1] if results["energies_combined"] else E_nf
+            results["best_stable_energy"] = best_energy
 
         return results

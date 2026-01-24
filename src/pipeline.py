@@ -516,6 +516,9 @@ class FlowGuidedKrylovPipeline:
             prev_energy = None
             stagnant_count = 0
 
+            best_energy = None
+            best_basis = expanded_basis.clone()
+
             for iteration in range(cfg.residual_iterations):
                 old_size = len(expanded_basis)
                 expanded_basis, expand_stats = expander.expand_basis(expanded_basis)
@@ -525,8 +528,23 @@ class FlowGuidedKrylovPipeline:
                 if initial_energy is None:
                     initial_energy = expand_stats.get('initial_energy', current_energy)
 
-                added = len(expanded_basis) - old_size
+                # Track best energy and basis (variational principle)
+                if best_energy is None or current_energy < best_energy:
+                    best_energy = current_energy
+                    best_basis = expanded_basis.clone()
+
+                added = expand_stats['configs_added']
                 total_added += added
+
+                # Check for variational violation
+                if expand_stats.get('variational_violation', False):
+                    rejected_mha = expand_stats.get('rejected_increase_mha', 0)
+                    print(f"  Iter {iteration+1}: Rejected configs (would increase E by {rejected_mha:.4f} mHa)")
+                    stagnant_count += 1
+                    if stagnant_count >= stagnation_patience:
+                        print(f"  Converged: no improvement for {stagnation_patience} iterations")
+                        break
+                    continue
 
                 # Calculate energy improvement
                 if prev_energy is not None:
@@ -559,14 +577,16 @@ class FlowGuidedKrylovPipeline:
                     print(f"  Reached max basis size: {residual_config.max_basis_size}")
                     break
 
-            final_energy = expand_stats['final_energy']
+            # Use best basis (ensures variational principle is respected)
+            expanded_basis = best_basis
+
             expand_stats = {
                 'initial_basis_size': len(self.nf_basis),
                 'final_basis_size': len(expanded_basis),
                 'configs_added_total': total_added,
                 'iterations': iteration + 1,
                 'initial_energy': initial_energy,
-                'final_energy': final_energy,
+                'final_energy': best_energy if best_energy is not None else current_energy,
                 'converged_early': stagnant_count >= stagnation_patience,
             }
         else:
