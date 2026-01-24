@@ -36,7 +36,8 @@ except ImportError:
     PYSCF_AVAILABLE = False
     print("WARNING: PySCF not available. Install with: pip install pyscf")
 
-from enhanced_pipeline import EnhancedFlowKrylovPipeline, EnhancedPipelineConfig
+from pipeline import FlowGuidedKrylovPipeline as EnhancedFlowKrylovPipeline
+from pipeline import PipelineConfig as EnhancedPipelineConfig
 
 
 def benchmark_h2_enhanced():

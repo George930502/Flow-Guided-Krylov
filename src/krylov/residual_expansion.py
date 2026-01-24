@@ -37,8 +37,15 @@ class ResidualExpansionConfig:
     # Maximum total iterations
     max_iterations: int = 10
 
-    # Convergence criterion (energy change)
+    # Convergence criterion (energy change in Hartree)
     energy_convergence: float = 1e-6
+
+    # Early stopping: minimum energy improvement per iteration (in mHa)
+    # Stop if improvement < this threshold for consecutive iterations
+    min_energy_improvement_mha: float = 0.05  # 0.05 mHa = 5e-5 Ha
+
+    # Number of consecutive stagnant iterations before stopping
+    stagnation_patience: int = 2
 
     # Maximum total basis size
     max_basis_size: int = 4096
@@ -304,6 +311,11 @@ class SelectedCIExpander:
 
     This provides a better estimate of configuration importance
     than raw residual magnitude.
+
+    Optimizations:
+    - Uses numpy arrays instead of Python sets for faster membership checks
+    - Batches diagonal element computations
+    - Early terminates basis state loop for insignificant coefficients
     """
 
     def __init__(
@@ -314,6 +326,10 @@ class SelectedCIExpander:
         self.hamiltonian = hamiltonian
         self.config = config or ResidualExpansionConfig()
         self.device = getattr(hamiltonian, 'device', 'cpu')
+
+        # Cache for basis set membership (optimization)
+        self._basis_array_cache = None
+        self._basis_hash_cache = None
 
     def expand_basis(
         self,
@@ -341,7 +357,7 @@ class SelectedCIExpander:
         )
 
         if len(new_configs) == 0:
-            return current_basis, {'configs_added': 0, 'energy': energy}
+            return current_basis, {'configs_added': 0, 'energy': energy, 'initial_energy': energy, 'final_energy': energy}
 
         # Add new configurations
         expanded_basis = torch.cat([current_basis, new_configs], dim=0)
@@ -357,6 +373,7 @@ class SelectedCIExpander:
             'initial_energy': energy,
             'final_energy': new_energy,
             'energy_improvement': energy - new_energy,
+            'energy_improvement_mha': (energy - new_energy) * 1000,  # in mHa
         }
 
         return expanded_basis, stats
@@ -366,12 +383,33 @@ class SelectedCIExpander:
         basis: torch.Tensor,
     ) -> Tuple[float, np.ndarray]:
         """Diagonalize Hamiltonian in given basis."""
+        n_basis = len(basis)
+
+        # Use sparse solver for large bases
+        if n_basis > 500:
+            try:
+                from scipy.sparse import csr_matrix
+                from scipy.sparse.linalg import eigsh
+
+                H_matrix = self.hamiltonian.matrix_elements(basis, basis)
+                H_np = H_matrix.cpu().numpy()
+                H_sparse = csr_matrix(H_np)
+
+                eigenvalues, eigenvectors = eigsh(H_sparse, k=1, which='SA', tol=1e-10)
+                return float(eigenvalues[0]), eigenvectors[:, 0]
+            except Exception:
+                pass  # Fall back to dense
+
         H_matrix = self.hamiltonian.matrix_elements(basis, basis)
         H_np = H_matrix.cpu().numpy()
-
         eigenvalues, eigenvectors = np.linalg.eigh(H_np)
-
         return float(eigenvalues[0]), eigenvectors[:, 0]
+
+    def _configs_to_hash_set(self, configs: torch.Tensor) -> set:
+        """Convert configurations to hash set for O(1) lookup."""
+        # Use tuple hashing which is faster than set membership for large arrays
+        configs_np = configs.cpu().numpy()
+        return {hash(c.tobytes()) for c in configs_np}
 
     def _find_important_configs(
         self,
@@ -384,57 +422,83 @@ class SelectedCIExpander:
 
         Importance: ε_i = |<i|H|Φ⟩|² / |E - E_i|
 
-        where E_i is approximated by the diagonal element <i|H|i>.
+        Optimized version with:
+        - Hash-based membership checking
+        - Coefficient magnitude sorting for early termination
+        - BATCHED diagonal energy computation (major speedup)
+        - Two-phase collection to minimize diagonal calls
         """
         cfg = self.config
         n_sites = basis.shape[1]
+        n_basis = len(basis)
 
-        basis_set = {tuple(c.cpu().tolist()) for c in basis}
+        # Use hash set for faster membership checks
+        basis_hash_set = self._configs_to_hash_set(basis)
+
         coeffs = torch.from_numpy(eigenvector).float().to(self.device)
 
-        candidates = []
-        importances = []
+        # Sort basis states by coefficient magnitude (descending)
+        # Process most important states first
+        coeff_magnitudes = torch.abs(coeffs)
+        sorted_indices = torch.argsort(coeff_magnitudes, descending=True)
 
-        # Collect candidates from connections
-        for j in range(len(basis)):
-            if abs(coeffs[j].item()) < 1e-10:
-                continue
+        # Only process basis states with significant coefficients
+        significant_mask = coeff_magnitudes[sorted_indices] > 1e-8
+        significant_indices = sorted_indices[significant_mask]
+
+        # PHASE 1: Collect all unique candidates and their couplings (no diagonal calls yet)
+        candidate_coupling_dict = {}  # hash -> (config_tensor, cumulative_coupling_squared)
+
+        for j in significant_indices.tolist():
+            coeff_j = coeffs[j].item()
 
             connected, elements = self.hamiltonian.get_connections(basis[j])
 
             if len(connected) == 0:
                 continue
 
+            # Batch process connections
+            connected_np = connected.cpu().numpy()
+            elements_np = elements.cpu().numpy() if isinstance(elements, torch.Tensor) else np.array([e.cpu().item() if isinstance(e, torch.Tensor) else e for e in elements])
+
             for k in range(len(connected)):
-                config_tuple = tuple(connected[k].cpu().tolist())
+                config_hash = hash(connected_np[k].tobytes())
 
-                if config_tuple not in basis_set:
-                    # Coupling: <i|H|Φ⟩ contribution from this basis state
-                    coupling = coeffs[j].item() * elements[k].item()
+                if config_hash not in basis_hash_set:
+                    coupling = coeff_j * elements_np[k]
 
-                    # Diagonal energy of candidate
-                    E_i = self.hamiltonian.diagonal_element(connected[k]).item()
+                    # Aggregate coupling² for this candidate (defer diagonal computation)
+                    if config_hash in candidate_coupling_dict:
+                        old_config, old_coupling_sq = candidate_coupling_dict[config_hash]
+                        candidate_coupling_dict[config_hash] = (old_config, old_coupling_sq + coupling**2)
+                    else:
+                        candidate_coupling_dict[config_hash] = (connected[k], coupling**2)
 
-                    # Perturbation importance
-                    denominator = abs(energy - E_i) + 1e-10
-                    importance = coupling**2 / denominator
-
-                    candidates.append(connected[k])
-                    importances.append(importance)
-
-        if not candidates:
+        if not candidate_coupling_dict:
             return torch.empty(0, n_sites, device=self.device), torch.empty(0, device=self.device)
 
-        candidates = torch.stack(candidates)
-        importances = torch.tensor(importances, device=self.device)
+        # PHASE 2: Batch compute diagonal energies for all candidates at once
+        candidates_list = [v[0] for v in candidate_coupling_dict.values()]
+        couplings_sq_list = [v[1] for v in candidate_coupling_dict.values()]
 
-        # Aggregate importances for duplicate candidates
-        unique_candidates, inverse = torch.unique(candidates, dim=0, return_inverse=True)
-        unique_importances = torch.zeros(len(unique_candidates), device=self.device)
-        unique_importances.scatter_add_(0, inverse, importances)
+        candidates = torch.stack(candidates_list)
+        couplings_sq = torch.tensor(couplings_sq_list, device=self.device)
+
+        # BATCH diagonal computation - this is the key optimization!
+        if hasattr(self.hamiltonian, 'diagonal_elements_batch'):
+            E_candidates = self.hamiltonian.diagonal_elements_batch(candidates)
+        else:
+            # Fallback for Hamiltonians without batch method
+            E_candidates = torch.stack([
+                self.hamiltonian.diagonal_element(c) for c in candidates
+            ])
+
+        # Compute PT2 importances
+        denominators = torch.abs(energy - E_candidates) + 1e-10
+        importances = couplings_sq / denominators
 
         # Select top by importance
-        n_select = min(cfg.max_configs_per_iter, len(unique_candidates))
-        _, top_indices = torch.topk(unique_importances, n_select)
+        n_select = min(cfg.max_configs_per_iter, len(candidates))
+        _, top_indices = torch.topk(importances, n_select)
 
-        return unique_candidates[top_indices], unique_importances[top_indices]
+        return candidates[top_indices], importances[top_indices]

@@ -716,6 +716,115 @@ class MolecularHamiltonian(Hamiltonian):
             dtype=np.complex128
         )
 
+    def exact_ground_state(
+        self, device: str = "cpu"
+    ) -> Tuple[float, torch.Tensor]:
+        """
+        Compute exact ground state energy by diagonalizing in particle-conserving subspace.
+
+        This is MUCH faster than dense diagonalization in full Hilbert space:
+        - Full space: O(4^n_orbitals)
+        - Particle-conserving: O(C(n_orb, n_alpha) * C(n_orb, n_beta))
+
+        Example speedups:
+        - NH3 (16 qubits): 65,536 -> 3,136 (21x reduction)
+        - N2 (20 qubits): 1,048,576 -> 14,400 (73x reduction)
+
+        Returns:
+            (ground_state_energy, ground_state_vector)
+            Note: ground_state_vector is in full Hilbert space representation
+        """
+        fci_energy_val = self.fci_energy()
+
+        # For small systems, also compute the ground state vector in full space
+        if self.hilbert_dim <= 16384:  # Up to 14 qubits
+            try:
+                from scipy.sparse.linalg import eigsh
+                H_sparse = self.to_sparse(device)
+                eigenvalues, eigenvectors = eigsh(H_sparse, k=1, which="SA")
+                psi0 = eigenvectors[:, 0]
+                return fci_energy_val, torch.from_numpy(psi0).to(device)
+            except Exception:
+                pass
+
+        # For larger systems, return None for eigenvector
+        return fci_energy_val, None
+
+    def fci_energy(self) -> float:
+        """
+        Compute FCI (Full Configuration Interaction) energy using PySCF.
+
+        This computes FCI by diagonalizing our qubit Hamiltonian in the
+        particle-conserving subspace, which is equivalent to FCI and much
+        faster than full Hilbert space diagonalization.
+
+        Returns:
+            FCI ground state energy in Hartree
+        """
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.linalg import eigsh
+
+        # Generate all valid (particle-conserving) configurations
+        from itertools import combinations
+
+        n_orb = self.n_orbitals
+        n_alpha = self.n_alpha
+        n_beta = self.n_beta
+
+        # Generate all valid determinants
+        alpha_configs = list(combinations(range(n_orb), n_alpha))
+        beta_configs = list(combinations(range(n_orb), n_beta))
+
+        basis_configs = []
+        for alpha_occ in alpha_configs:
+            for beta_occ in beta_configs:
+                config = torch.zeros(self.num_sites, dtype=torch.long)
+                for i in alpha_occ:
+                    config[i] = 1
+                for i in beta_occ:
+                    config[i + n_orb] = 1
+                basis_configs.append(config)
+
+        n_configs = len(basis_configs)
+        print(f"Computing FCI energy in {n_configs} configuration subspace...")
+
+        # Build index map for fast lookup
+        config_to_idx = {}
+        for idx, config in enumerate(basis_configs):
+            key = tuple(config.tolist())
+            config_to_idx[key] = idx
+
+        # Build Hamiltonian in this subspace
+        rows, cols, data = [], [], []
+
+        for j, config_j in enumerate(basis_configs):
+            # Diagonal
+            diag = self.diagonal_element(config_j).item()
+            rows.append(j)
+            cols.append(j)
+            data.append(diag)
+
+            # Off-diagonal
+            connected, elements = self.get_connections(config_j)
+            if len(connected) > 0:
+                for conn, elem in zip(connected, elements):
+                    key = tuple(conn.tolist())
+                    if key in config_to_idx:
+                        i = config_to_idx[key]
+                        rows.append(i)
+                        cols.append(j)
+                        data.append(elem.item() if hasattr(elem, 'item') else elem)
+
+        H_fci = csr_matrix(
+            (data, (rows, cols)),
+            shape=(n_configs, n_configs),
+            dtype=np.complex128
+        )
+
+        # Diagonalize
+        eigenvalues, _ = eigsh(H_fci, k=1, which='SA')
+        return float(eigenvalues[0].real)
+
 
 def compute_molecular_integrals(
     geometry: List[Tuple[str, Tuple[float, float, float]]],
@@ -815,6 +924,101 @@ def create_h2o_hamiltonian(
         ("O", (0.0, 0.0, 0.0)),
         ("H", (oh_length, 0.0, 0.0)),
         ("H", (oh_length * np.cos(angle_rad), oh_length * np.sin(angle_rad), 0.0)),
+    ]
+    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    return MolecularHamiltonian(integrals, device=device)
+
+
+def create_beh2_hamiltonian(
+    bond_length: float = 1.33,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> MolecularHamiltonian:
+    """
+    Create BeH2 (beryllium hydride) Hamiltonian.
+
+    Linear molecule: H-Be-H
+    6 electrons, ~7 orbitals in STO-3G
+    Valid configs: C(7,3)² = 1,225
+    """
+    geometry = [
+        ("Be", (0.0, 0.0, 0.0)),
+        ("H", (0.0, 0.0, bond_length)),
+        ("H", (0.0, 0.0, -bond_length)),
+    ]
+    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    return MolecularHamiltonian(integrals, device=device)
+
+
+def create_nh3_hamiltonian(
+    nh_length: float = 1.01,
+    hnh_angle: float = 107.8,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> MolecularHamiltonian:
+    """
+    Create NH3 (ammonia) Hamiltonian.
+
+    Pyramidal molecule with C3v symmetry.
+    10 electrons, ~8 orbitals in STO-3G
+    Valid configs: C(8,5)² = 3,136
+    """
+    # Place N at origin, H atoms in pyramidal arrangement
+    angle_rad = np.radians(hnh_angle)
+    # Height of N above H plane
+    h = nh_length * np.cos(np.arcsin(np.sin(angle_rad/2) / np.sin(np.radians(60))))
+    r = np.sqrt(nh_length**2 - h**2)  # Radius of H triangle
+
+    geometry = [
+        ("N", (0.0, 0.0, h)),
+        ("H", (r, 0.0, 0.0)),
+        ("H", (r * np.cos(np.radians(120)), r * np.sin(np.radians(120)), 0.0)),
+        ("H", (r * np.cos(np.radians(240)), r * np.sin(np.radians(240)), 0.0)),
+    ]
+    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    return MolecularHamiltonian(integrals, device=device)
+
+
+def create_n2_hamiltonian(
+    bond_length: float = 1.10,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> MolecularHamiltonian:
+    """
+    Create N2 (nitrogen) Hamiltonian.
+
+    Diatomic molecule with strong triple bond.
+    14 electrons, ~10 orbitals in STO-3G
+    Valid configs: C(10,7)² = 14,400
+
+    This is a challenging strongly-correlated system.
+    """
+    geometry = [
+        ("N", (0.0, 0.0, 0.0)),
+        ("N", (0.0, 0.0, bond_length)),
+    ]
+    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    return MolecularHamiltonian(integrals, device=device)
+
+
+def create_ch4_hamiltonian(
+    ch_length: float = 1.09,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> MolecularHamiltonian:
+    """
+    Create CH4 (methane) Hamiltonian.
+
+    Tetrahedral molecule with Td symmetry.
+    10 electrons, ~9 orbitals in STO-3G
+    Valid configs: C(9,5)² = 15,876
+    """
+    # Tetrahedral geometry
+    # C at origin, H at vertices of tetrahedron
+    a = ch_length / np.sqrt(3)  # Edge length relationship
+
+    geometry = [
+        ("C", (0.0, 0.0, 0.0)),
+        ("H", (a, a, a)),
+        ("H", (a, -a, -a)),
+        ("H", (-a, a, -a)),
+        ("H", (-a, -a, a)),
     ]
     integrals = compute_molecular_integrals(geometry, basis="sto-3g")
     return MolecularHamiltonian(integrals, device=device)
