@@ -1,6 +1,6 @@
 # Flow-Guided Krylov Quantum Diagonalization
 
-A hybrid quantum-classical algorithm for computing ground state energies of molecular systems with **chemical accuracy** (< 1 kcal/mol). This pipeline combines **Normalizing Flow-Assisted Neural Quantum States (NF-NQS)** for discovering important quantum states with **Sample-Based Krylov Quantum Diagonalization (SKQD)** for energy refinement.
+A hybrid quantum-classical algorithm for computing ground state energies of molecular systems with **chemical accuracy** (< 1 kcal/mol). This pipeline combines [Normalizing Flow-Assisted Neural Quantum States (NF-NQS)](https://arxiv.org/abs/2506.12128) for discovering important quantum states with [Sample-Based Krylov Quantum Diagonalization (SKQD)](https://arxiv.org/abs/2501.09702) for energy refinement, using the [Gumbel-Top-K trick](https://arxiv.org/pdf/1903.06059) for particle-conserving sampling.
 
 ## Pipeline Overview
 
@@ -82,6 +82,18 @@ results = pipeline.run()
 # Check results
 print(f"Energy: {results['combined_energy']:.6f} Ha")
 print(f"Error: {abs(results['combined_energy'] - E_exact) * 1000:.2f} mHa")
+```
+
+### Run Molecular Benchmarks
+
+```bash
+# Run all molecules
+python examples/benchmark.py --molecule all
+
+# Run specific molecule
+python examples/benchmark.py --molecule lih
+
+# Available molecules: h2, lih, h2o, beh2, nh3, n2, ch4
 ```
 
 ### Configuration Options
@@ -174,49 +186,12 @@ config = PipelineConfig(
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Key Techniques
-
-### Stage 1: Particle-Conserving Flow
-
-**Problem:** Standard flows sample invalid configurations with wrong electron count.
-
-**Solution:** Gumbel-Top-K sampling guarantees exactly k electrons per spin channel:
-```python
-# Instead of independent Bernoulli sampling:
-# samples = (probs > uniform) → wrong electron count
-
-# We use differentiable top-k selection:
-gumbel_noise = -log(-log(uniform))
-perturbed_logits = logits + gumbel_noise
-_, indices = topk(perturbed_logits, k=n_electrons)
-samples = one_hot(indices)  # exactly k electrons guaranteed
-```
-
-### Stage 3: PT2 Importance Estimation
-
-Configurations are selected based on second-order perturbation theory:
-
-$$\epsilon_x = \frac{|\langle x|H|\Phi\rangle|^2}{|E - E_x|}$$
-
-This estimates how much adding configuration x would lower the energy.
-
-### Early Stopping for Residual Expansion
-
-```
-Iter 1: 944 -> 1053, E = -61.540, ΔE = --
-Iter 2: 1053 -> 1253, E = -61.778, ΔE = 237.52 mHa
-Iter 3: 1253 -> 1453, E = -61.791, ΔE = 13.32 mHa
-Iter 4: 1453 -> 1653, E = -61.791, ΔE = 0.28 mHa
-Iter 5: 1653 -> 1853, E = -61.791, ΔE = 0.02 mHa
-Converged: improvement < 0.05 mHa for 2 iterations
-```
-
 ## Project Structure
 
 ```
 Flow-Guided-Krylov/
 ├── src/
-│   ├── pipeline.py                    # Main pipeline (consolidated)
+│   ├── pipeline.py                    # Main pipeline
 │   ├── flows/
 │   │   ├── particle_conserving_flow.py  # Gumbel-Top-K flow
 │   │   └── physics_guided_training.py   # Mixed-objective training
@@ -229,17 +204,9 @@ Flow-Guided-Krylov/
 │   │   └── residual_expansion.py        # Selected-CI expansion
 │   └── postprocessing/
 │       └── diversity_selection.py       # Excitation rank bucketing
-├── docs/
-│   ├── README.md                        # Documentation index
-│   ├── PIPELINE_ARCHITECTURE.md         # Full architecture details
-│   ├── STAGE1_NF_NQS_COTRAINING.md     # Stage 1 techniques
-│   ├── STAGE2_DIVERSITY_SELECTION.md   # Stage 2 techniques
-│   ├── STAGE3_RESIDUAL_EXPANSION.md    # Stage 3 techniques
-│   ├── STAGE4_SKQD.md                  # Stage 4 techniques
-│   └── MODULE_MOLECULAR_HAMILTONIAN.md # Hamiltonian module
+├── docs/                                # Detailed documentation
 ├── examples/
-│   ├── enhanced_benchmark.py            # Molecular benchmarks
-│   └── molecular_test.py                # Quick tests
+│   └── benchmark.py                     # Molecular benchmarks
 └── tests/                               # Unit tests
 ```
 
@@ -253,19 +220,6 @@ See the `docs/` folder for detailed documentation:
 - [Stage 3: Residual Expansion](docs/STAGE3_RESIDUAL_EXPANSION.md) - PT2 importance
 - [Stage 4: SKQD](docs/STAGE4_SKQD.md) - Krylov subspace methods
 - [Molecular Hamiltonian](docs/MODULE_MOLECULAR_HAMILTONIAN.md) - PySCF integration
-
-## References
-
-1. **NF-NQS**: "Improved Ground State Estimation in Quantum Field Theories via Normalising Flow-Assisted Neural Quantum States" - [arXiv:2506.12128](https://arxiv.org/abs/2506.12128)
-
-2. **SKQD**: "Sample-based Krylov Quantum Diagonalization" (Yu et al., IBM Quantum) - [arXiv:2501.09702](https://arxiv.org/html/2501.09702v1)
-
-3. **Selected-CI Methods**:
-   - CIPSI: Huron et al. (1973)
-   - ASCI: Tubman et al. (2017)
-   - Heat-bath CI: Holmes et al. (2016)
-
-4. **Gumbel-Top-K**: Kool et al., "Stochastic Beams and Where to Find Them" (2019)
 
 ## License
 
