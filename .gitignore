@@ -20,6 +20,10 @@ wheels/
 .installed.cfg
 *.egg
 
+# Local testing (not for GitHub)
+run_test.py
+tests/
+
 # Virtual environments
 venv/
 ENV/
