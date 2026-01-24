@@ -752,19 +752,19 @@ class MolecularHamiltonian(Hamiltonian):
 
     def fci_energy(self) -> float:
         """
-        Compute FCI (Full Configuration Interaction) energy using PySCF.
+        Compute FCI (Full Configuration Interaction) energy.
 
-        This computes FCI by diagonalizing our qubit Hamiltonian in the
+        This computes FCI by diagonalizing the Hamiltonian in the
         particle-conserving subspace, which is equivalent to FCI and much
         faster than full Hilbert space diagonalization.
+
+        IMPORTANT: Uses the same matrix_elements() function as the pipeline
+        to ensure consistency between FCI reference and pipeline energy.
 
         Returns:
             FCI ground state energy in Hartree
         """
-        from scipy.sparse import csr_matrix
-        from scipy.sparse.linalg import eigsh
-
-        # Generate all valid (particle-conserving) configurations
+        import time
         from itertools import combinations
 
         n_orb = self.n_orbitals
@@ -787,43 +787,40 @@ class MolecularHamiltonian(Hamiltonian):
 
         n_configs = len(basis_configs)
         print(f"Computing FCI energy in {n_configs} configuration subspace...")
+        start_time = time.time()
 
-        # Build index map for fast lookup
-        config_to_idx = {}
-        for idx, config in enumerate(basis_configs):
-            key = tuple(config.tolist())
-            config_to_idx[key] = idx
+        # Stack configs into tensor
+        basis_tensor = torch.stack(basis_configs).to(self.device)
 
-        # Build Hamiltonian in this subspace
-        rows, cols, data = [], [], []
+        # Use the SAME matrix construction as pipeline for consistency
+        H_fci = self.matrix_elements(basis_tensor, basis_tensor)
 
-        for j, config_j in enumerate(basis_configs):
-            # Diagonal
-            diag = self.diagonal_element(config_j).item()
-            rows.append(j)
-            cols.append(j)
-            data.append(diag)
+        # Convert to numpy with float64 for numerical stability
+        H_np = H_fci.cpu().numpy().astype(np.float64)
 
-            # Off-diagonal
-            connected, elements = self.get_connections(config_j)
-            if len(connected) > 0:
-                for conn, elem in zip(connected, elements):
-                    key = tuple(conn.tolist())
-                    if key in config_to_idx:
-                        i = config_to_idx[key]
-                        rows.append(i)
-                        cols.append(j)
-                        data.append(elem.item() if hasattr(elem, 'item') else elem)
+        # Ensure Hermitian symmetry (critical for correct eigenvalues)
+        H_np = 0.5 * (H_np + H_np.T)
 
-        H_fci = csr_matrix(
-            (data, (rows, cols)),
-            shape=(n_configs, n_configs),
-            dtype=np.complex128
-        )
+        # Verify Hermiticity
+        asymmetry = np.abs(H_np - H_np.T).max()
+        if asymmetry > 1e-10:
+            print(f"WARNING: Hamiltonian asymmetry detected: {asymmetry:.2e}")
 
-        # Diagonalize
-        eigenvalues, _ = eigsh(H_fci, k=1, which='SA')
-        return float(eigenvalues[0].real)
+        # Diagonalize using numpy for small matrices, sparse for large
+        if n_configs <= 2000:
+            eigenvalues, _ = np.linalg.eigh(H_np)
+            fci_E = float(eigenvalues[0])
+        else:
+            from scipy.sparse import csr_matrix
+            from scipy.sparse.linalg import eigsh
+            H_sparse = csr_matrix(H_np)
+            eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-12)
+            fci_E = float(eigenvalues[0])
+
+        elapsed = time.time() - start_time
+        print(f"FCI energy: {fci_E:.8f} Ha (computed in {elapsed:.1f}s)")
+
+        return fci_E
 
 
 def compute_molecular_integrals(
