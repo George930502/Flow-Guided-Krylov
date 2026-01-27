@@ -32,6 +32,7 @@ class PhysicsGuidedConfig:
     # Batch sizes
     samples_per_batch: int = 2000
     num_batches: int = 1
+    nqs_chunk_size: int = 8192  # Chunk size for batched NQS evaluation
 
     # Learning rates
     flow_lr: float = 5e-4
@@ -210,8 +211,10 @@ class PhysicsGuidedFlowTrainer:
                 nqs_probs = torch.exp(2 * nqs_log_amp)  # |psi|^2 = exp(2*log|psi|)
                 nqs_probs = nqs_probs / nqs_probs.sum()
 
-            # Compute local energies for physics signal
-            local_energies = self._compute_local_energies(unique_configs)
+            # Compute local energies for physics signal (using chunked batching)
+            local_energies = self._compute_local_energies(
+                unique_configs, nqs_chunk_size=config.nqs_chunk_size
+            )
 
             # Compute NQS energy estimate
             energy = (local_energies * nqs_probs).sum()
@@ -269,33 +272,93 @@ class PhysicsGuidedFlowTrainer:
 
         return total_metrics
 
-    def _compute_local_energies(self, configs: torch.Tensor) -> torch.Tensor:
+    def _compute_local_energies(
+        self, configs: torch.Tensor, nqs_chunk_size: int = 8192
+    ) -> torch.Tensor:
         """
         Compute local energies E_loc(x) = <x|H|psi>/<x|psi>.
 
-        For configurations in the NQS support.
+        Optimized version using chunked NQS batching:
+        1. Collect ALL connected configs from ALL original configs first
+        2. Evaluate NQS on original configs in one batch
+        3. Evaluate NQS on ALL connected configs in large chunks
+        4. Use scatter_add for efficient accumulation
+
+        This significantly improves GPU utilization by processing large batches
+        instead of many small individual NQS forward passes.
+
+        Args:
+            configs: (n_configs, num_sites) basis configurations
+            nqs_chunk_size: Maximum batch size for NQS evaluation (default 8192)
+
+        Returns:
+            (n_configs,) local energies
         """
         n_configs = len(configs)
-        local_energies = torch.zeros(n_configs, device=self.device)
 
         with torch.no_grad():
-            # Diagonal elements
+            # Step 1: Get diagonal elements (already vectorized and efficient)
             diag = self.hamiltonian.diagonal_elements_batch(configs)
 
-            # NQS amplitudes (use log_amplitude method)
-            log_psi = self.nqs.log_amplitude(configs.float())
+            # Step 2: Collect ALL connected configs first (don't evaluate NQS yet)
+            all_connected = []
+            all_elements = []
+            all_orig_indices = []
 
             for i in range(n_configs):
-                # Off-diagonal connections
                 connected, elements = self.hamiltonian.get_connections(configs[i])
+                n_conn = len(connected)
 
-                e_loc = diag[i]
-                if len(connected) > 0:
-                    log_psi_connected = self.nqs.log_amplitude(connected.float())
-                    ratio = torch.exp(log_psi_connected - log_psi[i])
-                    e_loc = e_loc + (elements * ratio).sum()
+                if n_conn > 0:
+                    all_connected.append(connected)
+                    all_elements.append(elements)
+                    # Track which original config each connection belongs to
+                    all_orig_indices.append(
+                        torch.full((n_conn,), i, dtype=torch.long, device=self.device)
+                    )
 
-                local_energies[i] = e_loc.real if torch.is_complex(e_loc) else e_loc
+            # If no off-diagonal connections, return diagonal energies
+            if not all_connected:
+                return diag
+
+            # Step 3: Concatenate all collected data
+            all_connected = torch.cat(all_connected, dim=0)  # (total_connections, num_sites)
+            all_elements = torch.cat(all_elements, dim=0)    # (total_connections,)
+            all_orig_indices = torch.cat(all_orig_indices, dim=0)  # (total_connections,)
+
+            total_connections = len(all_connected)
+
+            # Step 4: Evaluate NQS on original configs (single batch)
+            log_psi_orig = self.nqs.log_amplitude(configs.float())
+
+            # Step 5: Evaluate NQS on ALL connected configs in large chunks
+            # This is the key optimization - large batches saturate the GPU
+            log_psi_connected = torch.empty(total_connections, device=self.device)
+
+            for start in range(0, total_connections, nqs_chunk_size):
+                end = min(start + nqs_chunk_size, total_connections)
+                log_psi_connected[start:end] = self.nqs.log_amplitude(
+                    all_connected[start:end].float()
+                )
+
+            # Step 6: Compute amplitude ratios psi(connected)/psi(original)
+            log_psi_orig_expanded = log_psi_orig[all_orig_indices]
+            ratios = torch.exp(log_psi_connected - log_psi_orig_expanded)
+
+            # Step 7: Compute weighted contributions
+            weighted = all_elements * ratios
+
+            # Step 8: Accumulate off-diagonal contributions using scatter_add
+            # off_diag[i] = sum of weighted[j] for all j where all_orig_indices[j] == i
+            off_diag = torch.zeros(n_configs, device=self.device)
+            off_diag.scatter_add_(0, all_orig_indices, weighted)
+
+            # Step 9: Total local energy = diagonal + off-diagonal
+            local_energies = diag + off_diag
+
+            # Handle complex values if present
+            if torch.is_complex(local_energies):
+                local_energies = local_energies.real
 
         return local_energies
 

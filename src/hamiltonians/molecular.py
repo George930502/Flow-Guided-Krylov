@@ -79,6 +79,9 @@ class MolecularHamiltonian(Hamiltonian):
         # Precompute single excitation data
         self._precompute_single_excitation_data()
 
+        # Pre-convert h2e to numpy ONCE (avoids GPU->CPU transfer in get_connections)
+        self._h2e_np = self.h2e.cpu().numpy()
+
     def _precompute_vectorized_integrals(self):
         """Precompute tensors for vectorized energy evaluation."""
         n_orb = self.n_orbitals
@@ -219,8 +222,8 @@ class MolecularHamiltonian(Hamiltonian):
         virt_alpha = np.where(config_np[:n_orb] == 0)[0]
         virt_beta = np.where(config_np[n_orb:] == 0)[0]
 
-        # Pre-fetch h2e to CPU numpy once (faster indexing)
-        h2e_np = self.h2e.cpu().numpy()
+        # Use precomputed numpy array (avoids GPU->CPU transfer per call)
+        h2e_np = self._h2e_np
 
         # ===== SINGLE EXCITATIONS (one-body terms) =====
         occ_alpha_set = set(occ_alpha)
