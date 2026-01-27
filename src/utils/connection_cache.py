@@ -45,16 +45,12 @@ class ConnectionCache:
         self.bypass_threshold = bypass_threshold
 
         # Powers of 2 for integer encoding - precomputed on GPU
-        # For num_sites <= 62, we can use int64 safely
-        if num_sites <= 62:
-            self.powers_gpu = (2 ** torch.arange(
-                num_sites - 1, -1, -1, device=device, dtype=torch.int64
-            ))
-        else:
-            # For larger systems, use float64 (less precise but works)
-            self.powers_gpu = (2.0 ** torch.arange(
-                num_sites - 1, -1, -1, device=device, dtype=torch.float64
-            ))
+        # Always use float64 for CUDA compatibility (CUDA doesn't support
+        # matmul for int64 tensors). For num_sites <= 52, float64 has
+        # enough precision for exact integer representation.
+        self.powers_gpu = (2.0 ** torch.arange(
+            num_sites - 1, -1, -1, device=device, dtype=torch.float64
+        ))
 
         # Also keep CPU version for single config encoding
         self.powers_cpu = self.powers_gpu.cpu()
@@ -79,8 +75,9 @@ class ConnectionCache:
         """Encode a single configuration as integer (GPU-accelerated)."""
         if config.device != self.powers_gpu.device:
             # Use CPU version if config is on CPU
-            return int((config.long().cpu() * self.powers_cpu).sum().item())
-        return int((config.long() @ self.powers_gpu).item())
+            return int((config.double().cpu() * self.powers_cpu).sum().item())
+        # Use double precision (powers_gpu is already float64)
+        return int((config.double() @ self.powers_gpu).item())
 
     def _encode_batch_gpu(self, configs: torch.Tensor) -> torch.Tensor:
         """
@@ -88,17 +85,17 @@ class ConnectionCache:
 
         This is 10-50x faster than the CPU Python loop version.
 
+        Note: CUDA doesn't support matmul for Long (int64) tensors,
+        so we use double precision (powers_gpu is already float64).
+
         Args:
             configs: (n_configs, num_sites) tensor on GPU
 
         Returns:
             (n_configs,) tensor of integer keys
         """
-        configs_gpu = configs.to(self.device)
-        if self.num_sites <= 62:
-            return (configs_gpu.long() @ self.powers_gpu)
-        else:
-            return (configs_gpu.double() @ self.powers_gpu).long()
+        configs_gpu = configs.to(self.device, dtype=torch.float64)
+        return (configs_gpu @ self.powers_gpu).long()
 
     def _encode_batch(self, configs: torch.Tensor) -> List[int]:
         """Encode batch of configurations as integers (returns Python list)."""
