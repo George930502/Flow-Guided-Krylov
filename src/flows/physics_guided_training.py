@@ -24,6 +24,12 @@ from typing import Dict, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from tqdm import tqdm
 
+# Enable TensorFloat32 for better performance on Ampere+ GPUs
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision('high')
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 # Connection cache for avoiding recomputation
 try:
     from ..utils.connection_cache import ConnectionCache
@@ -60,7 +66,7 @@ class PhysicsGuidedConfig:
     # Accumulated basis for energy computation
     use_accumulated_energy: bool = True
     max_accumulated_basis: int = 2048
-    accumulated_energy_interval: int = 4
+    accumulated_energy_interval: int = 25  # Increased from 4 to reduce overhead
     prune_basis_threshold: float = 1e-6
 
     # EMA for stable tracking
@@ -537,17 +543,37 @@ class PhysicsGuidedFlowTrainer:
             self.accumulated_basis = self.accumulated_basis[indices]
 
     def _compute_accumulated_energy(self) -> float:
-        """Compute energy in accumulated basis via diagonalization."""
+        """
+        Compute energy in accumulated basis via diagonalization.
+
+        Uses sparse eigensolver for large bases (>500 configs) for efficiency.
+        """
         if self.accumulated_basis is None or len(self.accumulated_basis) == 0:
             return float('inf')
+
+        n_basis = len(self.accumulated_basis)
 
         with torch.no_grad():
             H_matrix = self.hamiltonian.matrix_elements(
                 self.accumulated_basis, self.accumulated_basis
             )
-            H_np = H_matrix.cpu().numpy()
+            H_np = H_matrix.cpu().numpy().astype(np.float64)
 
-            # Diagonalize
+            # Ensure Hermitian
+            H_np = 0.5 * (H_np + H_np.T)
+
+            # Use sparse eigensolver for large matrices
+            if n_basis > 500:
+                try:
+                    from scipy.sparse import csr_matrix
+                    from scipy.sparse.linalg import eigsh
+                    H_sparse = csr_matrix(H_np)
+                    eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-6)
+                    return float(eigenvalues[0])
+                except Exception:
+                    pass  # Fall back to dense
+
+            # Dense diagonalization for small matrices
             eigenvalues, _ = np.linalg.eigh(H_np)
             return float(eigenvalues[0])
 
