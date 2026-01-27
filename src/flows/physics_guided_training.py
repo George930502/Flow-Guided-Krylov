@@ -44,7 +44,7 @@ class PhysicsGuidedConfig:
     # Batch sizes
     samples_per_batch: int = 2000
     num_batches: int = 1
-    nqs_chunk_size: int = 8192  # Chunk size for batched NQS evaluation
+    nqs_chunk_size: int = 16384  # Increased chunk size for better GPU saturation
 
     # Learning rates
     flow_lr: float = 5e-4
@@ -66,7 +66,7 @@ class PhysicsGuidedConfig:
     # Accumulated basis for energy computation
     use_accumulated_energy: bool = True
     max_accumulated_basis: int = 2048
-    accumulated_energy_interval: int = 25  # Increased from 4 to reduce overhead
+    accumulated_energy_interval: int = 50  # Increased to reduce overhead
     prune_basis_threshold: float = 1e-6
 
     # EMA for stable tracking
@@ -83,6 +83,10 @@ class PhysicsGuidedConfig:
 
     # torch.compile() for faster NQS evaluation
     use_torch_compile: bool = True
+
+    # Parallel connection computation
+    use_parallel_connections: bool = True
+    parallel_workers: int = 8  # Number of parallel workers for connection computation
 
 
 class PhysicsGuidedFlowTrainer:
@@ -336,41 +340,64 @@ class PhysicsGuidedFlowTrainer:
         return total_metrics
 
     def _compute_local_energies(
-        self, configs: torch.Tensor, nqs_chunk_size: int = 8192
+        self, configs: torch.Tensor, nqs_chunk_size: int = 16384
     ) -> torch.Tensor:
         """
         Compute local energies E_loc(x) = <x|H|psi>/<x|psi>.
 
         Optimized version with connection caching and chunked NQS batching:
-        1. Get ALL connections using cache (avoids recomputation)
+        1. Get ALL connections using cache or parallel computation
         2. Evaluate NQS on original configs in one batch
         3. Evaluate NQS on ALL connected configs in large chunks
         4. Use scatter_add for efficient accumulation
 
         This significantly improves GPU utilization by:
         - Caching connection results (50-80% hit rate after warmup)
+        - Using parallel computation when cache hit rate is low
         - Processing NQS in large batches that saturate the GPU
 
         Args:
             configs: (n_configs, num_sites) basis configurations
-            nqs_chunk_size: Maximum batch size for NQS evaluation (default 8192)
+            nqs_chunk_size: Maximum batch size for NQS evaluation (default 16384)
 
         Returns:
             (n_configs,) local energies
         """
         n_configs = len(configs)
+        config = self.config
 
         with torch.no_grad():
             # Step 1: Get diagonal elements (already vectorized and efficient)
             diag = self.hamiltonian.diagonal_elements_batch(configs)
 
-            # Step 2: Get ALL connections using cache if available
+            # Step 2: Get ALL connections
+            # Choose method based on cache availability and hit rate
             if self.connection_cache is not None:
-                # Use batched cache lookup - much faster than individual calls
+                # Check if cache is effective
+                if self.connection_cache.hit_rate > 0.3 or len(self.connection_cache) < 1000:
+                    # Use cache - it's effective or still warming up
+                    all_connected, all_elements, all_orig_indices = \
+                        self.connection_cache.get_batch(configs, self.hamiltonian)
+                elif (config.use_parallel_connections and
+                      hasattr(self.hamiltonian, 'get_connections_parallel')):
+                    # Cache hit rate is low, use parallel computation instead
+                    all_connected, all_elements, all_orig_indices = \
+                        self.hamiltonian.get_connections_parallel(
+                            configs, max_workers=config.parallel_workers
+                        )
+                else:
+                    # Fallback to cache
+                    all_connected, all_elements, all_orig_indices = \
+                        self.connection_cache.get_batch(configs, self.hamiltonian)
+            elif (config.use_parallel_connections and
+                  hasattr(self.hamiltonian, 'get_connections_parallel')):
+                # No cache, use parallel computation
                 all_connected, all_elements, all_orig_indices = \
-                    self.connection_cache.get_batch(configs, self.hamiltonian)
+                    self.hamiltonian.get_connections_parallel(
+                        configs, max_workers=config.parallel_workers
+                    )
             else:
-                # Fallback: collect connections without cache
+                # Fallback: collect connections serially without cache
                 all_connected = []
                 all_elements = []
                 all_orig_indices = []
@@ -527,19 +554,60 @@ class PhysicsGuidedFlowTrainer:
         return loss
 
     def _update_accumulated_basis(self, new_configs: torch.Tensor):
-        """Add new configurations to accumulated basis."""
-        if self.accumulated_basis is None:
-            self.accumulated_basis = new_configs.clone()
-        else:
-            combined = torch.cat([self.accumulated_basis, new_configs], dim=0)
-            self.accumulated_basis = torch.unique(combined, dim=0)
+        """
+        Add new configurations to accumulated basis.
 
-        # Prune if too large
+        Uses hash-based deduplication for O(n) complexity instead of
+        torch.unique which is O(n log n).
+        """
+        device = new_configs.device
+        num_sites = new_configs.shape[1]
         max_size = self.config.max_accumulated_basis
+
+        # Use integer hash for fast deduplication
+        if num_sites <= 62:
+            powers = (2 ** torch.arange(num_sites - 1, -1, -1, device=device, dtype=torch.int64))
+
+            if self.accumulated_basis is None:
+                # First batch: just deduplicate new_configs
+                keys = (new_configs.long() @ powers).tolist()
+                seen = {}
+                unique_indices = []
+                for i, k in enumerate(keys):
+                    if k not in seen:
+                        seen[k] = True
+                        unique_indices.append(i)
+                self.accumulated_basis = new_configs[unique_indices]
+            else:
+                # Compute keys for existing basis
+                existing_keys = (self.accumulated_basis.long() @ powers).tolist()
+                existing_set = set(existing_keys)
+
+                # Find new unique configs
+                new_keys = (new_configs.long() @ powers).tolist()
+                new_unique_indices = []
+                for i, k in enumerate(new_keys):
+                    if k not in existing_set:
+                        existing_set.add(k)
+                        new_unique_indices.append(i)
+
+                # Append new unique configs
+                if new_unique_indices:
+                    self.accumulated_basis = torch.cat([
+                        self.accumulated_basis,
+                        new_configs[new_unique_indices]
+                    ], dim=0)
+        else:
+            # For very large systems, fall back to torch.unique
+            if self.accumulated_basis is None:
+                self.accumulated_basis = torch.unique(new_configs, dim=0)
+            else:
+                combined = torch.cat([self.accumulated_basis, new_configs], dim=0)
+                self.accumulated_basis = torch.unique(combined, dim=0)
+
+        # Prune if too large - keep random subset
         if len(self.accumulated_basis) > max_size:
-            # Keep most recent and random subset
-            n_keep = max_size
-            indices = torch.randperm(len(self.accumulated_basis))[:n_keep]
+            indices = torch.randperm(len(self.accumulated_basis), device=device)[:max_size]
             self.accumulated_basis = self.accumulated_basis[indices]
 
     def _compute_accumulated_energy(self) -> float:

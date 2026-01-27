@@ -516,6 +516,68 @@ class MolecularHamiltonian(Hamiltonian):
         return H
 
     @torch.no_grad()
+    def get_connections_parallel(
+        self, configs: torch.Tensor, max_workers: int = 8
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Parallel computation of connections for multiple configurations.
+
+        Uses ThreadPoolExecutor to process configs in parallel, providing
+        significant speedup for large batches on multi-core CPUs.
+
+        Args:
+            configs: (n_configs, num_sites) configurations
+            max_workers: Maximum number of parallel workers
+
+        Returns:
+            all_connected: (total_connections, num_sites) connected configs
+            all_elements: (total_connections,) matrix elements
+            config_indices: (total_connections,) which config each belongs to
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        device = self.device
+        configs = configs.to(device)
+        n_configs = len(configs)
+
+        # Process configs in parallel
+        def process_config(idx):
+            connected, elements = self.get_connections(configs[idx])
+            return idx, connected, elements
+
+        all_connected = []
+        all_elements = []
+        all_indices = []
+
+        # Use ThreadPool for parallel processing
+        # Note: ThreadPool works well here because get_connections releases GIL during numpy ops
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_config, i): i for i in range(n_configs)}
+
+            for future in as_completed(futures):
+                idx, connected, elements = future.result()
+                n_conn = len(connected)
+                if n_conn > 0:
+                    all_connected.append(connected.to(device))
+                    all_elements.append(elements.to(device))
+                    all_indices.append(
+                        torch.full((n_conn,), idx, dtype=torch.long, device=device)
+                    )
+
+        if not all_connected:
+            return (
+                torch.empty(0, self.num_sites, device=device),
+                torch.empty(0, device=device),
+                torch.empty(0, dtype=torch.long, device=device)
+            )
+
+        return (
+            torch.cat(all_connected, dim=0),
+            torch.cat(all_elements, dim=0),
+            torch.cat(all_indices, dim=0)
+        )
+
+    @torch.no_grad()
     def get_connections_batch(
         self, configs: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
