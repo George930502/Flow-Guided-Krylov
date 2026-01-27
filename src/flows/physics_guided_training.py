@@ -151,7 +151,8 @@ class PhysicsGuidedFlowTrainer:
                 self._nqs_compiled = torch.compile(
                     nqs.log_amplitude,
                     mode='reduce-overhead',
-                    fullgraph=False
+                    fullgraph=False,
+                    dynamic=True  # Handle dynamic batch sizes
                 )
             except Exception as e:
                 print(f"Warning: torch.compile failed, using eager mode: {e}")
