@@ -163,6 +163,11 @@ class PipelineConfig:
     time_step: float = 0.1
     shots_per_krylov: int = 50000
     skqd_regularization: float = 1e-8  # Regularization for numerical stability
+    skip_skqd: bool = False  # Skip Krylov refinement (for NF-only mode comparison)
+
+    # Training mode
+    use_local_energy: bool = True  # Use VMC local energy (proper variational estimator)
+    use_ci_seeding: bool = False  # Seed with CI basis (set True if NF struggles)
 
     # Eigensolver
     use_davidson: bool = True
@@ -640,7 +645,11 @@ class FlowGuidedKrylovPipeline:
         # skip SKQD to avoid numerical instability
         skip_skqd = False
 
-        # Check if SKQD is disabled
+        # Check if SKQD is disabled by config
+        if cfg.skip_skqd:
+            print("SKQD disabled (skip_skqd=True)")
+            skip_skqd = True
+
         if cfg.max_krylov_dim <= 0:
             print("SKQD disabled (max_krylov_dim=0)")
             skip_skqd = True
@@ -666,10 +675,26 @@ class FlowGuidedKrylovPipeline:
                 skip_skqd = True
 
         if skip_skqd:
-            self.results["skqd_energy"] = residual_energy
-            self.results["combined_energy"] = residual_energy
+            # Compute NF basis energy if no residual energy available
+            if residual_energy is None:
+                print("Computing NF basis energy via direct diagonalization...")
+                H_matrix = self.hamiltonian.matrix_elements(nf_basis, nf_basis)
+                H_np = H_matrix.detach().cpu().numpy()
+                # Symmetrize for numerical stability
+                H_np = 0.5 * (H_np + H_np.T)
+                eigenvalues, _ = np.linalg.eigh(H_np)
+                nf_basis_energy = float(eigenvalues[0])
+                print(f"NF basis energy: {nf_basis_energy:.8f} Ha ({len(nf_basis)} configs)")
+                self.results["nf_basis_energy"] = nf_basis_energy
+                self.results["skqd_energy"] = nf_basis_energy
+                self.results["combined_energy"] = nf_basis_energy
+            else:
+                self.results["skqd_energy"] = residual_energy
+                self.results["combined_energy"] = residual_energy
+
             self.results["skqd_skipped"] = True
-            return {"energies_combined": [residual_energy], "skipped": True}
+            final_energy = self.results.get("combined_energy", residual_energy)
+            return {"energies_combined": [final_energy], "skipped": True}
 
         # Configure SKQD with regularization for numerical stability
         skqd_config = SKQDConfig(
