@@ -395,7 +395,8 @@ class PhysicsGuidedFlowTrainer:
             nqs_forward = self._nqs_compiled if self._nqs_compiled is not None else self.nqs.log_amplitude
 
             # Step 3: Evaluate NQS on original configs (single batch)
-            log_psi_orig = nqs_forward(configs.float())
+            # Clone output to avoid CUDA graph tensor reuse issues with torch.compile
+            log_psi_orig = nqs_forward(configs.float()).clone()
 
             # Step 4: Evaluate NQS on ALL connected configs in large chunks
             # This is the key optimization - large batches saturate the GPU
@@ -403,9 +404,10 @@ class PhysicsGuidedFlowTrainer:
 
             for start in range(0, total_connections, nqs_chunk_size):
                 end = min(start + nqs_chunk_size, total_connections)
+                # Clone output to avoid CUDA graph tensor reuse issues
                 log_psi_connected[start:end] = nqs_forward(
                     all_connected[start:end].float()
-                )
+                ).clone()
 
             # Step 5: Compute amplitude ratios psi(connected)/psi(original)
             log_psi_orig_expanded = log_psi_orig[all_orig_indices]
