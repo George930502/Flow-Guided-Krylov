@@ -253,19 +253,22 @@ class ConnectionCache:
                 batch_connected, batch_elements, batch_indices = \
                     hamiltonian.get_connections_batch(compute_configs)
 
+                # Ensure batch_indices is long for indexing
+                batch_indices_long = batch_indices.long() if len(batch_indices) > 0 else batch_indices
+
                 # Remap indices to original positions
                 if len(batch_connected) > 0:
                     original_indices = torch.tensor(
                         configs_to_compute, device=device, dtype=torch.long
                     )
-                    remapped_indices = original_indices[batch_indices]
+                    remapped_indices = original_indices[batch_indices_long]
                     all_connected.append(batch_connected)
                     all_elements.append(batch_elements)
                     all_indices.append(remapped_indices)
 
                 # Cache individual results
                 for idx, key in configs_to_compute_indices:
-                    mask = batch_indices == configs_to_compute.index(idx)
+                    mask = batch_indices_long == configs_to_compute.index(idx)
                     if mask.sum() > 0:
                         self._cache[key] = (
                             batch_connected[mask],
