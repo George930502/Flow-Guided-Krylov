@@ -43,7 +43,6 @@ from hamiltonians.molecular import MolecularHamiltonian, MolecularIntegrals
 from pipeline import FlowGuidedKrylovPipeline, PipelineConfig
 from krylov.skqd import SampleBasedKrylovDiagonalization, FlowGuidedSKQD, SKQDConfig
 from krylov.residual_expansion import SelectedCIExpander, ResidualExpansionConfig
-from utils.system_scaler import SystemScaler, QualityPreset, auto_scale_pipeline
 
 
 @dataclass
@@ -344,7 +343,6 @@ def create_nh3_631g_molecule(
 def run_benchmark(
     molecule_key: str,
     verbose: bool = True,
-    preset: QualityPreset = QualityPreset.BALANCED,
 ) -> BenchmarkResult:
     """
     Run SKQD necessity benchmark for a single molecule.
@@ -352,7 +350,6 @@ def run_benchmark(
     Args:
         molecule_key: Key for molecule factory
         verbose: Print detailed progress
-        preset: Quality preset (FAST, BALANCED, ACCURATE)
     """
     # System factories
     factories = {
@@ -428,26 +425,20 @@ def run_benchmark(
     )
 
     # =======================================================================
-    # Step 1: NF-NQS Training (with auto-scaled parameters)
+    # Step 1: NF-NQS Training
     # =======================================================================
     print("\n--- Step 1: NF-NQS Training ---")
 
-    # Use SystemScaler for automatic parameter tuning
-    scaler = SystemScaler(preset=preset, device=device)
-    metrics = scaler.analyze_system(H)
-    scaled_params = scaler.compute_parameters(metrics)
+    # Use PipelineConfig with adapt_to_system_size for parameter tuning
+    config = PipelineConfig(
+        use_residual_expansion=False,
+        skip_skqd=True,
+        max_epochs=400,
+        device=device,
+    )
+    config.adapt_to_system_size(n_valid)
 
-    if verbose:
-        scaler.print_parameters(scaled_params)
-
-    # Create config from scaled parameters
-    config = scaler.create_pipeline_config(scaled_params)
-
-    # Override for NF-only mode (residual/SKQD done separately below)
-    config.use_residual_expansion = False
-    config.skip_skqd = True
-
-    pipeline = FlowGuidedKrylovPipeline(H, config=config, exact_energy=E_exact, auto_adapt=False)
+    pipeline = FlowGuidedKrylovPipeline(H, config=config, exact_energy=E_exact)
     pipeline.train_flow_nqs(progress=verbose)
     nf_basis = pipeline.extract_and_select_basis()
 
@@ -460,21 +451,21 @@ def run_benchmark(
     print(f"  NF energy: {result.nf_energy:.8f} Ha (error: {nf_error:.4f} mHa)")
 
     # =======================================================================
-    # Step 2: Residual Expansion (with scaled parameters)
+    # Step 2: Residual Expansion
     # =======================================================================
     print("\n--- Step 2: Residual (PT2) Expansion ---")
     residual_config = ResidualExpansionConfig(
-        max_configs_per_iter=scaled_params.residual_configs_per_iter,
-        max_iterations=scaled_params.residual_iterations,
-        residual_threshold=scaled_params.energy_threshold,
+        max_configs_per_iter=config.residual_configs_per_iter,
+        max_iterations=config.residual_iterations,
+        residual_threshold=config.residual_threshold,
     )
     expander = SelectedCIExpander(H, residual_config)
 
-    print(f"  Using scaled params: {scaled_params.residual_iterations} iterations, "
-          f"{scaled_params.residual_configs_per_iter} configs/iter")
+    print(f"  Using params: {config.residual_iterations} iterations, "
+          f"{config.residual_configs_per_iter} configs/iter")
 
     expanded_basis = nf_basis.clone()
-    for i in range(scaled_params.residual_iterations):
+    for i in range(config.residual_iterations):
         old_size = len(expanded_basis)
         expanded_basis, stats = expander.expand_basis(expanded_basis)
         added = stats['configs_added']
@@ -493,20 +484,26 @@ def run_benchmark(
     print(f"  NF+Residual energy: {result.nf_residual_energy:.8f} Ha (error: {residual_error:.4f} mHa)")
 
     # =======================================================================
-    # Step 3: Krylov Time Evolution (with scaled parameters)
+    # Step 3: Krylov Time Evolution
     # =======================================================================
     print("\n--- Step 3: Krylov Time Evolution ---")
+
+    # Default SKQD parameters
+    krylov_dim = 8
+    dt = 0.1
+    shots_per_krylov = 50000
+
     skqd_config = SKQDConfig(
-        max_krylov_dim=scaled_params.krylov_dim,
-        time_step=scaled_params.dt,
-        shots_per_krylov=scaled_params.shots_per_krylov,
+        max_krylov_dim=krylov_dim,
+        time_step=dt,
+        shots_per_krylov=shots_per_krylov,
     )
 
-    print(f"  Using scaled params: krylov_dim={scaled_params.krylov_dim}, "
-          f"dt={scaled_params.dt:.4f}, shots={scaled_params.shots_per_krylov:,}")
+    print(f"  Using params: krylov_dim={krylov_dim}, "
+          f"dt={dt:.4f}, shots={shots_per_krylov:,}")
 
     skqd = FlowGuidedSKQD(H, nf_basis, skqd_config)
-    skqd_results = skqd.run_with_nf(max_krylov_dim=scaled_params.krylov_dim, progress=verbose)
+    skqd_results = skqd.run_with_nf(max_krylov_dim=krylov_dim, progress=verbose)
 
     # Collect Krylov configs
     krylov_set = set()
@@ -597,24 +594,8 @@ def main():
         help="System to benchmark",
     )
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
-    parser.add_argument(
-        "--preset",
-        type=str,
-        default="balanced",
-        choices=["fast", "balanced", "accurate"],
-        help="Quality preset for parameter scaling",
-    )
 
     args = parser.parse_args()
-
-    # Convert preset string to enum
-    preset_map = {
-        "fast": QualityPreset.FAST,
-        "balanced": QualityPreset.BALANCED,
-        "accurate": QualityPreset.ACCURATE,
-    }
-    preset = preset_map[args.preset]
-    print(f"\nUsing quality preset: {args.preset.upper()}")
 
     # Order by qubit count (ascending)
     system_order = ["co", "hcn", "c2h2", "h2o_631g", "h2s", "c2h4", "nh3_631g"]
@@ -628,7 +609,7 @@ def main():
 
     for system_key in systems_to_run:
         try:
-            result = run_benchmark(system_key, verbose=not args.quiet, preset=preset)
+            result = run_benchmark(system_key, verbose=not args.quiet)
             all_results.append(result)
         except Exception as e:
             print(f"\nError running {system_key}: {e}")
