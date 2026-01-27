@@ -192,7 +192,7 @@ def run_tfim_experiment(
     skqd = SampleBasedKrylovDiagonalization(H, skqd_config)
 
     # Set initial state (all zeros - close to ground state for small h)
-    skqd.initial_state = initial_state.unsqueeze(0)
+    skqd.initial_state = initial_state  # 1D tensor expected
 
     # Generate Krylov samples
     skqd.generate_krylov_samples(max_krylov_dim=15, progress=True)
@@ -334,7 +334,7 @@ def run_heisenberg_experiment(
         shots_per_krylov=100000,
     )
     skqd = SampleBasedKrylovDiagonalization(H, skqd_config)
-    skqd.initial_state = neel_state.unsqueeze(0)
+    skqd.initial_state = neel_state  # 1D tensor expected
 
     skqd.generate_krylov_samples(max_krylov_dim=15, progress=True)
     cumulative = skqd.build_cumulative_basis()
@@ -460,7 +460,7 @@ def run_krylov_convergence_experiment(
 
         # Initialize from |0...0>
         initial_state = torch.zeros(n_spins, dtype=torch.long, device=device)
-        skqd.initial_state = initial_state.unsqueeze(0)
+        skqd.initial_state = initial_state  # 1D tensor expected
 
         skqd.generate_krylov_samples(max_krylov_dim=15, progress=False)
         cumulative = skqd.build_cumulative_basis()
@@ -531,7 +531,7 @@ def run_discovery_comparison(n_spins: int = 10, h_field: float = 0.5) -> Lattice
     print("\n--- Krylov Configuration Discovery ---")
     skqd_config = SKQDConfig(max_krylov_dim=12, time_step=0.1, shots_per_krylov=100000)
     skqd = SampleBasedKrylovDiagonalization(H, skqd_config)
-    skqd.initial_state = torch.zeros(n_spins, dtype=torch.long, device=device).unsqueeze(0)
+    skqd.initial_state = torch.zeros(n_spins, dtype=torch.long, device=device)  # 1D tensor
     skqd.generate_krylov_samples(max_krylov_dim=12, progress=True)
 
     krylov_set = set()
