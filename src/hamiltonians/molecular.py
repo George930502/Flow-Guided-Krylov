@@ -578,13 +578,17 @@ class MolecularHamiltonian(Hamiltonian):
         )
 
     @torch.no_grad()
-    def get_connections_batch(
+    def get_sparse_matrix_elements(
         self, configs: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Batch compute off-diagonal connections for multiple configurations.
 
         Returns sparse COO format data for efficient matrix construction.
+
+        NOTE: This returns (row_indices, col_indices, values) for sparse matrix
+        construction, NOT the (connected_configs, elements, config_indices) format
+        expected by ConnectionCache.get_connections_batch interface.
 
         Args:
             configs: (n_configs, num_sites) configurations
