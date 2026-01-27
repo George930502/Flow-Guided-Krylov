@@ -326,6 +326,56 @@ class MolecularHamiltonian(Hamiltonian):
 
         return connected, elements
 
+    @torch.no_grad()
+    def get_all_connections_with_indices(
+        self, configs: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Get ALL off-diagonal connections for ALL configs at once.
+
+        Optimized for batched local energy computation. Returns connections
+        in a format ready for scatter_add accumulation.
+
+        Args:
+            configs: (n_configs, num_sites) configurations
+
+        Returns:
+            all_connected: (total_connections, num_sites) all connected configurations
+            all_elements: (total_connections,) corresponding matrix elements
+            config_indices: (total_connections,) which original config each connection belongs to
+        """
+        device = self.device
+        configs = configs.to(device)
+        n_configs = configs.shape[0]
+
+        all_connected = []
+        all_elements = []
+        all_indices = []
+
+        for i in range(n_configs):
+            connected, elements = self.get_connections(configs[i])
+            n_conn = len(connected)
+
+            if n_conn > 0:
+                all_connected.append(connected)
+                all_elements.append(elements)
+                all_indices.append(
+                    torch.full((n_conn,), i, dtype=torch.long, device=device)
+                )
+
+        if not all_connected:
+            return (
+                torch.empty(0, self.num_sites, device=device),
+                torch.empty(0, device=device),
+                torch.empty(0, dtype=torch.long, device=device)
+            )
+
+        return (
+            torch.cat(all_connected, dim=0),
+            torch.cat(all_elements, dim=0),
+            torch.cat(all_indices, dim=0)
+        )
+
     def _jw_sign_np(self, config: np.ndarray, p: int, q: int) -> int:
         """
         Compute Jordan-Wigner sign for a+_p a_q (numpy version).
