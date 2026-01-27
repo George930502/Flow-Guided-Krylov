@@ -558,12 +558,14 @@ class PhysicsGuidedFlowTrainer:
         max_size = self.config.max_accumulated_basis
 
         # Use integer hash for fast deduplication
-        if num_sites <= 62:
-            powers = (2 ** torch.arange(num_sites - 1, -1, -1, device=device, dtype=torch.int64))
+        # Note: CUDA doesn't support matmul for Long tensors, so we use float64
+        # which has enough precision for exact integers up to 2^53
+        if num_sites <= 52:
+            powers = (2.0 ** torch.arange(num_sites - 1, -1, -1, device=device, dtype=torch.float64))
 
             if self.accumulated_basis is None:
                 # First batch: just deduplicate new_configs
-                keys = (new_configs.long() @ powers).tolist()
+                keys = (new_configs.double() @ powers).long().tolist()
                 seen = {}
                 unique_indices = []
                 for i, k in enumerate(keys):
@@ -573,11 +575,11 @@ class PhysicsGuidedFlowTrainer:
                 self.accumulated_basis = new_configs[unique_indices]
             else:
                 # Compute keys for existing basis
-                existing_keys = (self.accumulated_basis.long() @ powers).tolist()
+                existing_keys = (self.accumulated_basis.double() @ powers).long().tolist()
                 existing_set = set(existing_keys)
 
                 # Find new unique configs
-                new_keys = (new_configs.long() @ powers).tolist()
+                new_keys = (new_configs.double() @ powers).long().tolist()
                 new_unique_indices = []
                 for i, k in enumerate(new_keys):
                     if k not in existing_set:
