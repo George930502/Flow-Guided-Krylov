@@ -23,7 +23,7 @@ from pathlib import Path
 import argparse
 import time
 from math import comb
-from typing import Dict, Any, Set, Tuple
+from typing import Dict, Any, Set, Tuple, Optional
 from dataclasses import dataclass
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -32,19 +32,27 @@ import torch
 import numpy as np
 
 try:
-    from hamiltonians.molecular import (
-        MolecularHamiltonian,
-        compute_molecular_integrals,
-    )
+    from pyscf import gto, scf, ao2mo, cc
     PYSCF_AVAILABLE = True
 except ImportError:
     PYSCF_AVAILABLE = False
     print("ERROR: PySCF required")
     sys.exit(1)
 
+from hamiltonians.molecular import MolecularHamiltonian, MolecularIntegrals
 from pipeline import FlowGuidedKrylovPipeline, PipelineConfig
 from krylov.skqd import SampleBasedKrylovDiagonalization, FlowGuidedSKQD, SKQDConfig
 from krylov.residual_expansion import SelectedCIExpander, ResidualExpansionConfig
+
+
+@dataclass
+class MoleculeData:
+    """Container for molecule data including Hamiltonian and reference energies."""
+    hamiltonian: MolecularHamiltonian
+    hf_energy: float
+    ccsd_energy: Optional[float] = None
+    geometry: list = None
+    basis: str = "sto-3g"
 
 
 @dataclass
@@ -55,6 +63,7 @@ class BenchmarkResult:
     n_electrons: int
     n_valid_configs: int
     exact_energy: float
+    energy_type: str = "FCI"  # FCI, CCSD, or HF
 
     # Configuration counts
     nf_configs: int = 0
@@ -101,15 +110,92 @@ def compute_basis_energy(H: MolecularHamiltonian, basis: torch.Tensor) -> float:
 
 
 # =============================================================================
+# Helper: Create Hamiltonian with Reference Energies
+# =============================================================================
+
+def create_molecule_data(
+    geometry: list,
+    basis: str = "sto-3g",
+    charge: int = 0,
+    spin: int = 0,
+    compute_ccsd: bool = True,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> MoleculeData:
+    """
+    Create MoleculeData with Hamiltonian and reference energies.
+
+    Returns MoleculeData containing:
+    - MolecularHamiltonian
+    - HF energy
+    - CCSD energy (if requested)
+    """
+    # Build PySCF molecule
+    mol = gto.Mole()
+    mol.atom = geometry
+    mol.basis = basis
+    mol.charge = charge
+    mol.spin = spin
+    mol.build()
+
+    # Run HF
+    if spin == 0:
+        mf = scf.RHF(mol)
+    else:
+        mf = scf.ROHF(mol)
+    mf.kernel()
+    hf_energy = float(mf.e_tot)
+
+    # Run CCSD if requested
+    ccsd_energy = None
+    if compute_ccsd:
+        try:
+            mycc = cc.CCSD(mf)
+            mycc.kernel()
+            ccsd_energy = float(mycc.e_tot)
+        except Exception as e:
+            print(f"  CCSD failed: {e}")
+
+    # Get integrals in MO basis
+    h1e = mf.mo_coeff.T @ mf.get_hcore() @ mf.mo_coeff
+    h2e = ao2mo.kernel(mol, mf.mo_coeff)
+    h2e = ao2mo.restore(1, h2e, mol.nao)
+
+    n_electrons = mol.nelectron
+    n_orbitals = mol.nao
+    n_alpha = (n_electrons + spin) // 2
+    n_beta = (n_electrons - spin) // 2
+
+    integrals = MolecularIntegrals(
+        h1e=h1e,
+        h2e=h2e,
+        nuclear_repulsion=mol.energy_nuc(),
+        n_electrons=n_electrons,
+        n_orbitals=n_orbitals,
+        n_alpha=n_alpha,
+        n_beta=n_beta,
+    )
+
+    hamiltonian = MolecularHamiltonian(integrals, device=device)
+
+    return MoleculeData(
+        hamiltonian=hamiltonian,
+        hf_energy=hf_energy,
+        ccsd_energy=ccsd_energy,
+        geometry=geometry,
+        basis=basis,
+    )
+
+
+# =============================================================================
 # Hamiltonian Factories for Moderate Systems
 # =============================================================================
 
-def create_co_hamiltonian(
+def create_co_molecule(
     bond_length: float = 1.128,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> MolecularHamiltonian:
+) -> MoleculeData:
     """
-    Create CO (carbon monoxide) Hamiltonian.
+    Create CO (carbon monoxide) molecule data.
 
     14 electrons, 10 orbitals in STO-3G = 20 qubits
     Valid configs: C(10,7)² = 14,400
@@ -118,20 +204,18 @@ def create_co_hamiltonian(
         ("C", (0.0, 0.0, 0.0)),
         ("O", (0.0, 0.0, bond_length)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
-    return MolecularHamiltonian(integrals, device=device)
+    return create_molecule_data(geometry, basis="sto-3g", device=device)
 
 
-def create_hcn_hamiltonian(
+def create_hcn_molecule(
     ch_length: float = 1.066,
     cn_length: float = 1.156,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> MolecularHamiltonian:
+) -> MoleculeData:
     """
-    Create HCN (hydrogen cyanide) Hamiltonian.
+    Create HCN (hydrogen cyanide) molecule data.
 
     14 electrons, 11 orbitals in STO-3G = 22 qubits
-    Valid configs: C(11,7)² = 24,010 (approximate)
     Linear geometry: H-C≡N
     """
     geometry = [
@@ -139,20 +223,18 @@ def create_hcn_hamiltonian(
         ("C", (0.0, 0.0, ch_length)),
         ("N", (0.0, 0.0, ch_length + cn_length)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
-    return MolecularHamiltonian(integrals, device=device)
+    return create_molecule_data(geometry, basis="sto-3g", device=device)
 
 
-def create_c2h2_hamiltonian(
+def create_c2h2_molecule(
     cc_length: float = 1.203,
     ch_length: float = 1.063,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> MolecularHamiltonian:
+) -> MoleculeData:
     """
-    Create C2H2 (acetylene) Hamiltonian.
+    Create C2H2 (acetylene) molecule data.
 
     14 electrons, 12 orbitals in STO-3G = 24 qubits
-    Valid configs: C(12,7)² = 627,264 (approximate)
     Linear geometry: H-C≡C-H
     """
     geometry = [
@@ -161,20 +243,18 @@ def create_c2h2_hamiltonian(
         ("C", (0.0, 0.0, cc_length/2)),
         ("H", (0.0, 0.0, ch_length + cc_length/2)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
-    return MolecularHamiltonian(integrals, device=device)
+    return create_molecule_data(geometry, basis="sto-3g", device=device)
 
 
-def create_h2o_631g_hamiltonian(
+def create_h2o_631g_molecule(
     oh_length: float = 0.96,
     angle: float = 104.5,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> MolecularHamiltonian:
+) -> MoleculeData:
     """
-    Create H2O (water) Hamiltonian with 6-31G basis.
+    Create H2O (water) molecule data with 6-31G basis.
 
     10 electrons, 13 orbitals in 6-31G = 26 qubits
-    Valid configs: C(13,5)² = 1,656,369 (approximate)
     """
     angle_rad = np.radians(angle)
     geometry = [
@@ -182,20 +262,18 @@ def create_h2o_631g_hamiltonian(
         ("H", (oh_length, 0.0, 0.0)),
         ("H", (oh_length * np.cos(angle_rad), oh_length * np.sin(angle_rad), 0.0)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="6-31g")
-    return MolecularHamiltonian(integrals, device=device)
+    return create_molecule_data(geometry, basis="6-31g", device=device)
 
 
-def create_h2s_hamiltonian(
+def create_h2s_molecule(
     sh_length: float = 1.336,
     angle: float = 92.1,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> MolecularHamiltonian:
+) -> MoleculeData:
     """
-    Create H2S (hydrogen sulfide) Hamiltonian.
+    Create H2S (hydrogen sulfide) molecule data.
 
     18 electrons, 13 orbitals in STO-3G = 26 qubits
-    Valid configs: C(13,9)² = 521,284 (approximate)
     """
     angle_rad = np.radians(angle)
     geometry = [
@@ -203,21 +281,19 @@ def create_h2s_hamiltonian(
         ("H", (sh_length, 0.0, 0.0)),
         ("H", (sh_length * np.cos(angle_rad), sh_length * np.sin(angle_rad), 0.0)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
-    return MolecularHamiltonian(integrals, device=device)
+    return create_molecule_data(geometry, basis="sto-3g", device=device)
 
 
-def create_c2h4_hamiltonian(
+def create_c2h4_molecule(
     cc_length: float = 1.339,
     ch_length: float = 1.087,
     hcc_angle: float = 121.3,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> MolecularHamiltonian:
+) -> MoleculeData:
     """
-    Create C2H4 (ethylene) Hamiltonian.
+    Create C2H4 (ethylene) molecule data.
 
     16 electrons, 14 orbitals in STO-3G = 28 qubits
-    Valid configs: C(14,8)² = 9,018,009 (approximate)
     Planar geometry
     """
     angle_rad = np.radians(hcc_angle)
@@ -233,20 +309,18 @@ def create_c2h4_hamiltonian(
         ("H", (ch_length * np.sin(angle_rad), 0.0, cc_length/2 + ch_length * np.cos(angle_rad))),
         ("H", (-ch_length * np.sin(angle_rad), 0.0, cc_length/2 + ch_length * np.cos(angle_rad))),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
-    return MolecularHamiltonian(integrals, device=device)
+    return create_molecule_data(geometry, basis="sto-3g", device=device)
 
 
-def create_nh3_631g_hamiltonian(
+def create_nh3_631g_molecule(
     nh_length: float = 1.012,
     hnh_angle: float = 106.7,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> MolecularHamiltonian:
+) -> MoleculeData:
     """
-    Create NH3 (ammonia) Hamiltonian with 6-31G basis.
+    Create NH3 (ammonia) molecule data with 6-31G basis.
 
     10 electrons, 15 orbitals in 6-31G = 30 qubits
-    Valid configs: C(15,5)² = 9,018,009 (approximate)
     """
     angle_rad = np.radians(hnh_angle)
     # Height of N above H plane
@@ -259,8 +333,7 @@ def create_nh3_631g_hamiltonian(
         ("H", (r * np.cos(np.radians(120)), r * np.sin(np.radians(120)), 0.0)),
         ("H", (r * np.cos(np.radians(240)), r * np.sin(np.radians(240)), 0.0)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="6-31g")
-    return MolecularHamiltonian(integrals, device=device)
+    return create_molecule_data(geometry, basis="6-31g", device=device)
 
 
 # =============================================================================
@@ -273,13 +346,13 @@ def run_benchmark(molecule_key: str, verbose: bool = True) -> BenchmarkResult:
     """
     # System factories
     factories = {
-        'co': (create_co_hamiltonian, "CO (STO-3G)"),
-        'hcn': (create_hcn_hamiltonian, "HCN (STO-3G)"),
-        'c2h2': (create_c2h2_hamiltonian, "C2H2 (STO-3G)"),
-        'h2o_631g': (create_h2o_631g_hamiltonian, "H2O (6-31G)"),
-        'h2s': (create_h2s_hamiltonian, "H2S (STO-3G)"),
-        'c2h4': (create_c2h4_hamiltonian, "C2H4 (STO-3G)"),
-        'nh3_631g': (create_nh3_631g_hamiltonian, "NH3 (6-31G)"),
+        'co': (create_co_molecule, "CO (STO-3G)"),
+        'hcn': (create_hcn_molecule, "HCN (STO-3G)"),
+        'c2h2': (create_c2h2_molecule, "C2H2 (STO-3G)"),
+        'h2o_631g': (create_h2o_631g_molecule, "H2O (6-31G)"),
+        'h2s': (create_h2s_molecule, "H2S (STO-3G)"),
+        'c2h4': (create_c2h4_molecule, "C2H4 (STO-3G)"),
+        'nh3_631g': (create_nh3_631g_molecule, "NH3 (6-31G)"),
     }
 
     if molecule_key not in factories:
@@ -291,9 +364,10 @@ def run_benchmark(molecule_key: str, verbose: bool = True) -> BenchmarkResult:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Create Hamiltonian
-    print("Creating Hamiltonian...")
-    H = factory_fn(device=device)
+    # Create molecule data with Hamiltonian and reference energies
+    print("Creating Hamiltonian and computing reference energies...")
+    mol_data = factory_fn(device=device)
+    H = mol_data.hamiltonian
 
     n_qubits = H.num_sites
     n_electrons = H.n_electrons
@@ -303,21 +377,36 @@ def run_benchmark(molecule_key: str, verbose: bool = True) -> BenchmarkResult:
     print(f"  Qubits: {n_qubits}")
     print(f"  Electrons: {n_electrons}")
     print(f"  Valid configs: {n_valid:,}")
+    print(f"  HF Energy: {mol_data.hf_energy:.8f} Ha")
+    if mol_data.ccsd_energy:
+        print(f"  CCSD Energy: {mol_data.ccsd_energy:.8f} Ha")
 
-    # Compute FCI energy if feasible
+    # Determine reference energy
+    energy_type = "HF"
     if n_valid <= 100000:
         print("Computing FCI energy...")
         try:
             E_exact = H.fci_energy()
+            energy_type = "FCI"
             print(f"  FCI Energy: {E_exact:.8f} Ha")
         except Exception as e:
             print(f"  FCI failed: {e}")
-            E_exact = H.hf_energy()
-            print(f"  Using HF Energy: {E_exact:.8f} Ha (reference)")
+            if mol_data.ccsd_energy:
+                E_exact = mol_data.ccsd_energy
+                energy_type = "CCSD"
+                print(f"  Using CCSD Energy: {E_exact:.8f} Ha (reference)")
+            else:
+                E_exact = mol_data.hf_energy
+                print(f"  Using HF Energy: {E_exact:.8f} Ha (reference)")
     else:
-        print("FCI not feasible, using HF as reference...")
-        E_exact = H.hf_energy()
-        print(f"  HF Energy: {E_exact:.8f} Ha (reference)")
+        print("FCI not feasible...")
+        if mol_data.ccsd_energy:
+            E_exact = mol_data.ccsd_energy
+            energy_type = "CCSD"
+            print(f"  Using CCSD Energy: {E_exact:.8f} Ha (reference)")
+        else:
+            E_exact = mol_data.hf_energy
+            print(f"  Using HF Energy: {E_exact:.8f} Ha (reference)")
 
     result = BenchmarkResult(
         system=system_name,
@@ -325,6 +414,7 @@ def run_benchmark(molecule_key: str, verbose: bool = True) -> BenchmarkResult:
         n_electrons=n_electrons,
         n_valid_configs=n_valid,
         exact_energy=E_exact,
+        energy_type=energy_type,
     )
 
     # =======================================================================
