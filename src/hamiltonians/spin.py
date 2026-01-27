@@ -80,6 +80,63 @@ class HeisenbergHamiltonian(Hamiltonian):
 
         return torch.tensor(diag, device=device)
 
+    def diagonal_elements_batch(self, configs: torch.Tensor) -> torch.Tensor:
+        """
+        Vectorized diagonal energy computation for a batch.
+
+        Args:
+            configs: (batch_size, num_sites) occupation numbers
+
+        Returns:
+            (batch_size,) diagonal energies
+        """
+        device = configs.device
+        spins = 2 * configs.float() - 1  # Map {0,1} → {-1,+1}
+
+        # ZZ interaction: sum over bonds
+        diag = torch.zeros(configs.shape[0], device=device)
+        for i, j in self.bonds:
+            diag += self.Jz / 4.0 * spins[:, i] * spins[:, j]
+
+        # Z field
+        h_z_tensor = torch.tensor(self.h_z, device=device, dtype=torch.float32)
+        diag += (spins * h_z_tensor / 2.0).sum(dim=1)
+
+        return diag
+
+    def matrix_elements(
+        self, configs_bra: torch.Tensor, configs_ket: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute Hamiltonian matrix elements between configurations."""
+        device = configs_bra.device
+        n_bra = configs_bra.shape[0]
+        n_ket = configs_ket.shape[0]
+
+        H = torch.zeros(n_bra, n_ket, device=device)
+
+        # Build config hash for fast lookup
+        config_to_bra = {tuple(configs_bra[i].cpu().tolist()): i for i in range(n_bra)}
+
+        for j in range(n_ket):
+            config_j = configs_ket[j]
+            key_j = tuple(config_j.cpu().tolist())
+
+            # Diagonal
+            if key_j in config_to_bra:
+                i = config_to_bra[key_j]
+                H[i, j] = self.diagonal_element(config_j)
+
+            # Off-diagonal
+            connected, elements = self.get_connections(config_j)
+            if len(connected) > 0:
+                for k in range(len(connected)):
+                    key = tuple(connected[k].cpu().tolist())
+                    if key in config_to_bra:
+                        i = config_to_bra[key]
+                        H[i, j] = elements[k]
+
+        return H
+
     def get_connections(
         self, config: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -174,6 +231,58 @@ class TransverseFieldIsing(Hamiltonian):
             diag = diag - self.V * spins[i] * spins[j]
 
         return diag
+
+    def diagonal_elements_batch(self, configs: torch.Tensor) -> torch.Tensor:
+        """
+        Vectorized diagonal energy computation for a batch.
+
+        Args:
+            configs: (batch_size, num_sites) occupation numbers
+
+        Returns:
+            (batch_size,) diagonal energies
+        """
+        device = configs.device
+        spins = 2 * configs.float() - 1  # {0,1} → {-1,+1}
+
+        diag = torch.zeros(configs.shape[0], device=device)
+        for i, j in self.edges:
+            diag -= self.V * spins[:, i] * spins[:, j]
+
+        return diag
+
+    def matrix_elements(
+        self, configs_bra: torch.Tensor, configs_ket: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute Hamiltonian matrix elements between configurations."""
+        device = configs_bra.device
+        n_bra = configs_bra.shape[0]
+        n_ket = configs_ket.shape[0]
+
+        H = torch.zeros(n_bra, n_ket, device=device)
+
+        # Build config hash for fast lookup
+        config_to_bra = {tuple(configs_bra[i].cpu().tolist()): i for i in range(n_bra)}
+
+        for j in range(n_ket):
+            config_j = configs_ket[j]
+            key_j = tuple(config_j.cpu().tolist())
+
+            # Diagonal
+            if key_j in config_to_bra:
+                i = config_to_bra[key_j]
+                H[i, j] = self.diagonal_element(config_j)
+
+            # Off-diagonal
+            connected, elements = self.get_connections(config_j)
+            if len(connected) > 0:
+                for k in range(len(connected)):
+                    key = tuple(connected[k].cpu().tolist())
+                    if key in config_to_bra:
+                        i = config_to_bra[key]
+                        H[i, j] = elements[k]
+
+        return H
 
     def get_connections(
         self, config: torch.Tensor
