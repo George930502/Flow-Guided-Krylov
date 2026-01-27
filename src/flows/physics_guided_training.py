@@ -145,14 +145,16 @@ class PhysicsGuidedFlowTrainer:
             )
 
         # Compile NQS for faster forward passes (PyTorch 2.0+)
+        # Note: 'reduce-overhead' mode uses CUDA graphs which are incompatible
+        # with dynamic batch sizes. Use 'default' mode instead.
         self._nqs_compiled = None
         if config.use_torch_compile and hasattr(torch, 'compile'):
             try:
                 self._nqs_compiled = torch.compile(
                     nqs.log_amplitude,
-                    mode='reduce-overhead',
+                    mode='default',
                     fullgraph=False,
-                    dynamic=True  # Handle dynamic batch sizes
+                    dynamic=True
                 )
             except Exception as e:
                 print(f"Warning: torch.compile failed, using eager mode: {e}")
