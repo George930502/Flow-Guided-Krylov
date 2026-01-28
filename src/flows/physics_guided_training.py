@@ -80,6 +80,8 @@ class PhysicsGuidedConfig:
     # Connection caching for avoiding recomputation
     use_connection_cache: bool = True
     max_cache_size: int = 100000  # Max cached configurations
+    cache_warmup: bool = True  # Pre-populate cache with HF neighborhood
+    cache_warmup_excitation_level: int = 2  # Include singles (1) and doubles (2)
 
     # torch.compile() for faster NQS evaluation
     use_torch_compile: bool = True
@@ -87,6 +89,10 @@ class PhysicsGuidedConfig:
     # Parallel connection computation
     use_parallel_connections: bool = True
     parallel_workers: int = 8  # Number of parallel workers for connection computation
+
+    # Early stopping on energy plateau
+    early_stopping_patience: int = 100  # Stop if energy doesn't improve for N epochs
+    early_stopping_threshold: float = 0.001  # Minimum improvement (Ha) to reset patience
 
 
 class PhysicsGuidedFlowTrainer:
@@ -163,6 +169,126 @@ class PhysicsGuidedFlowTrainer:
             'cache_hit_rates': [],
         }
 
+        # Early stopping tracking
+        self._best_energy = float('inf')
+        self._patience_counter = 0
+
+    def _warmup_cache_with_hf_neighborhood(self):
+        """
+        Pre-populate the connection cache with HF neighborhood configurations.
+
+        This dramatically improves cache hit rate because:
+        1. HF and nearby excitations are the most physically important configs
+        2. During early training, the flow explores configs near HF
+        3. Pre-computing these avoids expensive on-the-fly computation
+
+        For C2H4 (14 orbitals, 8 alpha, 8 beta):
+        - Singles: 2 * n_occ * n_virt = 2 * 8 * 6 = 96 configs
+        - Doubles: C(8,2)*C(6,2)*2 + 8*8*6*6 = 840 + 2304 = 3144 configs
+        - Total: ~3240 important configs pre-cached
+        """
+        if self.connection_cache is None:
+            return
+
+        if not hasattr(self.hamiltonian, 'n_alpha'):
+            # Not a molecular Hamiltonian
+            return
+
+        config = self.config
+        n_orb = self.hamiltonian.n_orbitals
+        n_alpha = self.hamiltonian.n_alpha
+        n_beta = self.hamiltonian.n_beta
+
+        print("Warming up connection cache with HF neighborhood...")
+
+        # Get HF state
+        hf_state = self.hamiltonian.get_hf_state()
+
+        # Collect configurations to pre-cache
+        configs_to_cache = [hf_state]
+
+        # Get occupied and virtual orbitals
+        occ_alpha = list(range(n_alpha))
+        occ_beta = list(range(n_beta))
+        virt_alpha = list(range(n_alpha, n_orb))
+        virt_beta = list(range(n_beta, n_orb))
+
+        # Add single excitations
+        if config.cache_warmup_excitation_level >= 1:
+            # Alpha singles
+            for i in occ_alpha:
+                for a in virt_alpha:
+                    new_config = hf_state.clone()
+                    new_config[i] = 0
+                    new_config[a] = 1
+                    configs_to_cache.append(new_config)
+
+            # Beta singles
+            for i in occ_beta:
+                for a in virt_beta:
+                    new_config = hf_state.clone()
+                    new_config[i + n_orb] = 0
+                    new_config[a + n_orb] = 1
+                    configs_to_cache.append(new_config)
+
+        # Add double excitations
+        if config.cache_warmup_excitation_level >= 2:
+            from itertools import combinations
+
+            # Alpha-alpha doubles
+            for i, j in combinations(occ_alpha, 2):
+                for a, b in combinations(virt_alpha, 2):
+                    new_config = hf_state.clone()
+                    new_config[i] = 0
+                    new_config[j] = 0
+                    new_config[a] = 1
+                    new_config[b] = 1
+                    configs_to_cache.append(new_config)
+
+            # Beta-beta doubles
+            for i, j in combinations(occ_beta, 2):
+                for a, b in combinations(virt_beta, 2):
+                    new_config = hf_state.clone()
+                    new_config[i + n_orb] = 0
+                    new_config[j + n_orb] = 0
+                    new_config[a + n_orb] = 1
+                    new_config[b + n_orb] = 1
+                    configs_to_cache.append(new_config)
+
+            # Alpha-beta doubles (most numerous)
+            for i in occ_alpha:
+                for j in occ_beta:
+                    for a in virt_alpha:
+                        for b in virt_beta:
+                            new_config = hf_state.clone()
+                            new_config[i] = 0
+                            new_config[j + n_orb] = 0
+                            new_config[a] = 1
+                            new_config[b + n_orb] = 1
+                            configs_to_cache.append(new_config)
+
+        # Stack and remove duplicates
+        configs_tensor = torch.stack(configs_to_cache).to(self.device)
+        configs_tensor = torch.unique(configs_tensor, dim=0)
+
+        n_warmup = len(configs_tensor)
+        print(f"  Pre-caching {n_warmup} HF neighborhood configurations...")
+
+        # Cache connections for all configs (in batches to avoid memory issues)
+        batch_size = 500
+        cached = 0
+
+        for start in range(0, n_warmup, batch_size):
+            end = min(start + batch_size, n_warmup)
+            batch = configs_tensor[start:end]
+
+            for cfg in batch:
+                connected, elements = self.hamiltonian.get_connections(cfg)
+                self.connection_cache.put(cfg, connected, elements)
+                cached += 1
+
+        print(f"  Cached {cached} configurations ({self.connection_cache.stats()['size']} entries)")
+
     def train(self) -> Dict[str, list]:
         """Run physics-guided training loop."""
         config = self.config
@@ -173,6 +299,10 @@ class PhysicsGuidedFlowTrainer:
         print(f"  Entropy weight: {config.entropy_weight}")
         if config.use_connection_cache:
             print(f"  Connection cache: enabled (max {config.max_cache_size} entries)")
+
+        # Warm up cache with HF neighborhood before training
+        if config.use_connection_cache and config.cache_warmup:
+            self._warmup_cache_with_hf_neighborhood()
 
         pbar = tqdm(range(config.num_epochs), desc="Training")
 
@@ -229,6 +359,23 @@ class PhysicsGuidedFlowTrainer:
                         print(f"Cache stats: {stats['hits']} hits, {stats['misses']} misses, "
                               f"{stats['hit_rate']:.1%} hit rate, {stats['size']} entries")
                     break
+
+            # Early stopping on energy plateau
+            current_energy = metrics['energy']
+            if current_energy < self._best_energy - config.early_stopping_threshold:
+                self._best_energy = current_energy
+                self._patience_counter = 0
+            else:
+                self._patience_counter += 1
+
+            if self._patience_counter >= config.early_stopping_patience and epoch >= config.min_epochs:
+                print(f"\nEarly stopping at epoch {epoch}: no energy improvement for "
+                      f"{config.early_stopping_patience} epochs (best: {self._best_energy:.6f} Ha)")
+                if self.connection_cache is not None:
+                    stats = self.connection_cache.stats()
+                    print(f"Cache stats: {stats['hits']} hits, {stats['misses']} misses, "
+                          f"{stats['hit_rate']:.1%} hit rate, {stats['size']} entries")
+                break
 
         # Print final cache stats
         if self.connection_cache is not None:

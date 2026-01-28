@@ -544,7 +544,7 @@ class SampleBasedKrylovDiagonalization:
         Sample bitstrings from a quantum state.
 
         Args:
-            state_vector: Quantum state vector
+            state_vector: Quantum state vector (full Hilbert space)
             num_samples: Number of shots
 
         Returns:
@@ -554,10 +554,56 @@ class SampleBasedKrylovDiagonalization:
         probs = torch.abs(state_vector) ** 2
         probs = probs / probs.sum()  # Normalize
 
+        # Check for PyTorch multinomial limit (2^24 categories on CUDA)
+        max_multinomial_categories = 2**24
+        if len(probs) > max_multinomial_categories:
+            # Use chunked/CPU sampling for very large state spaces
+            return self._sample_from_large_state(probs, num_samples)
+
         # Sample indices (multinomial on GPU, convert to numpy for counting)
         indices = torch.multinomial(
             probs, num_samples, replacement=True
         ).cpu().numpy()
+
+        # Count occurrences
+        unique, counts = np.unique(indices, return_counts=True)
+
+        # Convert to bitstring dictionary
+        results = {}
+        for idx, count in zip(unique, counts):
+            bitstring = self._index_to_bitstring(idx)
+            results[bitstring] = int(count)
+
+        return results
+
+    def _sample_from_large_state(
+        self,
+        probs: torch.Tensor,
+        num_samples: int,
+    ) -> Dict[str, int]:
+        """
+        Sample from state with more than 2^24 categories (CUDA multinomial limit).
+
+        Uses numpy for sampling to avoid the CUDA limitation.
+
+        Args:
+            probs: Probability distribution (normalized)
+            num_samples: Number of shots
+
+        Returns:
+            Dictionary mapping bitstrings to counts
+        """
+        # Move to CPU and use numpy for sampling (no category limit)
+        probs_np = probs.cpu().numpy().astype(np.float64)
+
+        # Ensure valid probability distribution
+        probs_np = np.maximum(probs_np, 0)
+        probs_np = probs_np / probs_np.sum()
+
+        # Sample using numpy's choice (no category limit)
+        indices = np.random.choice(
+            len(probs_np), size=num_samples, replace=True, p=probs_np
+        )
 
         # Count occurrences
         unique, counts = np.unique(indices, return_counts=True)
@@ -602,6 +648,12 @@ class SampleBasedKrylovDiagonalization:
 
         self.krylov_samples = []
 
+        # For molecular systems with particle conservation, work entirely in subspace
+        # This avoids memory issues and PyTorch multinomial's 2^24 category limit
+        if self._is_molecular and self._subspace_basis is not None:
+            return self._generate_krylov_samples_subspace(max_krylov_dim, progress)
+
+        # For non-molecular systems, use full Hilbert space
         # Create initial state vector in Hilbert space on the correct device
         # |ψ_0⟩ = |bitstring⟩
         device = self.device
@@ -633,6 +685,117 @@ class SampleBasedKrylovDiagonalization:
                 )
 
         return self.krylov_samples
+
+    def _generate_krylov_samples_subspace(
+        self,
+        max_krylov_dim: int,
+        progress: bool = True,
+    ) -> List[Dict[str, int]]:
+        """
+        Generate Krylov samples working entirely in particle-conserving subspace.
+
+        This is MUCH more memory-efficient for molecular systems:
+        - C2H4 (28 qubits): 9M subspace vs 268M full space (30x smaller)
+        - Avoids PyTorch multinomial's 2^24 category limit
+
+        The key insight is that for molecular Hamiltonians, the particle number
+        is conserved, so we never leave the subspace during time evolution.
+
+        Args:
+            max_krylov_dim: Maximum Krylov dimension
+            progress: Show progress bar
+
+        Returns:
+            List of sample dictionaries for each Krylov state
+        """
+        from scipy.sparse.linalg import expm_multiply
+
+        # Build sparse Hamiltonian in subspace (cached for reuse)
+        if not hasattr(self, '_sparse_H'):
+            self._sparse_H = self._build_sparse_hamiltonian()
+
+        n_subspace = len(self._subspace_basis)
+
+        # Find initial state index in subspace
+        initial_key = tuple(self.initial_state.tolist())
+        if initial_key not in self._subspace_index_map:
+            raise ValueError(
+                f"Initial state not in particle-conserving subspace. "
+                f"Expected {self.hamiltonian.n_alpha} alpha and "
+                f"{self.hamiltonian.n_beta} beta electrons."
+            )
+        initial_subspace_idx = self._subspace_index_map[initial_key]
+
+        # Create initial state in subspace
+        psi_subspace = np.zeros(n_subspace, dtype=np.complex128)
+        psi_subspace[initial_subspace_idx] = 1.0
+
+        iterator = range(max_krylov_dim)
+        if progress:
+            iterator = tqdm(iterator, desc="Generating Krylov states")
+
+        for k in iterator:
+            # Sample from current subspace state
+            samples = self._sample_from_subspace(psi_subspace)
+            self.krylov_samples.append(samples)
+
+            # Evolve state in subspace: |ψ_{k+1}⟩ = U |ψ_k⟩
+            if k < max_krylov_dim - 1:
+                t = -1j * self.time_step
+                psi_subspace = expm_multiply(t * self._sparse_H, psi_subspace)
+
+        return self.krylov_samples
+
+    def _sample_from_subspace(
+        self,
+        psi_subspace: np.ndarray,
+    ) -> Dict[str, int]:
+        """
+        Sample bitstrings from a quantum state in subspace representation.
+
+        This method is much more memory-efficient than full-space sampling:
+        - Only needs to store probabilities for valid configurations
+        - Uses numpy sampling (no CUDA category limit)
+        - Converts subspace indices to bitstrings via _subspace_basis
+
+        Args:
+            psi_subspace: State vector in subspace representation
+
+        Returns:
+            Dictionary mapping bitstrings to counts
+        """
+        num_samples = self.config.shots_per_krylov
+        n_subspace = len(psi_subspace)
+
+        # Compute probabilities in subspace
+        probs = np.abs(psi_subspace) ** 2
+        probs = probs / probs.sum()  # Normalize
+
+        # Check if we can use CUDA multinomial (faster for moderate sizes)
+        max_multinomial_categories = 2**24
+        if n_subspace <= max_multinomial_categories and torch.cuda.is_available():
+            # Use CUDA for sampling (faster)
+            probs_torch = torch.from_numpy(probs).float().cuda()
+            indices = torch.multinomial(
+                probs_torch, num_samples, replacement=True
+            ).cpu().numpy()
+        else:
+            # Use numpy for very large subspaces
+            indices = np.random.choice(
+                n_subspace, size=num_samples, replace=True, p=probs.astype(np.float64)
+            )
+
+        # Count occurrences
+        unique, counts = np.unique(indices, return_counts=True)
+
+        # Convert subspace indices to bitstrings
+        results = {}
+        for subspace_idx, count in zip(unique, counts):
+            config = self._subspace_basis[subspace_idx]
+            bitstring = "".join(str(b.item()) for b in config)
+            results[bitstring] = int(count)
+
+        return results
 
     def build_cumulative_basis(self) -> List[Dict[str, int]]:
         """
