@@ -602,16 +602,22 @@ class PhysicsGuidedFlowTrainer:
         """Get all connections for a batch of configurations."""
         config = self.config
 
+        # Determine if we should use the cache
+        use_cache = False
         if self.connection_cache is not None:
-            if self.connection_cache.hit_rate > 0.3 or len(self.connection_cache) < 1000:
-                return self.connection_cache.get_batch(configs, self.hamiltonian)
-            elif (config.use_parallel_connections and
-                  hasattr(self.hamiltonian, 'get_connections_parallel')):
-                return self.hamiltonian.get_connections_parallel(
-                    configs, max_workers=config.parallel_workers
-                )
-            else:
-                return self.connection_cache.get_batch(configs, self.hamiltonian)
+            # Use cache if: hit rate is reasonable (>0.1), OR cache was just warmed up
+            # (no queries yet), OR cache is still small. The previous condition
+            # (hit_rate > 0.3 or size < 1000) was buggy: after warmup with 3241 entries
+            # and 0 initial queries, hit_rate=0 caused the cache to never be used.
+            total_queries = self.connection_cache.hits + self.connection_cache.misses
+            use_cache = (
+                total_queries < 100 or  # Not enough data to judge hit rate yet
+                self.connection_cache.hit_rate > 0.1 or  # Hit rate is decent
+                len(self.connection_cache) < 1000  # Cache is small, overhead is low
+            )
+
+        if use_cache and self.connection_cache is not None:
+            return self.connection_cache.get_batch(configs, self.hamiltonian)
         elif (config.use_parallel_connections and
               hasattr(self.hamiltonian, 'get_connections_parallel')):
             return self.hamiltonian.get_connections_parallel(
@@ -715,12 +721,14 @@ class PhysicsGuidedFlowTrainer:
         # Sample indices
         indices = torch.multinomial(probs, n_sample, replacement=False)
 
-        # Reweight elements to account for sampling
-        # E[element / prob] = sum(element) for uniform sampling
-        # For importance sampling: element / (n_sample * prob)
+        # Reweight elements to account for importance sampling
+        # For importance sampling with prob_i ∝ |element_i|:
+        #   E[sum over sampled (element_i / (n_sample * prob_i))] = sum(elements)
+        # This provides an unbiased estimate of the full sum.
+        # NOTE: Do NOT multiply by n_total - that was a bug causing ~300,000x energy inflation!
         sampled_probs = probs[indices]
         reweight_factor = 1.0 / (n_sample * sampled_probs + 1e-10)
-        reweighted_elements = all_elements[indices] * reweight_factor * n_total
+        reweighted_elements = all_elements[indices] * reweight_factor
 
         return (
             all_connected[indices],
