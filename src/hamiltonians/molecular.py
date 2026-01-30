@@ -484,32 +484,48 @@ class MolecularHamiltonian(Hamiltonian):
     ) -> int:
         """
         Compute Jordan-Wigner sign for double excitation a+_p a+_r a_s a_q (numpy version).
+
+        IMPORTANT: Operators are applied RIGHT-TO-LEFT in second quantization:
+        1. a_q first (annihilate q) - on original config
+        2. a_s second (annihilate s) - on config with q removed
+        3. a+_r third (create r) - on config with q,s removed
+        4. a+_p fourth (create p) - on config with q,s removed, r added
+
+        Each JW string counts occupied sites to the LEFT of the operator position,
+        accounting for modifications from previously applied operators.
         """
         total_count = 0
-        total_count += config[:p].sum()
 
-        count_r = config[:r].sum()
-        if q < r:
-            count_r -= config[q]
-        total_count += count_r
+        # 1. a_q (FIRST operator, applied to original config)
+        # JW string: count occupied sites below q in original config
+        total_count += config[:q].sum()
 
+        # 2. a_s (second operator, q has been removed)
+        # JW string: count occupied sites below s, minus 1 if q < s (since q is now empty)
         count_s = config[:s].sum()
-        if p < s:
-            count_s += 1
-        if r < s:
-            count_s += 1
         if q < s:
-            count_s -= config[q]
+            count_s -= 1  # q was occupied, now removed
         total_count += count_s
 
-        count_q = config[:q].sum()
-        if p < q:
-            count_q += 1
-        if r < q:
-            count_q += 1
-        if s < q:
-            count_q -= config[s]
-        total_count += count_q
+        # 3. a+_r (third operator, q and s have been removed)
+        # JW string: count occupied sites below r, minus adjustments for q,s removal
+        count_r = config[:r].sum()
+        if q < r:
+            count_r -= 1  # q was occupied, now removed
+        if s < r:
+            count_r -= 1  # s was occupied, now removed
+        total_count += count_r
+
+        # 4. a+_p (fourth operator, q,s removed, r added)
+        # JW string: count occupied sites below p, with all adjustments
+        count_p = config[:p].sum()
+        if q < p:
+            count_p -= 1  # q was occupied, now removed
+        if s < p:
+            count_p -= 1  # s was occupied, now removed
+        if r < p:
+            count_p += 1  # r was empty, now occupied
+        total_count += count_p
 
         return (-1) ** int(total_count)
 
@@ -518,32 +534,44 @@ class MolecularHamiltonian(Hamiltonian):
     ) -> int:
         """
         Compute Jordan-Wigner sign for double excitation a+_p a+_r a_s a_q.
+
+        IMPORTANT: Operators are applied RIGHT-TO-LEFT in second quantization:
+        1. a_q first (annihilate q) - on original config
+        2. a_s second (annihilate s) - on config with q removed
+        3. a+_r third (create r) - on config with q,s removed
+        4. a+_p fourth (create p) - on config with q,s removed, r added
+
+        Each JW string counts occupied sites to the LEFT of the operator position,
+        accounting for modifications from previously applied operators.
         """
         total_count = 0
-        total_count += config[:p].sum().item()
 
-        count_r = config[:r].sum().item()
-        if q < r:
-            count_r -= config[q].item()
-        total_count += count_r
+        # 1. a_q (FIRST operator, applied to original config)
+        total_count += config[:q].sum().item()
 
+        # 2. a_s (second operator, q has been removed)
         count_s = config[:s].sum().item()
-        if p < s:
-            count_s += 1
-        if r < s:
-            count_s += 1
         if q < s:
-            count_s -= config[q].item()
+            count_s -= 1  # q was occupied, now removed
         total_count += count_s
 
-        count_q = config[:q].sum().item()
-        if p < q:
-            count_q += 1
-        if r < q:
-            count_q += 1
-        if s < q:
-            count_q -= config[s].item()
-        total_count += count_q
+        # 3. a+_r (third operator, q and s have been removed)
+        count_r = config[:r].sum().item()
+        if q < r:
+            count_r -= 1
+        if s < r:
+            count_r -= 1
+        total_count += count_r
+
+        # 4. a+_p (fourth operator, q,s removed, r added)
+        count_p = config[:p].sum().item()
+        if q < p:
+            count_p -= 1
+        if s < p:
+            count_p -= 1
+        if r < p:
+            count_p += 1
+        total_count += count_p
 
         return (-1) ** int(total_count)
 
