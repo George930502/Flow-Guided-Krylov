@@ -1061,7 +1061,15 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
     The NF-discovered basis provides a good initial subspace that captures
     the support of the ground state, while Krylov refinement improves
     the energy estimate through systematic subspace expansion.
+
+    OPTIMIZATION FOR LARGE SYSTEMS:
+    For systems with >100k valid configurations, we use NF-basis-guided
+    Krylov expansion instead of full particle-conserving subspace evolution.
+    This avoids building the prohibitively large Hamiltonian matrix.
     """
+
+    # Threshold for using NF-guided Krylov (vs full subspace evolution)
+    MAX_FULL_SUBSPACE_SIZE = 100000
 
     def __init__(
         self,
@@ -1070,7 +1078,40 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         config: Optional[SKQDConfig] = None,
         initial_state: Optional[torch.Tensor] = None,
     ):
-        super().__init__(hamiltonian, config, initial_state)
+        # Check if we should use NF-guided mode for large systems
+        self._use_nf_guided_mode = False
+        if hasattr(hamiltonian, 'n_alpha') and hasattr(hamiltonian, 'n_beta'):
+            n_valid = comb(hamiltonian.n_orbitals, hamiltonian.n_alpha) * \
+                      comb(hamiltonian.n_orbitals, hamiltonian.n_beta)
+            if n_valid > self.MAX_FULL_SUBSPACE_SIZE:
+                self._use_nf_guided_mode = True
+                print(f"Using NF-guided Krylov mode for large system ({n_valid:,} configs)")
+
+        # For NF-guided mode, temporarily disable molecular detection
+        # to prevent full subspace setup
+        if self._use_nf_guided_mode:
+            # Don't call parent's molecular subspace setup
+            self.hamiltonian = hamiltonian
+            self.config = config or SKQDConfig()
+            self.num_sites = hamiltonian.num_sites
+            self._is_molecular = True  # Still molecular, but no full subspace
+            self._subspace_basis = None
+            self._subspace_index_map = None
+            self._sparse_H = None
+
+            # Set up initial state from NF basis
+            if initial_state is not None:
+                self.initial_state = initial_state
+            else:
+                self.initial_state = hamiltonian.get_hf_state()
+
+            self.time_step = self.config.time_step
+            self.krylov_samples = []
+            self.cumulative_basis = []
+            self.energies = []
+        else:
+            # Standard initialization for smaller systems
+            super().__init__(hamiltonian, config, initial_state)
 
         self.nf_basis = nf_basis  # (n_nf, num_sites)
 
@@ -1106,6 +1147,189 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
         return unique
 
+    def _generate_krylov_samples_nf_guided(
+        self,
+        max_krylov_dim: int,
+        progress: bool = True,
+    ) -> List[Dict[str, int]]:
+        """
+        Generate Krylov samples using NF-guided expansion (for large systems).
+
+        This method avoids building the full particle-conserving Hamiltonian by:
+        1. Starting with NF basis as the initial subspace
+        2. Building H only in the current subspace (small matrix)
+        3. Time evolving in this subspace
+        4. Discovering new configurations via get_connections
+        5. Expanding the subspace dynamically
+
+        For C2H4: Works with ~1000-10000 configs instead of 9M.
+
+        Args:
+            max_krylov_dim: Maximum Krylov dimension
+            progress: Show progress bar
+
+        Returns:
+            List of sample dictionaries for each Krylov step
+        """
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.linalg import expm_multiply
+
+        device = self.hamiltonian.device if hasattr(self.hamiltonian, 'device') else 'cpu'
+
+        # Start with NF basis as the subspace
+        current_basis = self.nf_basis.clone().to(device)
+        n_initial = len(current_basis)
+
+        # Create index mapping
+        basis_set = {tuple(c.cpu().tolist()) for c in current_basis}
+
+        print(f"NF-guided Krylov: Starting with {n_initial} NF configs")
+
+        # Initialize state: uniform superposition over NF basis
+        n_subspace = len(current_basis)
+        psi = np.ones(n_subspace, dtype=np.complex128) / np.sqrt(n_subspace)
+
+        self.krylov_samples = []
+
+        iterator = range(max_krylov_dim)
+        if progress:
+            iterator = tqdm(iterator, desc="NF-guided Krylov")
+
+        for k in iterator:
+            # Sample from current state
+            samples = self._sample_from_subspace_basis(psi, current_basis)
+            self.krylov_samples.append(samples)
+
+            if k < max_krylov_dim - 1:
+                # Expand subspace by finding connected configurations
+                new_configs = self._find_connected_configs(current_basis, basis_set)
+
+                if len(new_configs) > 0:
+                    # Add new configs to basis
+                    current_basis = torch.cat([current_basis, new_configs], dim=0)
+                    for c in new_configs:
+                        basis_set.add(tuple(c.cpu().tolist()))
+
+                    # Expand state vector (new configs start with zero amplitude)
+                    n_new = len(new_configs)
+                    psi = np.concatenate([psi, np.zeros(n_new, dtype=np.complex128)])
+
+                # Build Hamiltonian in current subspace
+                H_subspace = self._build_hamiltonian_in_basis(current_basis)
+
+                # Time evolution in subspace
+                t = -1j * self.time_step
+                psi = expm_multiply(t * H_subspace, psi)
+
+                # Normalize
+                psi = psi / np.linalg.norm(psi)
+
+        n_final = len(current_basis)
+        print(f"NF-guided Krylov: Expanded to {n_final} configs (+{n_final - n_initial} new)")
+
+        # Store final basis for later use
+        self._nf_guided_basis = current_basis
+
+        return self.krylov_samples
+
+    def _find_connected_configs(
+        self,
+        basis: torch.Tensor,
+        basis_set: set,
+        max_new_per_step: int = 500,
+    ) -> torch.Tensor:
+        """Find configurations connected to current basis but not in it."""
+        device = basis.device
+        new_configs = []
+        new_set = set()
+
+        # Sample subset of basis for efficiency
+        n_sample = min(len(basis), 200)
+        indices = torch.randperm(len(basis))[:n_sample]
+
+        for idx in indices:
+            config = basis[idx]
+            connected, elements = self.hamiltonian.get_connections(config)
+
+            for conn in connected:
+                key = tuple(conn.cpu().tolist())
+                if key not in basis_set and key not in new_set:
+                    new_configs.append(conn)
+                    new_set.add(key)
+
+                    if len(new_configs) >= max_new_per_step:
+                        break
+
+            if len(new_configs) >= max_new_per_step:
+                break
+
+        if not new_configs:
+            return torch.empty(0, basis.shape[1], device=device)
+
+        return torch.stack(new_configs).to(device)
+
+    def _build_hamiltonian_in_basis(self, basis: torch.Tensor):
+        """Build sparse Hamiltonian matrix in given basis."""
+        from scipy.sparse import csr_matrix
+
+        n = len(basis)
+        device = basis.device
+
+        # Create index mapping
+        basis_map = {}
+        for i, config in enumerate(basis):
+            key = tuple(config.cpu().tolist())
+            basis_map[key] = i
+
+        rows, cols, data = [], [], []
+
+        for j in range(n):
+            config = basis[j]
+
+            # Diagonal
+            diag = self.hamiltonian.diagonal_element(config).item()
+            rows.append(j)
+            cols.append(j)
+            data.append(diag)
+
+            # Off-diagonal
+            connected, elements = self.hamiltonian.get_connections(config)
+            for conn, elem in zip(connected, elements):
+                key = tuple(conn.cpu().tolist())
+                if key in basis_map:
+                    i = basis_map[key]
+                    rows.append(i)
+                    cols.append(j)
+                    data.append(elem.item() if hasattr(elem, 'item') else elem)
+
+        return csr_matrix(
+            (data, (rows, cols)),
+            shape=(n, n),
+            dtype=np.complex128
+        )
+
+    def _sample_from_subspace_basis(
+        self,
+        psi: np.ndarray,
+        basis: torch.Tensor,
+    ) -> Dict[str, int]:
+        """Sample bitstrings from state in given basis."""
+        num_samples = self.config.shots_per_krylov
+
+        probs = np.abs(psi) ** 2
+        probs = probs / probs.sum()
+
+        indices = np.random.choice(len(probs), size=num_samples, replace=True, p=probs)
+        unique, counts = np.unique(indices, return_counts=True)
+
+        results = {}
+        for idx, count in zip(unique, counts):
+            config = basis[idx]
+            bitstring = "".join(str(b.item()) for b in config)
+            results[bitstring] = int(count)
+
+        return results
+
     def run_with_nf(
         self,
         max_krylov_dim: Optional[int] = None,
@@ -1120,6 +1344,9 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         1. The NF basis already captures important low-energy configurations
         2. Krylov time evolution discovers configurations missed by NF
         3. Combining them gives a better basis than either alone
+
+        For large systems (>100k configs), uses NF-guided Krylov expansion
+        which works in a growing subspace instead of the full space.
 
         Includes numerical stability improvements:
         - Uses regularization from config
@@ -1140,8 +1367,11 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         )
         print(f"NF-only basis energy: {E_nf:.6f} ({len(self.nf_basis)} configs)")
 
-        # Generate Krylov samples
-        self.generate_krylov_samples(max_krylov_dim, progress=progress)
+        # Generate Krylov samples - use appropriate method based on system size
+        if self._use_nf_guided_mode:
+            self._generate_krylov_samples_nf_guided(max_krylov_dim, progress=progress)
+        else:
+            self.generate_krylov_samples(max_krylov_dim, progress=progress)
 
         results = {
             "krylov_dims": [],
