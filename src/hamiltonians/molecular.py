@@ -323,20 +323,22 @@ class MolecularHamiltonian(Hamiltonian):
                 elements_list.append(sign * h_pq)
 
         # ===== DOUBLE EXCITATIONS (two-body terms) =====
-        # OPTIMIZED: Use precomputed sparse h2e lookup instead of 4 nested loops
-        # For C2H4: reduces from ~38k iterations to ~500-2000 nonzero lookups
+        # NOTE: Using original 4-nested-loops approach for correctness.
+        # The sparse h2e optimization had a bug causing energy to go below ground state.
 
-        # Alpha-Alpha: use sparse lookup
-        for i in range(len(occ_alpha)):
+        # Alpha-Alpha
+        n_occ_a = len(occ_alpha)
+        n_virt_a = len(virt_alpha)
+        for i in range(n_occ_a):
             q = occ_alpha[i]
-            for j in range(i + 1, len(occ_alpha)):
+            for j in range(i + 1, n_occ_a):
                 s = occ_alpha[j]
-                # Lookup precomputed non-zero pairs for this occupied pair
-                occ_pair = (q, s) if q < s else (s, q)
-                if occ_pair in self._h2e_same_spin_by_occ:
-                    for p, r, val in self._h2e_same_spin_by_occ[occ_pair]:
-                        # Check if p,r are virtual for alpha
-                        if p in virt_alpha_set and r in virt_alpha_set:
+                for k in range(n_virt_a):
+                    p = virt_alpha[k]
+                    for l in range(k + 1, n_virt_a):
+                        r = virt_alpha[l]
+                        val = h2e_np[p, q, r, s] - h2e_np[p, s, r, q]
+                        if abs(val) > 1e-12:
                             new_config = config_np.copy()
                             new_config[q] = 0
                             new_config[s] = 0
@@ -346,15 +348,19 @@ class MolecularHamiltonian(Hamiltonian):
                             connected_list.append(new_config)
                             elements_list.append(sign * val)
 
-        # Beta-Beta: use sparse lookup
-        for i in range(len(occ_beta)):
+        # Beta-Beta
+        n_occ_b = len(occ_beta)
+        n_virt_b = len(virt_beta)
+        for i in range(n_occ_b):
             q = occ_beta[i]
-            for j in range(i + 1, len(occ_beta)):
+            for j in range(i + 1, n_occ_b):
                 s = occ_beta[j]
-                occ_pair = (q, s) if q < s else (s, q)
-                if occ_pair in self._h2e_same_spin_by_occ:
-                    for p, r, val in self._h2e_same_spin_by_occ[occ_pair]:
-                        if p in virt_beta_set and r in virt_beta_set:
+                for k in range(n_virt_b):
+                    p = virt_beta[k]
+                    for l in range(k + 1, n_virt_b):
+                        r = virt_beta[l]
+                        val = h2e_np[p, q, r, s] - h2e_np[p, s, r, q]
+                        if abs(val) > 1e-12:
                             new_config = config_np.copy()
                             q_idx = q + n_orb
                             s_idx = s + n_orb
@@ -368,13 +374,13 @@ class MolecularHamiltonian(Hamiltonian):
                             connected_list.append(new_config)
                             elements_list.append(sign * val)
 
-        # Alpha-Beta: use sparse lookup (no exchange term)
+        # Alpha-Beta (no exchange term)
         for q in occ_alpha:
             for s in occ_beta:
-                occ_pair = (q, s)
-                if occ_pair in self._h2e_alpha_beta_by_occ:
-                    for p, r, val in self._h2e_alpha_beta_by_occ[occ_pair]:
-                        if p in virt_alpha_set and r in virt_beta_set:
+                for p in virt_alpha:
+                    for r in virt_beta:
+                        val = h2e_np[p, q, r, s]
+                        if abs(val) > 1e-12:
                             new_config = config_np.copy()
                             s_idx = s + n_orb
                             r_idx = r + n_orb

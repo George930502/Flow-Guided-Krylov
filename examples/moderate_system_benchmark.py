@@ -488,42 +488,57 @@ def run_benchmark(
     # =======================================================================
     print("\n--- Step 3: Krylov Time Evolution ---")
 
-    # Default SKQD parameters
-    krylov_dim = 8
-    dt = 0.1
-    shots_per_krylov = 50000
+    # Skip SKQD for very large systems where building the full Hamiltonian is infeasible
+    # For C2H4 (9M configs), building the 9M x 9M Hamiltonian takes hours
+    MAX_SKQD_SUBSPACE_SIZE = 100000  # 100k configs is manageable
 
-    skqd_config = SKQDConfig(
-        max_krylov_dim=krylov_dim,
-        time_step=dt,
-        shots_per_krylov=shots_per_krylov,
-    )
+    if n_valid > MAX_SKQD_SUBSPACE_SIZE:
+        print(f"  SKIPPING: Subspace too large ({n_valid:,} > {MAX_SKQD_SUBSPACE_SIZE:,})")
+        print(f"  Building {n_valid:,} x {n_valid:,} Hamiltonian is not feasible")
+        print(f"  Using NF+Residual basis only for this system")
 
-    print(f"  Using params: krylov_dim={krylov_dim}, "
-          f"dt={dt:.4f}, shots={shots_per_krylov:,}")
+        # Set Krylov results to match residual results (no improvement)
+        result.krylov_new_configs = 0
+        result.nf_krylov_energy = result.nf_residual_energy
+        krylov_set = set()
+        nf_krylov_set = residual_set
+    else:
+        # Default SKQD parameters
+        krylov_dim = 8
+        dt = 0.1
+        shots_per_krylov = 50000
 
-    skqd = FlowGuidedSKQD(H, nf_basis, skqd_config)
-    skqd_results = skqd.run_with_nf(max_krylov_dim=krylov_dim, progress=verbose)
+        skqd_config = SKQDConfig(
+            max_krylov_dim=krylov_dim,
+            time_step=dt,
+            shots_per_krylov=shots_per_krylov,
+        )
 
-    # Collect Krylov configs
-    krylov_set = set()
-    cumulative = skqd.build_cumulative_basis()
-    if cumulative:
-        for bitstring in cumulative[-1].keys():
-            config = tuple(int(b) for b in bitstring)
-            krylov_set.add(config)
+        print(f"  Using params: krylov_dim={krylov_dim}, "
+              f"dt={dt:.4f}, shots={shots_per_krylov:,}")
 
-    krylov_new = krylov_set - nf_set
-    result.krylov_new_configs = len(krylov_new)
+        skqd = FlowGuidedSKQD(H, nf_basis, skqd_config)
+        skqd_results = skqd.run_with_nf(max_krylov_dim=krylov_dim, progress=verbose)
 
-    # Compute NF+Krylov energy
-    nf_krylov_set = nf_set | krylov_set
-    nf_krylov_basis = set_to_configs(nf_krylov_set, H.num_sites, device)
-    result.nf_krylov_energy = compute_basis_energy(H, nf_krylov_basis)
+        # Collect Krylov configs
+        krylov_set = set()
+        cumulative = skqd.build_cumulative_basis()
+        if cumulative:
+            for bitstring in cumulative[-1].keys():
+                config = tuple(int(b) for b in bitstring)
+                krylov_set.add(config)
 
-    nf_krylov_error = abs(result.nf_krylov_energy - E_exact) * 1000
-    print(f"  Krylov found: {len(krylov_new)} NEW configs")
-    print(f"  NF+Krylov energy: {result.nf_krylov_energy:.8f} Ha (error: {nf_krylov_error:.4f} mHa)")
+        krylov_new = krylov_set - nf_set
+        result.krylov_new_configs = len(krylov_new)
+
+        # Compute NF+Krylov energy
+        nf_krylov_set = nf_set | krylov_set
+        nf_krylov_basis = set_to_configs(nf_krylov_set, H.num_sites, device)
+        result.nf_krylov_energy = compute_basis_energy(H, nf_krylov_basis)
+
+        nf_krylov_error = abs(result.nf_krylov_energy - E_exact) * 1000
+        print(f"  Krylov found: {len(krylov_new)} NEW configs")
+        print(f"  NF+Krylov energy: {result.nf_krylov_energy:.8f} Ha (error: {nf_krylov_error:.4f} mHa)")
 
     # =======================================================================
     # Step 4: Krylov-Unique Analysis
@@ -550,7 +565,12 @@ def run_benchmark(
     # =======================================================================
     print("\n--- Step 5: SKQD Necessity Verdict ---")
 
-    if len(krylov_unique) > 0:
+    # Handle skipped SKQD case
+    if n_valid > MAX_SKQD_SUBSPACE_SIZE:
+        result.verdict = "SKIPPED"
+        result.krylov_improvement_mha = 0.0
+        reason = f"SKQD skipped due to large subspace ({n_valid:,} configs)"
+    elif len(krylov_unique) > 0:
         krylov_improvement = (result.nf_residual_energy - result.combined_energy) * 1000
         result.krylov_improvement_mha = krylov_improvement
 

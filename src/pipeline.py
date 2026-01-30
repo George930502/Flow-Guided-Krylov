@@ -188,7 +188,7 @@ class PipelineConfig:
     # Sample a fraction of connections for stochastic local energy (1.0 = all)
     stochastic_connections_fraction: float = 1.0
 
-    def adapt_to_system_size(self, n_valid_configs: int) -> "PipelineConfig":
+    def adapt_to_system_size(self, n_valid_configs: int, verbose: bool = True) -> "PipelineConfig":
         """
         Adapt configuration parameters based on the valid configuration space size.
 
@@ -197,10 +197,15 @@ class PipelineConfig:
 
         Args:
             n_valid_configs: Number of particle-conserving configurations
+            verbose: Whether to print adaptation info (default True, set False to suppress)
 
         Returns:
             Updated config (modifies self in-place and returns)
         """
+        # Skip if already adapted to same size
+        if hasattr(self, '_adapted_size') and self._adapted_size == n_valid_configs:
+            return self
+
         # Determine system complexity tier
         if n_valid_configs <= 1000:
             tier = "small"
@@ -211,7 +216,8 @@ class PipelineConfig:
         else:
             tier = "very_large"
 
-        print(f"System size: {n_valid_configs:,} valid configs -> {tier} tier")
+        if verbose:
+            print(f"System size: {n_valid_configs:,} valid configs -> {tier} tier")
 
         if tier == "small":
             # Small systems: default parameters are fine
@@ -277,12 +283,16 @@ class PipelineConfig:
         coverage_accumulated = min(1.0, self.max_accumulated_basis / n_valid_configs)
         coverage_diverse = min(1.0, self.max_diverse_configs / n_valid_configs)
 
-        print(f"Adapted parameters:")
-        print(f"  max_accumulated_basis: {self.max_accumulated_basis:,} ({coverage_accumulated*100:.1f}% of valid)")
-        print(f"  max_diverse_configs: {self.max_diverse_configs:,} ({coverage_diverse*100:.1f}% of valid)")
-        print(f"  residual_iterations: {self.residual_iterations}")
-        print(f"  residual_configs_per_iter: {self.residual_configs_per_iter}")
-        print(f"  NQS hidden dims: {self.nqs_hidden_dims}")
+        if verbose:
+            print(f"Adapted parameters:")
+            print(f"  max_accumulated_basis: {self.max_accumulated_basis:,} ({coverage_accumulated*100:.1f}% of valid)")
+            print(f"  max_diverse_configs: {self.max_diverse_configs:,} ({coverage_diverse*100:.1f}% of valid)")
+            print(f"  residual_iterations: {self.residual_iterations}")
+            print(f"  residual_configs_per_iter: {self.residual_configs_per_iter}")
+            print(f"  NQS hidden dims: {self.nqs_hidden_dims}")
+
+        # Mark as adapted to prevent duplicate adaptation
+        self._adapted_size = n_valid_configs
 
         return self
 
