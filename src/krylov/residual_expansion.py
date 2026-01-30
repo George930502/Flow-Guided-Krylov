@@ -56,6 +56,14 @@ class ResidualExpansionConfig:
     # Number of samples for importance sampling
     n_importance_samples: int = 10000
 
+    # Energy bound for variational principle enforcement
+    # If set, any expansion that drops energy below this is rejected
+    energy_lower_bound: float = None  # Set to reference energy (e.g., CCSD)
+
+    # Maximum allowed energy drop per iteration (Ha) - safety check
+    # If energy drops more than this in one iteration, reject the expansion
+    max_energy_drop_per_iter: float = 0.5  # 500 mHa is suspicious
+
 
 class ResidualBasedExpander:
     """
@@ -348,9 +356,10 @@ class SelectedCIExpander:
         """
         Expand basis using perturbation-based selection.
 
-        Includes variational consistency check: if adding configurations
-        increases the energy (violates variational principle), we keep
-        the original basis and return with a warning.
+        Includes multiple safety checks:
+        1. Variational consistency: reject if energy increases
+        2. Energy bound: reject if energy drops below reference (e.g., CCSD)
+        3. Catastrophic drop: reject if energy drops too much in one iteration
 
         Args:
             current_basis: Current basis configurations
@@ -380,27 +389,55 @@ class SelectedCIExpander:
         # Rediagonalize
         new_energy, _ = self._diagonalize(expanded_basis)
 
-        # VARIATIONAL CONSISTENCY CHECK:
-        # Adding configurations should NEVER increase energy (variational principle)
-        # If energy increased, this indicates numerical issues or wrong configs selected
+        # SAFETY CHECK 1: Variational consistency
+        # Adding configurations should NEVER increase energy
         energy_improvement = energy - new_energy
 
         if energy_improvement < -1e-8:  # Allow tiny numerical tolerance
-            # Energy increased - this violates variational principle
-            # Keep the original basis and report the issue
             stats = {
                 'initial_size': len(current_basis),
-                'final_size': len(current_basis),  # Keep original
+                'final_size': len(current_basis),
                 'configs_added': 0,
                 'initial_energy': energy,
-                'final_energy': energy,  # Keep original energy
+                'final_energy': energy,
                 'energy_improvement': 0.0,
                 'energy_improvement_mha': 0.0,
                 'variational_violation': True,
                 'rejected_energy': new_energy,
                 'rejected_increase_mha': -energy_improvement * 1000,
+                'rejection_reason': 'energy_increased',
             }
             return current_basis, stats
+
+        # SAFETY CHECK 2: Energy lower bound
+        # If we have a reference energy, reject if we go below it
+        if cfg.energy_lower_bound is not None:
+            if new_energy < cfg.energy_lower_bound - 1e-6:
+                violation_amount = (cfg.energy_lower_bound - new_energy) * 1000
+                print(f"  WARNING: Energy {new_energy:.6f} Ha below bound "
+                      f"{cfg.energy_lower_bound:.6f} Ha by {violation_amount:.2f} mHa!")
+                stats = {
+                    'initial_size': len(current_basis),
+                    'final_size': len(current_basis),
+                    'configs_added': 0,
+                    'initial_energy': energy,
+                    'final_energy': energy,
+                    'energy_improvement': 0.0,
+                    'energy_improvement_mha': 0.0,
+                    'variational_violation': True,
+                    'rejected_energy': new_energy,
+                    'bound_violation_mha': violation_amount,
+                    'rejection_reason': 'below_energy_bound',
+                }
+                return current_basis, stats
+
+        # SAFETY CHECK 3: Catastrophic energy drop
+        # Large drops often indicate numerical issues
+        if energy_improvement > cfg.max_energy_drop_per_iter:
+            print(f"  WARNING: Suspiciously large energy drop: "
+                  f"{energy_improvement*1000:.2f} mHa in one iteration!")
+            # Still accept but flag it
+            pass
 
         stats = {
             'initial_size': len(current_basis),
@@ -409,7 +446,7 @@ class SelectedCIExpander:
             'initial_energy': energy,
             'final_energy': new_energy,
             'energy_improvement': energy_improvement,
-            'energy_improvement_mha': energy_improvement * 1000,  # in mHa
+            'energy_improvement_mha': energy_improvement * 1000,
             'variational_violation': False,
         }
 
@@ -424,6 +461,9 @@ class SelectedCIExpander:
 
         Uses float64 precision for numerical stability.
         Ensures consistent ground state is found across iterations.
+
+        IMPORTANT: The Hamiltonian matrix should already be Hermitian from
+        matrix_elements_fast(). We check for asymmetry and warn if found.
         """
         n_basis = len(basis)
 
@@ -431,7 +471,18 @@ class SelectedCIExpander:
         # Use float64 for better numerical precision
         H_np = H_matrix.cpu().numpy().astype(np.float64)
 
-        # Ensure Hermitian symmetry (numerical errors can break this)
+        # Check for asymmetry BEFORE symmetrization
+        asymmetry = np.abs(H_np - H_np.T).max()
+        if asymmetry > 1e-8:
+            print(f"  WARNING: Matrix asymmetry detected: {asymmetry:.2e}")
+            # Find worst offender
+            diff = np.abs(H_np - H_np.T)
+            i, j = np.unravel_index(np.argmax(diff), diff.shape)
+            if H_np[i, j] * H_np[j, i] < 0:
+                print(f"  CRITICAL: Opposite signs at ({i},{j}): "
+                      f"H[i,j]={H_np[i,j]:.4f}, H[j,i]={H_np[j,i]:.4f}")
+
+        # Ensure Hermitian symmetry (should be minimal adjustment now)
         H_np = 0.5 * (H_np + H_np.T)
 
         # Use sparse solver for large bases

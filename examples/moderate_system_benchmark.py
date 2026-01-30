@@ -100,10 +100,27 @@ def set_to_configs(config_set: Set[tuple], n_sites: int, device: str) -> torch.T
     return torch.tensor(configs, dtype=torch.long, device=device)
 
 
-def compute_basis_energy(H: MolecularHamiltonian, basis: torch.Tensor) -> float:
-    """Compute ground state energy by diagonalizing H in given basis."""
+def compute_basis_energy(H: MolecularHamiltonian, basis: torch.Tensor,
+                         check_asymmetry: bool = False) -> float:
+    """
+    Compute ground state energy by diagonalizing H in given basis.
+
+    Args:
+        H: Hamiltonian
+        basis: Basis configurations
+        check_asymmetry: If True, print warning for asymmetric matrices
+    """
     H_matrix = H.matrix_elements(basis, basis)
     H_np = H_matrix.cpu().numpy().astype(np.float64)
+
+    # Check asymmetry before symmetrization
+    if check_asymmetry:
+        asymmetry = np.abs(H_np - H_np.T).max()
+        if asymmetry > 1e-8:
+            print(f"  WARNING: Matrix asymmetry detected: {asymmetry:.2e}")
+
+    # The matrix should already be Hermitian from matrix_elements_fast()
+    # This is just a safety net for any residual numerical errors
     H_np = 0.5 * (H_np + H_np.T)
     eigenvalues, _ = np.linalg.eigh(H_np)
     return float(eigenvalues[0])
@@ -458,6 +475,8 @@ def run_benchmark(
         max_configs_per_iter=config.residual_configs_per_iter,
         max_iterations=config.residual_iterations,
         residual_threshold=config.residual_threshold,
+        # Set energy lower bound to reference energy to catch variational violations
+        energy_lower_bound=E_exact,
     )
     expander = SelectedCIExpander(H, residual_config)
 

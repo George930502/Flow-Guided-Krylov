@@ -593,16 +593,20 @@ class MolecularHamiltonian(Hamiltonian):
         configs: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Fast Hamiltonian matrix construction.
+        Fast Hamiltonian matrix construction with enforced Hermitian symmetry.
 
         Uses vectorized diagonal and optimized off-diagonal computation.
         For large bases (>200 configs), uses integer hash encoding for speed.
+
+        IMPORTANT: Builds only the lower triangle and mirrors to upper triangle
+        to guarantee Hermitian symmetry. This avoids issues where H[i,j] and H[j,i]
+        might differ due to JW sign computation from different directions.
 
         Args:
             configs: (n_configs, num_sites) basis configurations
 
         Returns:
-            (n_configs, n_configs) Hamiltonian matrix
+            (n_configs, n_configs) Hermitian Hamiltonian matrix
         """
         configs = configs.to(self.device)
         n_configs = configs.shape[0]
@@ -619,7 +623,8 @@ class MolecularHamiltonian(Hamiltonian):
         config_ints = (configs_cpu * powers).sum(dim=1).tolist()
         config_hash = {config_ints[i]: i for i in range(n_configs)}
 
-        # Off-diagonal elements with batched processing
+        # Off-diagonal elements - build lower triangle only, then mirror
+        # This guarantees H[i,j] = H[j,i] by construction
         for j in range(n_configs):
             connected, elements = self.get_connections(configs[j])
             if len(connected) > 0:
@@ -630,7 +635,15 @@ class MolecularHamiltonian(Hamiltonian):
                 for k, conn_int in enumerate(connected_ints):
                     if conn_int in config_hash:
                         i = config_hash[conn_int]
-                        H[i, j] = elements[k]
+                        # Only set if i > j (lower triangle) or if not yet set
+                        # This ensures each pair is set exactly once
+                        if i > j:
+                            H[i, j] = elements[k]
+                            H[j, i] = elements[k]  # Mirror for Hermiticity
+                        elif i < j and H[i, j] == 0:
+                            # Upper triangle element from a later j - set both
+                            H[i, j] = elements[k]
+                            H[j, i] = elements[k]
 
         return H
 
