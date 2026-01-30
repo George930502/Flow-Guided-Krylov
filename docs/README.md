@@ -34,6 +34,12 @@ This documentation describes the Flow-Guided Krylov pipeline for computing molec
 |--------|----------|-------------|
 | Hamiltonian | [MODULE_MOLECULAR_HAMILTONIAN.md](MODULE_MOLECULAR_HAMILTONIAN.md) | Second quantization, Jordan-Wigner, PySCF integration |
 
+### Performance
+
+| Document | Description |
+|----------|-------------|
+| [COMPUTATIONAL_ACCELERATION.md](COMPUTATIONAL_ACCELERATION.md) | Vectorization, GPU acceleration, sparse operations, optimization techniques |
+
 ---
 
 ## Quick Start

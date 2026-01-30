@@ -619,3 +619,11 @@ if len(nf_basis) < 300:
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Related Documentation
+
+- [MODULE_MOLECULAR_HAMILTONIAN.md](MODULE_MOLECULAR_HAMILTONIAN.md) - Hamiltonian construction and Jordan-Wigner transformation
+- [COMPUTATIONAL_ACCELERATION.md](COMPUTATIONAL_ACCELERATION.md) - Performance optimization techniques including sparse time evolution and GPU acceleration
+- [STAGE3_RESIDUAL_EXPANSION.md](STAGE3_RESIDUAL_EXPANSION.md) - Residual-based basis expansion that feeds into SKQD

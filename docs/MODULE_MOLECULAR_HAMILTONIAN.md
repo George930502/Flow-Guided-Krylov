@@ -204,6 +204,49 @@ def _compute_parity(self, config: torch.Tensor, p: int, q: int) -> int:
     return (-1) ** int(between.item())
 ```
 
+### Jordan-Wigner Sign for Double Excitations
+
+**Critical:** For double excitations a⁺ₚ a⁺ᵣ aₛ aᵧ, operators are applied **RIGHT-TO-LEFT** in second quantization. This means:
+
+1. **a_q first** (annihilate q) - operates on original configuration
+2. **a_s second** (annihilate s) - configuration now has q removed
+3. **a⁺_r third** (create r) - configuration has q,s removed
+4. **a⁺_p fourth** (create p) - configuration has q,s removed, r added
+
+Each JW string counts occupied sites to the LEFT, accounting for prior modifications:
+
+```python
+def _jw_sign_double_np(self, config, p, r, q, s):
+    """JW sign for a+_p a+_r a_s a_q applied RIGHT-TO-LEFT."""
+    total_count = 0
+
+    # 1. a_q (first): count on original config
+    total_count += config[:q].sum()
+
+    # 2. a_s (second): q has been removed
+    count_s = config[:s].sum()
+    if q < s:
+        count_s -= 1  # q was occupied, now empty
+    total_count += count_s
+
+    # 3. a+_r (third): q,s removed
+    count_r = config[:r].sum()
+    if q < r: count_r -= 1
+    if s < r: count_r -= 1
+    total_count += count_r
+
+    # 4. a+_p (fourth): q,s removed, r added
+    count_p = config[:p].sum()
+    if q < p: count_p -= 1
+    if s < p: count_p -= 1
+    if r < p: count_p += 1  # r now occupied
+    total_count += count_p
+
+    return (-1) ** int(total_count)
+```
+
+**Why This Matters:** Incorrect operator ordering violates the variational principle (E_computed < E_exact), producing unphysical energies below the ground state.
+
 ---
 
 ## FCI Energy Calculation
