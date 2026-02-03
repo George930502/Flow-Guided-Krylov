@@ -41,8 +41,10 @@ except ImportError:
 # Support both package imports and direct script execution
 try:
     from ..hamiltonians.base import Hamiltonian
+    from ..utils.gpu_linalg import gpu_eigh, gpu_expm_multiply
 except ImportError:
     from hamiltonians.base import Hamiltonian
+    from utils.gpu_linalg import gpu_eigh, gpu_expm_multiply
 
 
 @dataclass
@@ -244,33 +246,31 @@ class SampleBasedKrylovDiagonalization:
         num_steps: int,
     ) -> torch.Tensor:
         """
-        Apply time evolution using sparse matrix-vector multiplication.
+        Apply time evolution using GPU-accelerated matrix exponential.
 
-        Uses scipy.sparse.linalg.expm_multiply for efficient computation
+        Uses Lanczos-based Krylov approximation for efficient GPU computation
         of e^{-iHt}|psi> without forming the full matrix exponential.
 
         For molecular systems, works in particle-conserving subspace for
         massive speedup (e.g., 3K x 3K instead of 65K x 65K for NH3).
         """
-        from scipy.sparse.linalg import expm_multiply
-
-        # Build sparse Hamiltonian (cached for reuse)
-        if not hasattr(self, '_sparse_H'):
-            self._sparse_H = self._build_sparse_hamiltonian()
+        # Build GPU Hamiltonian matrix (cached for reuse)
+        if not hasattr(self, '_H_gpu') or self._H_gpu is None:
+            self._H_gpu = self._build_gpu_hamiltonian()
 
         # For molecular systems, work in subspace
         if self._is_molecular and self._subspace_basis is not None:
             return self._sparse_time_evolution_subspace(state_vector, num_steps)
 
-        # Standard full Hilbert space evolution
-        psi_np = state_vector.cpu().numpy().astype(np.complex128)
+        # GPU-accelerated time evolution
+        device = state_vector.device
+        psi = state_vector.to(torch.complex128)
 
-        # Apply time evolution num_steps times
-        t = -1j * self.time_step
+        # Apply time evolution num_steps times using GPU
         for _ in range(num_steps):
-            psi_np = expm_multiply(t * self._sparse_H, psi_np)
+            psi = gpu_expm_multiply(self._H_gpu, psi, t=-1j * self.time_step)
 
-        return torch.from_numpy(psi_np).to(state_vector.device)
+        return psi.to(device)
 
     def _sparse_time_evolution_subspace(
         self,
@@ -278,22 +278,28 @@ class SampleBasedKrylovDiagonalization:
         num_steps: int,
     ) -> torch.Tensor:
         """
-        Time evolution in particle-conserving subspace.
+        GPU-accelerated time evolution in particle-conserving subspace.
 
         Much faster because subspace is typically 10-100x smaller than full space.
+        All operations stay on GPU for maximum performance.
         """
-        from scipy.sparse.linalg import expm_multiply
+        device = state_vector.device
 
-        # Convert full state vector to subspace representation
-        psi_subspace = self._full_to_subspace(state_vector)
+        # Build GPU subspace Hamiltonian if not cached
+        if not hasattr(self, '_H_subspace_gpu') or self._H_subspace_gpu is None:
+            self._H_subspace_gpu = self._build_gpu_subspace_hamiltonian()
 
-        # Apply time evolution in subspace
-        t = -1j * self.time_step
+        # Convert full state vector to subspace representation (on GPU)
+        psi_subspace = self._full_to_subspace_gpu(state_vector)
+
+        # Apply time evolution in subspace using GPU
         for _ in range(num_steps):
-            psi_subspace = expm_multiply(t * self._sparse_H, psi_subspace)
+            psi_subspace = gpu_expm_multiply(
+                self._H_subspace_gpu, psi_subspace, t=-1j * self.time_step
+            )
 
         # Convert back to full Hilbert space
-        return self._subspace_to_full(psi_subspace, state_vector.device)
+        return self._subspace_to_full_gpu(psi_subspace, device)
 
     def _full_to_subspace(self, state_vector: torch.Tensor) -> np.ndarray:
         """Convert full Hilbert space state to subspace representation."""
@@ -319,6 +325,91 @@ class SampleBasedKrylovDiagonalization:
             state_full[idx] = psi_subspace[i]
 
         return torch.from_numpy(state_full).to(device)
+
+    def _full_to_subspace_gpu(self, state_vector: torch.Tensor) -> torch.Tensor:
+        """Convert full Hilbert space state to subspace representation (GPU)."""
+        device = state_vector.device
+        n_subspace = len(self._subspace_basis)
+
+        # Pre-compute subspace indices if not cached
+        if not hasattr(self, '_subspace_indices'):
+            self._subspace_indices = torch.tensor(
+                [self.hamiltonian._config_to_index(c) for c in self._subspace_basis],
+                device=device, dtype=torch.long
+            )
+        elif self._subspace_indices.device != device:
+            self._subspace_indices = self._subspace_indices.to(device)
+
+        # Extract amplitudes using advanced indexing (GPU-accelerated)
+        psi_subspace = state_vector[self._subspace_indices].to(torch.complex128)
+        return psi_subspace
+
+    def _subspace_to_full_gpu(self, psi_subspace: torch.Tensor, device) -> torch.Tensor:
+        """Convert subspace state back to full Hilbert space (GPU)."""
+        n_full = self.hamiltonian.hilbert_dim
+
+        # Ensure subspace indices are on correct device
+        if not hasattr(self, '_subspace_indices'):
+            self._subspace_indices = torch.tensor(
+                [self.hamiltonian._config_to_index(c) for c in self._subspace_basis],
+                device=device, dtype=torch.long
+            )
+        elif self._subspace_indices.device != device:
+            self._subspace_indices = self._subspace_indices.to(device)
+
+        # Create full state vector and scatter subspace values
+        state_full = torch.zeros(n_full, dtype=torch.complex128, device=device)
+        state_full[self._subspace_indices] = psi_subspace
+
+        return state_full
+
+    def _build_gpu_hamiltonian(self) -> torch.Tensor:
+        """
+        Build dense Hamiltonian matrix on GPU.
+
+        For molecular systems, builds in particle-conserving subspace
+        which is MUCH smaller than the full Hilbert space.
+        """
+        # For molecular systems, build in particle-conserving subspace
+        if self._is_molecular and self._subspace_basis is not None:
+            return self._build_gpu_subspace_hamiltonian()
+
+        # For non-molecular systems, use full Hilbert space
+        device = self.device if hasattr(self, 'device') else 'cuda' if torch.cuda.is_available() else 'cpu'
+        n = self.hamiltonian.hilbert_dim
+
+        print(f"Building GPU Hamiltonian ({n} x {n})...")
+
+        # Generate all basis states
+        basis = self.hamiltonian._generate_all_configs(device)
+
+        # Build matrix using Hamiltonian's matrix_elements method
+        H = self.hamiltonian.matrix_elements(basis, basis)
+
+        # Convert to complex128 for time evolution
+        return H.to(torch.complex128)
+
+    def _build_gpu_subspace_hamiltonian(self) -> torch.Tensor:
+        """
+        Build dense Hamiltonian in particle-conserving subspace on GPU.
+
+        This is MUCH faster than building in full Hilbert space because:
+        - NH3: 3,136 x 3,136 instead of 65,536 x 65,536 (420x fewer elements)
+        - N2: 14,400 x 14,400 instead of 1,048,576 x 1,048,576 (5300x fewer elements)
+        """
+        device = self.device if hasattr(self, 'device') else 'cuda' if torch.cuda.is_available() else 'cpu'
+        n_subspace = len(self._subspace_basis)
+
+        print(f"Building GPU subspace Hamiltonian ({n_subspace:,} x {n_subspace:,})...")
+
+        # Convert subspace basis to tensor
+        basis = torch.stack([torch.tensor(c, device=device) for c in self._subspace_basis])
+
+        # Build matrix using Hamiltonian's matrix_elements method
+        H = self.hamiltonian.matrix_elements(basis, basis)
+
+        # Convert to complex128 for time evolution
+        return H.to(torch.complex128)
 
     def _build_sparse_hamiltonian(self):
         """
@@ -877,95 +968,60 @@ class SampleBasedKrylovDiagonalization:
             cumulative = self.build_cumulative_basis()
             basis = self.get_basis_states(len(self.krylov_samples) - 1)
 
-        # Build projected Hamiltonian
+        # Build projected Hamiltonian (stays on GPU)
         H_proj = self.hamiltonian.matrix_elements(basis, basis)
+        n = H_proj.shape[0]
+        device = H_proj.device
 
-        # Convert to numpy with DOUBLE precision for numerical stability
-        H_np = H_proj.detach().cpu().numpy().astype(np.complex128)
-        n = H_np.shape[0]
+        # Use float64 for numerical stability (GPU supports double precision)
+        H = H_proj.detach().double()
 
-        # Ensure Hermitian symmetry (numerical errors can break this)
-        H_np = 0.5 * (H_np + H_np.conj().T)
-
-        # Verify Hamiltonian is essentially real (molecular Hamiltonians should be)
-        max_imag = np.abs(H_np.imag).max()
-        if max_imag > 1e-10:
-            # Has significant imaginary part - keep complex
-            pass
+        # Ensure Hermitian symmetry (on GPU)
+        if H.is_complex():
+            H = 0.5 * (H + H.conj().T)
+            # Verify Hamiltonian is essentially real (molecular Hamiltonians should be)
+            max_imag = H.imag.abs().max().item()
+            if max_imag <= 1e-10:
+                # Essentially real - use real matrix for better stability
+                H = H.real
         else:
-            # Essentially real - use real matrix for better stability
-            H_np = H_np.real.astype(np.float64)
+            H = 0.5 * (H + H.T)
 
         # Add small regularization to improve conditioning
         # NOTE: This shifts ALL eigenvalues up by regularization amount
         if regularization > 0:
-            H_np = H_np + regularization * np.eye(n, dtype=H_np.dtype)
+            H = H + regularization * torch.eye(n, dtype=H.dtype, device=device)
 
-        # Check matrix conditioning
+        # Check matrix conditioning (on GPU)
         try:
-            cond = np.linalg.cond(H_np)
+            # Use torch.linalg.cond for GPU-accelerated condition number
+            cond = torch.linalg.cond(H).item()
             if cond > 1e12:
                 print(f"WARNING: Ill-conditioned Hamiltonian (cond={cond:.2e})")
                 print("Using SVD-based solver for numerical stability")
+                H_np = H.cpu().numpy()
                 return self._svd_ground_state(H_np, return_eigenvector)
-        except np.linalg.LinAlgError:
+        except Exception:
             print("WARNING: Could not compute condition number, using SVD")
+            H_np = H.cpu().numpy()
             return self._svd_ground_state(H_np, return_eigenvector)
 
-        # Use sparse eigensolver for efficiency (as specified in AGENTs.md)
-        # For small matrices, dense is actually faster
-        if n < 100:
-            # Small matrix: use dense solver
+        # GPU-accelerated dense eigensolver (works for all matrix sizes)
+        # torch.linalg.eigh is highly optimized on GPU
+        try:
+            eigenvalues, eigenvectors = gpu_eigh(H, use_gpu=True)
+            E0 = float(eigenvalues[0].cpu())
+            v0 = eigenvectors[:, 0] if return_eigenvector else None
+        except Exception as e:
+            print(f"GPU eigensolver failed: {e}")
+            print("Falling back to CPU solver")
+            H_np = H.cpu().numpy()
             eigenvalues, eigenvectors = np.linalg.eigh(H_np)
             E0 = float(eigenvalues[0])
-            v0 = eigenvectors[:, 0]
-        else:
-            # Large matrix: use sparse solver
-            use_gpu = self.config.use_gpu and CUPY_AVAILABLE
-
-            try:
-                if use_gpu:
-                    # GPU sparse solver
-                    H_gpu = cp.asarray(H_np)
-                    H_sparse = cupy_csr(H_gpu)
-                    eigenvalues = cupy_eigsh(
-                        H_sparse,
-                        k=self.config.num_eigenvalues,
-                        which=self.config.which_eigenvalues,
-                        return_eigenvectors=return_eigenvector,
-                    )
-                    if return_eigenvector:
-                        eigenvalues, eigenvectors = eigenvalues
-                        E0 = float(cp.asnumpy(eigenvalues[0]))
-                        v0 = cp.asnumpy(eigenvectors[:, 0])
-                    else:
-                        E0 = float(cp.asnumpy(eigenvalues[0]))
-                        v0 = None
-                else:
-                    # CPU sparse solver
-                    H_sparse = scipy_csr(H_np)
-                    result = scipy_eigsh(
-                        H_sparse,
-                        k=min(self.config.num_eigenvalues, n - 1),
-                        which=self.config.which_eigenvalues,
-                        return_eigenvectors=return_eigenvector,
-                    )
-                    if return_eigenvector:
-                        eigenvalues, eigenvectors = result
-                        E0 = float(eigenvalues[0])
-                        v0 = eigenvectors[:, 0]
-                    else:
-                        E0 = float(result[0])
-                        v0 = None
-            except Exception as e:
-                print(f"Sparse eigensolver failed: {e}")
-                print("Falling back to dense solver")
-                eigenvalues, eigenvectors = np.linalg.eigh(H_np)
-                E0 = float(eigenvalues[0])
-                v0 = eigenvectors[:, 0] if return_eigenvector else None
+            v0 = torch.from_numpy(eigenvectors[:, 0]).to(device) if return_eigenvector else None
 
         if return_eigenvector:
-            return E0, torch.from_numpy(v0) if v0 is not None else None
+            return E0, v0
         else:
             return E0, None
 

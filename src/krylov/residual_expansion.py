@@ -23,6 +23,12 @@ import numpy as np
 from typing import Tuple, Optional, Dict, List, Set
 from dataclasses import dataclass
 
+# GPU-accelerated linear algebra
+try:
+    from ..utils.gpu_linalg import gpu_eigh
+except ImportError:
+    from utils.gpu_linalg import gpu_eigh
+
 
 @dataclass
 class ResidualExpansionConfig:
@@ -171,13 +177,14 @@ class ResidualBasedExpander:
         self,
         basis: torch.Tensor,
     ) -> Tuple[float, np.ndarray]:
-        """Diagonalize Hamiltonian in given basis."""
+        """Diagonalize Hamiltonian in given basis using GPU acceleration."""
         H_matrix = self.hamiltonian.matrix_elements(basis, basis)
-        H_np = H_matrix.cpu().numpy()
 
-        eigenvalues, eigenvectors = np.linalg.eigh(H_np)
+        # GPU-accelerated eigensolve (stays on GPU)
+        eigenvalues, eigenvectors = gpu_eigh(H_matrix, use_gpu=True)
 
-        return float(eigenvalues[0]), eigenvectors[:, 0]
+        # Return numpy array for compatibility with existing code
+        return float(eigenvalues[0].cpu()), eigenvectors[:, 0].cpu().numpy()
 
     def _find_residual_configs(
         self,
@@ -517,7 +524,7 @@ class SelectedCIExpander:
         basis: torch.Tensor,
     ) -> Tuple[float, np.ndarray]:
         """
-        Diagonalize Hamiltonian in given basis.
+        Diagonalize Hamiltonian in given basis using GPU acceleration.
 
         Uses float64 precision for numerical stability.
         Ensures consistent ground state is found across iterations.
@@ -525,43 +532,31 @@ class SelectedCIExpander:
         IMPORTANT: The Hamiltonian matrix should already be Hermitian from
         matrix_elements_fast(). We check for asymmetry and warn if found.
         """
-        n_basis = len(basis)
-
         H_matrix = self.hamiltonian.matrix_elements(basis, basis)
-        # Use float64 for better numerical precision
-        H_np = H_matrix.cpu().numpy().astype(np.float64)
 
-        # Check for asymmetry BEFORE symmetrization
-        asymmetry = np.abs(H_np - H_np.T).max()
+        # Use float64 for better numerical precision (GPU supports double)
+        H = H_matrix.double()
+
+        # Check for asymmetry BEFORE symmetrization (on GPU)
+        asymmetry = (H - H.T).abs().max().item()
         if asymmetry > 1e-8:
             print(f"  WARNING: Matrix asymmetry detected: {asymmetry:.2e}")
             # Find worst offender
-            diff = np.abs(H_np - H_np.T)
-            i, j = np.unravel_index(np.argmax(diff), diff.shape)
-            if H_np[i, j] * H_np[j, i] < 0:
+            diff = (H - H.T).abs()
+            flat_idx = diff.argmax().item()
+            i, j = flat_idx // H.shape[1], flat_idx % H.shape[1]
+            if H[i, j].item() * H[j, i].item() < 0:
                 print(f"  CRITICAL: Opposite signs at ({i},{j}): "
-                      f"H[i,j]={H_np[i,j]:.4f}, H[j,i]={H_np[j,i]:.4f}")
+                      f"H[i,j]={H[i,j].item():.4f}, H[j,i]={H[j,i].item():.4f}")
 
-        # Ensure Hermitian symmetry (should be minimal adjustment now)
-        H_np = 0.5 * (H_np + H_np.T)
+        # Ensure Hermitian symmetry (on GPU)
+        H = 0.5 * (H + H.T)
 
-        # Use sparse solver for large bases
-        if n_basis > 500:
-            try:
-                from scipy.sparse import csr_matrix
-                from scipy.sparse.linalg import eigsh
+        # GPU-accelerated eigensolve (stays on GPU regardless of matrix size)
+        eigenvalues, eigenvectors = gpu_eigh(H, use_gpu=True)
 
-                H_sparse = csr_matrix(H_np)
-                # Use tighter tolerance for consistent convergence
-                eigenvalues, eigenvectors = eigsh(
-                    H_sparse, k=1, which='SA', tol=1e-12, maxiter=1000
-                )
-                return float(eigenvalues[0]), eigenvectors[:, 0]
-            except Exception:
-                pass  # Fall back to dense
-
-        eigenvalues, eigenvectors = np.linalg.eigh(H_np)
-        return float(eigenvalues[0]), eigenvectors[:, 0]
+        # Return numpy array for compatibility with existing code
+        return float(eigenvalues[0].cpu()), eigenvectors[:, 0].cpu().numpy()
 
     def _configs_to_hash_set(self, configs: torch.Tensor) -> set:
         """Convert configurations to integer set for O(1) lookup (GPU-optimized)."""
