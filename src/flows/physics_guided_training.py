@@ -46,9 +46,9 @@ class PhysicsGuidedConfig:
     num_batches: int = 1
     nqs_chunk_size: int = 16384  # Increased chunk size for better GPU saturation
 
-    # Learning rates (increased for faster convergence)
-    flow_lr: float = 1e-3       # Was 5e-4 (2x increase)
-    nqs_lr: float = 3e-3        # Was 1e-3 (3x increase, NQS needs more LR)
+    # Learning rates
+    flow_lr: float = 5e-4
+    nqs_lr: float = 1e-3
 
     # Training epochs
     num_epochs: int = 500
@@ -56,10 +56,9 @@ class PhysicsGuidedConfig:
     convergence_threshold: float = 0.20
 
     # Loss weights (sum to 1.0 recommended)
-    # Focus more on energy, less on matching NQS distribution
-    teacher_weight: float = 0.2  # Was 0.5 (reduced - don't follow bad NQS early on)
-    physics_weight: float = 0.7  # Was 0.4 (increased - optimize energy directly)
-    entropy_weight: float = 0.1  # Keep same
+    teacher_weight: float = 0.5  # Match NQS probability
+    physics_weight: float = 0.4  # Energy-based importance
+    entropy_weight: float = 0.1  # Exploration bonus
 
     # Energy baseline for physics signal
     use_energy_baseline: bool = True  # Subtract baseline for variance reduction
@@ -92,7 +91,7 @@ class PhysicsGuidedConfig:
     parallel_workers: int = 8  # Number of parallel workers for connection computation
 
     # Early stopping on energy plateau
-    early_stopping_patience: int = 50   # Was 100 (stop faster if stuck)
+    early_stopping_patience: int = 100  # Stop if energy doesn't improve for N epochs
     early_stopping_threshold: float = 0.001  # Minimum improvement (Ha) to reset patience
 
     # === PERFORMANCE OPTIMIZATIONS FOR LARGE SYSTEMS ===
@@ -467,11 +466,9 @@ class PhysicsGuidedFlowTrainer:
             flow_loss.backward(retain_graph=True)
             nqs_loss.backward()
 
-            # Gradient clipping (increased max_norm for better learning with large networks)
-            # With 30M params and max_norm=1.0, per-param gradient is ~3e-5 (nearly zero)
-            # With max_norm=10.0, per-param gradient is ~3e-4 (10x more learning)
-            torch.nn.utils.clip_grad_norm_(self.flow.parameters(), max_norm=5.0)
-            torch.nn.utils.clip_grad_norm_(self.nqs.parameters(), max_norm=10.0)
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.flow.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.nqs.parameters(), max_norm=1.0)
 
             self.flow_optimizer.step()
             self.nqs_optimizer.step()
@@ -792,13 +789,8 @@ class PhysicsGuidedFlowTrainer:
             config.entropy_weight * entropy
         )
 
-        # Scale by loss components for stability (NOT by energy magnitude!)
-        # Previous scaling by |energy| (~65 Ha for C2H4) suppressed gradients ~65x
-        # Making effective learning rates too small (1e-3 -> 1.5e-5)
-        # Instead, scale by the magnitude of the loss components themselves
-        # This ensures gradients are always in a reasonable range regardless of energy scale
-        loss_scale = max(1.0, (teacher_loss.detach().abs() + physics_loss.detach().abs()).item())
-        total_loss = total_loss / loss_scale
+        # Scale by energy magnitude for stability
+        total_loss = total_loss / (torch.abs(energy.detach()) + 1.0)
 
         components = {
             'teacher': teacher_loss,
@@ -817,35 +809,20 @@ class PhysicsGuidedFlowTrainer:
         """
         Compute NQS loss (energy minimization).
 
-        Uses a combination of:
-        1. REINFORCE-style gradient (variance reduction via centering)
-        2. Direct energy gradient (allows NQS to optimize energy directly)
-
-        The direct energy term addresses the issue where detaching energy
-        gradients prevents the NQS from directly minimizing energy.
+        Uses variance-reduced estimator:
+        L = <E_loc> + lambda * Var(E_loc)
         """
         # Recompute with gradients
         log_amp = self.nqs.log_amplitude(configs.float())
         log_probs = 2 * log_amp  # log(|psi|^2) = 2 * log|psi|
 
-        # === REINFORCE-style gradient (variance reduced) ===
+        # REINFORCE-style gradient
         # d<E>/d_theta = 2 * Re[<(E_loc - <E>) * d log psi/d_theta>]
         energy = (local_energies.detach() * probs.detach()).sum()
         centered_energies = local_energies.detach() - energy
 
-        # Policy gradient loss (REINFORCE)
-        reinforce_loss = (centered_energies * log_probs * probs.detach()).sum()
-
-        # === Direct energy gradient term ===
-        # Recompute probabilities with gradients for direct energy optimization
-        # This allows NQS to directly minimize expected energy
-        probs_with_grad = torch.exp(log_probs)
-        probs_with_grad = probs_with_grad / (probs_with_grad.sum() + 1e-10)
-        direct_energy_loss = (local_energies.detach() * probs_with_grad).sum()
-
-        # Combine: 70% REINFORCE + 30% direct energy
-        # REINFORCE provides variance reduction, direct term enables energy optimization
-        loss = 0.7 * reinforce_loss + 0.3 * direct_energy_loss
+        # Policy gradient loss
+        loss = (centered_energies * log_probs * probs.detach()).sum()
 
         return loss
 

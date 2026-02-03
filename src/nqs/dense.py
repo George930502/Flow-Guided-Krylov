@@ -86,10 +86,9 @@ class DenseNQS(NeuralQuantumState):
             ])
             in_dim = hidden_dim
 
-        # Output layer for log amplitude (NO Tanh - allows proper amplitude range)
+        # Output layer for log amplitude
         layers.append(nn.Linear(in_dim, 1))
-        # NOTE: Removed Tanh which was limiting amplitude range to exp(-1) to exp(1) = 7.4x
-        # Real ground states need 100-1000x amplitude variations
+        layers.append(nn.Tanh())  # Bounded output for stability
 
         self.amplitude_net = nn.Sequential(*layers)
 
@@ -108,11 +107,8 @@ class DenseNQS(NeuralQuantumState):
         else:
             self.phase_net = None
 
-        # Learnable scale for log amplitude (initialized to 1.5 for stable training)
-        # With soft clamp in log_amplitude(), this allows amplitude range of ~90x
-        # Starting with a smaller value prevents training instabilities in large systems
-        # The network can learn to increase this if needed
-        self.log_amp_scale = nn.Parameter(torch.tensor(1.5))
+        # Learnable scale for log amplitude
+        self.log_amp_scale = nn.Parameter(torch.tensor(1.0))
 
     def log_amplitude(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -123,17 +119,10 @@ class DenseNQS(NeuralQuantumState):
 
         Returns:
             Log amplitudes, shape (batch_size,)
-
-        Note:
-            Uses soft clamp for numerical stability while allowing large amplitude range.
-            With log_amp_scale=3.0 and tanh(x/3)*3, output is bounded to [-9, 9],
-            giving amplitude range of exp(-9) to exp(9) ≈ 8000x (vs 7.4x with simple Tanh).
         """
         x = self.encode_configuration(x)
-        raw = self.amplitude_net(x).squeeze(-1)  # (batch_size,)
-        # Soft clamp for numerical stability (prevents exp overflow)
-        # tanh(x/3)*3 bounds to [-3, 3], then scale gives [-9, 9] with log_amp_scale=3.0
-        return self.log_amp_scale * torch.tanh(raw / 3.0) * 3.0
+        out = self.amplitude_net(x)  # (batch_size, 1)
+        return self.log_amp_scale * out.squeeze(-1)
 
     def phase(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -198,12 +187,12 @@ class SignedDenseNQS(NeuralQuantumState):
 
         self.feature_net = nn.Sequential(*feature_layers)
 
-        # Amplitude head (NO Tanh - allows proper amplitude range)
+        # Amplitude head
         self.amplitude_head = nn.Sequential(
             nn.Linear(in_dim, hidden_dims[-1]),
             act_fn(),
             nn.Linear(hidden_dims[-1], 1),
-            # NOTE: Removed Tanh - soft clamp applied in log_amplitude() instead
+            nn.Tanh(),
         )
 
         # Sign head (outputs logit for sign)
@@ -211,12 +200,10 @@ class SignedDenseNQS(NeuralQuantumState):
             nn.Linear(in_dim, hidden_dims[-1]),
             act_fn(),
             nn.Linear(hidden_dims[-1], 1),
-            nn.Tanh(),  # Keep Tanh for sign (bounded output is appropriate here)
+            nn.Tanh(),
         )
 
-        # Learnable scale for log amplitude (initialized to 1.5 for stable training)
-        # Starting with a smaller value prevents training instabilities in large systems
-        self.log_amp_scale = nn.Parameter(torch.tensor(1.5))
+        self.log_amp_scale = nn.Parameter(torch.tensor(1.0))
 
         # Feature cache for avoiding duplicate forward passes
         self._feature_cache = None
@@ -252,9 +239,8 @@ class SignedDenseNQS(NeuralQuantumState):
 
     def log_amplitude(self, x: torch.Tensor) -> torch.Tensor:
         features = self._get_features(x)
-        raw = self.amplitude_head(features).squeeze(-1)
-        # Soft clamp for numerical stability while allowing large amplitude range
-        return self.log_amp_scale * torch.tanh(raw / 3.0) * 3.0
+        out = self.amplitude_head(features)
+        return self.log_amp_scale * out.squeeze(-1)
 
     def phase(self, x: torch.Tensor) -> torch.Tensor:
         """Return 0 or π based on sign prediction."""
@@ -277,9 +263,7 @@ class SignedDenseNQS(NeuralQuantumState):
         Use this method when you need both values for the same configs.
         """
         features = self._get_features(x)
-        raw = self.amplitude_head(features).squeeze(-1)
-        # Soft clamp for numerical stability while allowing large amplitude range
-        log_amp = self.log_amp_scale * torch.tanh(raw / 3.0) * 3.0
+        log_amp = self.log_amp_scale * self.amplitude_head(features).squeeze(-1)
         sign_logit = self.sign_head(features).squeeze(-1)
         phase = torch.pi * (sign_logit < 0).float()
         return log_amp, phase
