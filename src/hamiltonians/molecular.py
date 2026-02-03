@@ -623,8 +623,10 @@ class MolecularHamiltonian(Hamiltonian):
         config_ints = (configs_cpu * powers).sum(dim=1).tolist()
         config_hash = {config_ints[i]: i for i in range(n_configs)}
 
-        # Off-diagonal elements - build lower triangle only, then mirror
-        # This guarantees H[i,j] = H[j,i] by construction
+        # Off-diagonal elements - use explicit pair tracking to guarantee
+        # each pair (i,j) is processed exactly once, ensuring Hermiticity
+        processed_pairs = set()
+
         for j in range(n_configs):
             connected, elements = self.get_connections(configs[j])
             if len(connected) > 0:
@@ -635,15 +637,15 @@ class MolecularHamiltonian(Hamiltonian):
                 for k, conn_int in enumerate(connected_ints):
                     if conn_int in config_hash:
                         i = config_hash[conn_int]
-                        # Only set if i > j (lower triangle) or if not yet set
-                        # This ensures each pair is set exactly once
-                        if i > j:
-                            H[i, j] = elements[k]
-                            H[j, i] = elements[k]  # Mirror for Hermiticity
-                        elif i < j and H[i, j] == 0:
-                            # Upper triangle element from a later j - set both
-                            H[i, j] = elements[k]
-                            H[j, i] = elements[k]
+                        if i != j:
+                            # Use canonical pair ordering (smaller index first)
+                            pair = (min(i, j), max(i, j))
+                            if pair not in processed_pairs:
+                                processed_pairs.add(pair)
+                                # Set both H[i,j] and H[j,i] to the same value
+                                # This guarantees Hermitian symmetry by construction
+                                H[i, j] = elements[k]
+                                H[j, i] = elements[k]
 
         return H
 

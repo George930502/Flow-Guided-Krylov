@@ -457,15 +457,26 @@ def run_benchmark(
 
     pipeline = FlowGuidedKrylovPipeline(H, config=config, exact_energy=E_exact)
     pipeline.train_flow_nqs(progress=verbose)
+
+    # Get training energy for diagnostic comparison
+    training_energy = getattr(pipeline.trainer, 'best_energy', None)
+    if training_energy is not None:
+        print(f"  NQS Training best energy: {training_energy:.6f} Ha")
+
     nf_basis = pipeline.extract_and_select_basis()
 
     nf_set = configs_to_set(nf_basis)
     result.nf_configs = len(nf_set)
-    result.nf_energy = compute_basis_energy(H, nf_basis)
+    result.nf_energy = compute_basis_energy(H, nf_basis, check_asymmetry=True)
 
     nf_error = abs(result.nf_energy - E_exact) * 1000
     print(f"  NF found: {len(nf_set)} configs")
     print(f"  NF energy: {result.nf_energy:.8f} Ha (error: {nf_error:.4f} mHa)")
+
+    # Diagnostic: compare training vs diagonalization energy
+    if training_energy is not None:
+        gap = result.nf_energy - training_energy
+        print(f"  Training vs Diag gap: {gap:.4f} Ha (expected: diag <= training)")
 
     # =======================================================================
     # Step 2: Residual Expansion
@@ -484,14 +495,34 @@ def run_benchmark(
           f"{config.residual_configs_per_iter} configs/iter")
 
     expanded_basis = nf_basis.clone()
+    prev_basis = nf_basis.clone()  # Track previous basis for rollback
+    variational_violation_detected = False
+
     for i in range(config.residual_iterations):
         old_size = len(expanded_basis)
+        prev_basis = expanded_basis.clone()  # Save before expansion
+
         expanded_basis, stats = expander.expand_basis(expanded_basis)
         added = stats['configs_added']
+
         if added == 0:
             break
+
+        # Compute current energy with asymmetry checking
+        current_energy = compute_basis_energy(H, expanded_basis, check_asymmetry=(i == 0))
+
+        # CRITICAL: Check variational principle
+        if current_energy < E_exact - 1e-6:
+            violation_mha = (E_exact - current_energy) * 1000
+            print(f"  WARNING: Iter {i+1}: Energy {current_energy:.6f} Ha is "
+                  f"{violation_mha:.2f} mHa BELOW reference {E_exact:.6f} Ha!")
+            print(f"  STOPPING and reverting to previous basis.")
+            expanded_basis = prev_basis
+            variational_violation_detected = True
+            break
+
         if verbose:
-            print(f"  Iter {i+1}: {old_size} -> {len(expanded_basis)} (+{added})")
+            print(f"    Iter {i+1}: {old_size} -> {len(expanded_basis)} (+{added})")
 
     residual_set = configs_to_set(expanded_basis)
     residual_new = residual_set - nf_set
@@ -501,6 +532,9 @@ def run_benchmark(
     residual_error = abs(result.nf_residual_energy - E_exact) * 1000
     print(f"  Residual found: {len(residual_new)} NEW configs")
     print(f"  NF+Residual energy: {result.nf_residual_energy:.8f} Ha (error: {residual_error:.4f} mHa)")
+
+    if variational_violation_detected:
+        print(f"  NOTE: Expansion was stopped early due to variational violation!")
 
     # =======================================================================
     # Step 3: Krylov Time Evolution
@@ -543,6 +577,10 @@ def run_benchmark(
     nf_krylov_error = abs(result.nf_krylov_energy - E_exact) * 1000
     print(f"  Krylov found: {len(krylov_new)} NEW configs")
     print(f"  NF+Krylov energy: {result.nf_krylov_energy:.8f} Ha (error: {nf_krylov_error:.4f} mHa)")
+
+    # Note: Krylov is computed from NF-only basis. If the new configs don't
+    # improve NF+Krylov energy, it means they have negligible weight in the
+    # ground state wavefunction, which is expected behavior.
 
     # =======================================================================
     # Step 4: Krylov-Unique Analysis
