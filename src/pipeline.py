@@ -134,14 +134,14 @@ class PipelineConfig:
     min_epochs: int = 100
     convergence_threshold: float = 0.20
 
-    # Physics-guided training weights
-    teacher_weight: float = 0.5
-    physics_weight: float = 0.4
-    entropy_weight: float = 0.1
+    # Physics-guided training weights (optimized for faster convergence)
+    teacher_weight: float = 0.2  # Reduced - don't follow bad NQS early on
+    physics_weight: float = 0.7  # Increased - optimize energy directly
+    entropy_weight: float = 0.1  # Keep same
 
-    # Learning rates
-    nf_lr: float = 5e-4
-    nqs_lr: float = 1e-3
+    # Learning rates (increased for faster convergence)
+    nf_lr: float = 1e-3   # Was 5e-4 (2x increase)
+    nqs_lr: float = 3e-3  # Was 1e-3 (3x increase)
 
     # Basis management - ADAPTIVE: will be scaled by system size
     max_accumulated_basis: int = 4096  # Base value, scaled automatically
@@ -271,9 +271,10 @@ class PipelineConfig:
             # Keeps singles + strongest doubles, provides ~10-15x speedup
             self.max_connections_per_config = 200
 
-            # Use diagonal-only for first 50 epochs (very fast warmup)
-            # Allows flow to find ground state region before expensive off-diag
-            self.diagonal_only_warmup_epochs = 50
+            # Use diagonal-only for first 100 epochs (extended warmup)
+            # Gives NQS time to learn rough energy landscape before expensive off-diag
+            # Was 50, increased to 100 for better initial convergence
+            self.diagonal_only_warmup_epochs = 100
 
             # After warmup, use 30% of connections stochastically
             # Provides unbiased estimate with ~3x speedup

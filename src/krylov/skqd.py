@@ -1292,15 +1292,17 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         self,
         basis: torch.Tensor,
         basis_set: set,
-        max_new_per_step: int = 500,
+        max_new_per_step: int = 2000,  # Increased from 500 for better exploration
     ) -> torch.Tensor:
         """Find configurations connected to current basis but not in it."""
         device = basis.device
         new_configs = []
         new_set = set()
 
-        # Sample subset of basis for efficiency
-        n_sample = min(len(basis), 200)
+        # Sample a larger fraction of basis for better exploration
+        # For large systems, we need to examine more configs to find important ones
+        # Use at least 500 samples or half the basis, whichever is larger
+        n_sample = min(len(basis), max(500, len(basis) // 2))
         indices = torch.randperm(len(basis))[:n_sample]
 
         for idx in indices:
