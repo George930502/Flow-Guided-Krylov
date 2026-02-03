@@ -55,10 +55,12 @@ class PhysicsGuidedConfig:
     min_epochs: int = 150
     convergence_threshold: float = 0.20
 
-    # Loss weights (sum to 1.0 recommended)
-    teacher_weight: float = 0.5  # Match NQS probability
-    physics_weight: float = 0.4  # Energy-based importance
-    entropy_weight: float = 0.1  # Exploration bonus
+    # Loss weights - following paper's approach
+    # Paper uses only cross-entropy for NF, weighted by |E|
+    # Set physics_weight=0 and entropy_weight=0 to match paper exactly
+    teacher_weight: float = 1.0  # Cross-entropy (paper's only term)
+    physics_weight: float = 0.0  # Paper doesn't use this
+    entropy_weight: float = 0.0  # Paper doesn't use this
 
     # Energy baseline for physics signal
     use_energy_baseline: bool = True  # Subtract baseline for variance reduction
@@ -789,8 +791,13 @@ class PhysicsGuidedFlowTrainer:
             config.entropy_weight * entropy
         )
 
-        # Scale by energy magnitude for stability
-        total_loss = total_loss / (torch.abs(energy.detach()) + 1.0)
+        # Scale by energy magnitude - MULTIPLY not divide (paper Eq. 16)
+        # Paper: L_φ = -|E[ψ_θ]|/|S| × Σ p_θ(x) × log(p̂_φ(x))
+        # The |E| factor prioritizes learning when energy is poor (high magnitude)
+        # For molecular systems with E ~ -60 to -80 Ha, this amplifies gradients
+        # We divide by |S| (number of unique configs) for normalization
+        n_unique = len(unique_configs)
+        total_loss = total_loss * torch.abs(energy.detach()) / n_unique
 
         components = {
             'teacher': teacher_loss,

@@ -134,10 +134,11 @@ class PipelineConfig:
     min_epochs: int = 100
     convergence_threshold: float = 0.20
 
-    # Physics-guided training weights
-    teacher_weight: float = 0.5
-    physics_weight: float = 0.4
-    entropy_weight: float = 0.1
+    # Physics-guided training weights - following paper's approach
+    # Paper uses only cross-entropy for NF, weighted by |E|
+    teacher_weight: float = 1.0  # Cross-entropy (paper's only term)
+    physics_weight: float = 0.0  # Paper doesn't use this
+    entropy_weight: float = 0.0  # Paper doesn't use this
 
     # Learning rates
     nf_lr: float = 5e-4
