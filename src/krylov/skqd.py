@@ -73,6 +73,18 @@ class SKQDConfig:
     # Hardware
     use_gpu: bool = True
 
+    # === KRYLOV SAMPLING LIMITS (increased for better discovery) ===
+    # Maximum new configurations to add per Krylov step
+    # Increased from 500 to 2000 to improve discovery rate
+    max_new_configs_per_krylov_step: int = 2000
+
+    # Fraction of basis to sample when finding connected configs
+    # Higher values = more thorough exploration but slower
+    krylov_basis_sample_fraction: float = 0.5
+
+    # Minimum number of basis states to sample regardless of fraction
+    min_krylov_basis_sample: int = 500
+
 
 class SampleBasedKrylovDiagonalization:
     """
@@ -1292,68 +1304,124 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         self,
         basis: torch.Tensor,
         basis_set: set,
-        max_new_per_step: int = 500,
+        max_new_per_step: Optional[int] = None,
     ) -> torch.Tensor:
-        """Find configurations connected to current basis but not in it."""
-        device = basis.device
-        new_configs = []
-        new_set = set()
+        """
+        Find configurations connected to current basis but not in it.
 
-        # Sample subset of basis for efficiency
-        n_sample = min(len(basis), 200)
+        Uses configurable sampling parameters for better discovery rate.
+        Default discovery rate was ~7% (296/4144), target is >20%.
+
+        OPTIMIZED: Uses GPU-based integer encoding with single CPU transfer
+        instead of per-connection CPU transfers.
+        """
+        device = basis.device
+        cfg = self.config
+        n_sites = basis.shape[1]
+
+        # Use config parameter if not explicitly overridden
+        if max_new_per_step is None:
+            max_new_per_step = cfg.max_new_configs_per_krylov_step
+
+        # Precompute powers of 2 on GPU for fast integer encoding
+        powers = (2 ** torch.arange(n_sites, device=device, dtype=torch.long)).flip(0)
+
+        # Calculate how many basis states to sample
+        # Use fraction-based sampling with configurable minimum
+        n_sample = max(
+            cfg.min_krylov_basis_sample,
+            int(len(basis) * cfg.krylov_basis_sample_fraction)
+        )
+        n_sample = min(len(basis), n_sample)
+
         indices = torch.randperm(len(basis))[:n_sample]
 
+        # Collect all connected configs in batches for GPU-efficient processing
+        all_connected = []
         for idx in indices:
             config = basis[idx]
             connected, elements = self.hamiltonian.get_connections(config)
+            if len(connected) > 0:
+                all_connected.append(connected)
 
-            for conn in connected:
-                key = tuple(conn.cpu().tolist())
-                if key not in basis_set and key not in new_set:
-                    new_configs.append(conn)
-                    new_set.add(key)
+        if not all_connected:
+            return torch.empty(0, n_sites, device=device)
 
-                    if len(new_configs) >= max_new_per_step:
-                        break
+        # Stack all connected configs
+        all_connected = torch.cat(all_connected, dim=0)
 
-            if len(new_configs) >= max_new_per_step:
-                break
+        # GPU-based integer encoding (single operation)
+        connected_ints = (all_connected.long() * powers).sum(dim=1)
 
-        if not new_configs:
-            return torch.empty(0, basis.shape[1], device=device)
+        # Single CPU transfer for membership check
+        connected_ints_cpu = connected_ints.cpu().tolist()
 
-        return torch.stack(new_configs).to(device)
+        # Find new configs not in basis_set
+        new_set = set()
+        new_indices = []
+        for i, config_int in enumerate(connected_ints_cpu):
+            if config_int not in basis_set and config_int not in new_set:
+                new_set.add(config_int)
+                new_indices.append(i)
+                if len(new_indices) >= max_new_per_step:
+                    break
+
+        if not new_indices:
+            return torch.empty(0, n_sites, device=device)
+
+        return all_connected[new_indices]
 
     def _build_hamiltonian_in_basis(self, basis: torch.Tensor):
-        """Build sparse Hamiltonian matrix in given basis."""
+        """
+        Build sparse Hamiltonian matrix in given basis.
+
+        OPTIMIZED: Uses batch diagonal computation and GPU-based integer
+        encoding for efficient membership checking.
+        """
         from scipy.sparse import csr_matrix
 
         n = len(basis)
         device = basis.device
+        n_sites = basis.shape[1]
 
-        # Create index mapping
-        basis_map = {}
-        for i, config in enumerate(basis):
-            key = tuple(config.cpu().tolist())
-            basis_map[key] = i
+        # Precompute powers of 2 on GPU for fast integer encoding
+        powers = (2 ** torch.arange(n_sites, device=device, dtype=torch.long)).flip(0)
+
+        # Create index mapping using GPU-based integer encoding (single CPU transfer)
+        basis_ints = (basis.long() * powers).sum(dim=1).cpu().tolist()
+        basis_map = {config_int: i for i, config_int in enumerate(basis_ints)}
 
         rows, cols, data = [], [], []
 
+        # OPTIMIZED: Batch diagonal computation
+        if hasattr(self.hamiltonian, 'diagonal_elements_batch'):
+            diag_elements = self.hamiltonian.diagonal_elements_batch(basis)
+            for j in range(n):
+                rows.append(j)
+                cols.append(j)
+                data.append(diag_elements[j].item())
+        else:
+            # Fallback for Hamiltonians without batch method
+            for j in range(n):
+                diag = self.hamiltonian.diagonal_element(basis[j]).item()
+                rows.append(j)
+                cols.append(j)
+                data.append(diag)
+
+        # Off-diagonal elements - batch process connections
         for j in range(n):
-            config = basis[j]
+            connected, elements = self.hamiltonian.get_connections(basis[j])
 
-            # Diagonal
-            diag = self.hamiltonian.diagonal_element(config).item()
-            rows.append(j)
-            cols.append(j)
-            data.append(diag)
+            if len(connected) == 0:
+                continue
 
-            # Off-diagonal
-            connected, elements = self.hamiltonian.get_connections(config)
-            for conn, elem in zip(connected, elements):
-                key = tuple(conn.cpu().tolist())
-                if key in basis_map:
-                    i = basis_map[key]
+            # GPU-based integer encoding for connected configs
+            connected_ints = (connected.long() * powers).sum(dim=1).cpu().tolist()
+
+            for k, config_int in enumerate(connected_ints):
+                if config_int in basis_map:
+                    i = basis_map[config_int]
+                    elem = elements[k]
                     rows.append(i)
                     cols.append(j)
                     data.append(elem.item() if hasattr(elem, 'item') else elem)

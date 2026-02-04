@@ -70,6 +70,18 @@ class ResidualExpansionConfig:
     # If energy drops more than this in one iteration, reject the expansion
     max_energy_drop_per_iter: float = 0.5  # 500 mHa is suspicious
 
+    # === PT2 FORMULA FIX ===
+    # Use raw coupling strength instead of PT2 formula with energy denominator
+    # The PT2 formula |<i|H|Φ>|² / |E - E_i| causes variational violations when
+    # E_i < E because the denominator becomes tiny, giving huge importance scores
+    # for configs that would drop energy below reference. Using raw coupling
+    # |<i|H|Φ>|² avoids this issue while still selecting physically relevant configs.
+    use_raw_coupling: bool = True
+
+    # Minimum coupling strength threshold (squared) for config selection
+    # Configs with |<i|H|Φ>|² below this are ignored
+    min_coupling_sq: float = 1e-12
+
 
 class ResidualBasedExpander:
     """
@@ -645,16 +657,22 @@ class SelectedCIExpander:
                     powers = (2 ** torch.arange(n_sites, device=self.device, dtype=torch.long)).flip(0)
 
                 connected_ints = (all_connected.long() * powers).sum(dim=1)
-                connected_ints_cpu = connected_ints.cpu().tolist()
 
                 # Get coefficients for each connection
                 local_coeffs = coeffs[significant_indices[batch_indices]]
 
-                # Accumulate signed couplings
+                # OPTIMIZED: Compute all couplings vectorized on GPU first
+                couplings_gpu = local_coeffs * all_elements
+
+                # Single CPU transfer for all data
+                connected_ints_cpu = connected_ints.cpu().tolist()
+                couplings_cpu = couplings_gpu.cpu().tolist()
+
+                # Accumulate signed couplings (CPU loop but no .item() calls)
                 for k in range(len(all_connected)):
                     config_int = connected_ints_cpu[k]
                     if config_int not in basis_hash_set:
-                        coupling = (local_coeffs[k] * all_elements[k]).item()
+                        coupling = couplings_cpu[k]
 
                         if config_int in candidate_coupling_dict:
                             old_config, old_coupling_sum = candidate_coupling_dict[config_int]
@@ -662,7 +680,10 @@ class SelectedCIExpander:
                         else:
                             candidate_coupling_dict[config_int] = (all_connected[k], coupling)
         else:
-            # Fallback to sequential method
+            # Fallback to sequential method (optimized to minimize .item() calls)
+            # Precompute powers for integer encoding
+            powers = (2 ** torch.arange(n_sites, device=self.device, dtype=torch.long)).flip(0)
+
             for j in significant_indices.tolist():
                 coeff_j = coeffs[j].item()
 
@@ -671,12 +692,19 @@ class SelectedCIExpander:
                 if len(connected) == 0:
                     continue
 
-                # Use integer encoding for membership check
+                # OPTIMIZED: Batch encode and compute couplings on GPU
+                connected_ints = (connected.long() * powers).sum(dim=1)
+                couplings_gpu = coeff_j * elements
+
+                # Single CPU transfer
+                connected_ints_cpu = connected_ints.cpu().tolist()
+                couplings_cpu = couplings_gpu.cpu().tolist()
+
                 for k in range(len(connected)):
-                    config_int = self._encode_config_int(connected[k])
+                    config_int = connected_ints_cpu[k]
 
                     if config_int not in basis_hash_set:
-                        coupling = coeff_j * elements[k].item()
+                        coupling = couplings_cpu[k]
 
                         if config_int in candidate_coupling_dict:
                             old_config, old_coupling_sum = candidate_coupling_dict[config_int]
@@ -697,18 +725,32 @@ class SelectedCIExpander:
         # FIXED: Square the accumulated signed coupling (correct PT2 formula)
         couplings_sq = couplings_signed ** 2
 
-        # BATCH diagonal computation - this is the key optimization!
-        if hasattr(self.hamiltonian, 'diagonal_elements_batch'):
-            E_candidates = self.hamiltonian.diagonal_elements_batch(candidates)
-        else:
-            # Fallback for Hamiltonians without batch method
-            E_candidates = torch.stack([
-                self.hamiltonian.diagonal_element(c) for c in candidates
-            ])
+        # Filter by minimum coupling threshold
+        if cfg.min_coupling_sq > 0:
+            valid_mask = couplings_sq >= cfg.min_coupling_sq
+            if not valid_mask.any():
+                return torch.empty(0, n_sites, device=self.device), torch.empty(0, device=self.device)
+            candidates = candidates[valid_mask]
+            couplings_sq = couplings_sq[valid_mask]
 
-        # Compute PT2 importances: ε_i = |<i|H|Φ>|² / |E - E_i|
-        denominators = torch.abs(energy - E_candidates) + 1e-10
-        importances = couplings_sq / denominators
+        if cfg.use_raw_coupling:
+            # Use raw coupling strength |<i|H|Φ>|² as importance (FIXED approach)
+            # This avoids the PT2 denominator issue where E_i < E causes explosion
+            importances = couplings_sq
+        else:
+            # Legacy PT2 formula (can cause variational violations)
+            # BATCH diagonal computation - this is the key optimization!
+            if hasattr(self.hamiltonian, 'diagonal_elements_batch'):
+                E_candidates = self.hamiltonian.diagonal_elements_batch(candidates)
+            else:
+                # Fallback for Hamiltonians without batch method
+                E_candidates = torch.stack([
+                    self.hamiltonian.diagonal_element(c) for c in candidates
+                ])
+
+            # Compute PT2 importances: ε_i = |<i|H|Φ>|² / |E - E_i|
+            denominators = torch.abs(energy - E_candidates) + 1e-10
+            importances = couplings_sq / denominators
 
         # Select top by importance
         n_select = min(cfg.max_configs_per_iter, len(candidates))

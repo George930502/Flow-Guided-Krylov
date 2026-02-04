@@ -114,6 +114,21 @@ class PhysicsGuidedConfig:
     # Set to 1.0 to use all connections, 0.1 to use 10%
     stochastic_connections_fraction: float = 1.0
 
+    # === PAPER-ALIGNED ENERGY COMPUTATION ===
+    # Use subspace diagonalization for energy (paper's method) instead of local energy
+    # Paper Section 3.2-3.3: "Energy is computed by diagonalizing H restricted to S"
+    # This fixes the training-vs-diagonalization energy gap
+    use_subspace_energy: bool = True
+
+    # Maximum basis size for subspace diagonalization (for memory efficiency)
+    # If basis exceeds this, use top-N configs by NQS probability
+    max_subspace_diag_size: int = 2048
+
+    # Compute subspace energy every N epochs (for performance on large systems)
+    # Set to 1 to compute every epoch (most accurate but slower)
+    # Set to 5-10 for faster training with periodic energy updates
+    subspace_energy_interval: int = 1
+
 
 class PhysicsGuidedFlowTrainer:
     """
@@ -438,17 +453,39 @@ class PhysicsGuidedFlowTrainer:
                 nqs_probs = torch.exp(2 * nqs_log_amp)  # |psi|^2 = exp(2*log|psi|)
                 nqs_probs = nqs_probs / nqs_probs.sum()
 
-            # Compute local energies for physics signal (using chunked batching)
-            # During warmup, use diagonal-only for speed
-            use_diagonal_only = (epoch < config.diagonal_only_warmup_epochs)
-            local_energies = self._compute_local_energies(
-                unique_configs,
-                nqs_chunk_size=config.nqs_chunk_size,
-                diagonal_only=use_diagonal_only,
-            )
+            # Compute energy using paper's subspace diagonalization method
+            # This is the CORRECT approach per paper Section 3.2-3.3
+            if config.use_subspace_energy:
+                # OPTIMIZATION: Compute subspace energy at specified interval
+                # (reduces O(n³) diagonalization overhead for large systems)
+                compute_subspace_this_epoch = (
+                    epoch % config.subspace_energy_interval == 0 or
+                    epoch == 0 or  # Always compute first epoch
+                    not hasattr(self, '_cached_subspace_energy')
+                )
 
-            # Compute NQS energy estimate
-            energy = (local_energies * nqs_probs).sum()
+                if compute_subspace_this_epoch:
+                    energy = self._compute_subspace_energy(unique_configs, nqs_probs)
+                    self._cached_subspace_energy = energy
+                else:
+                    energy = self._cached_subspace_energy
+
+                # Still compute local energies for REINFORCE gradient (NQS training)
+                use_diagonal_only = (epoch < config.diagonal_only_warmup_epochs)
+                local_energies = self._compute_local_energies(
+                    unique_configs,
+                    nqs_chunk_size=config.nqs_chunk_size,
+                    diagonal_only=use_diagonal_only,
+                )
+            else:
+                # Legacy mode: use local energy (not paper's approach)
+                use_diagonal_only = (epoch < config.diagonal_only_warmup_epochs)
+                local_energies = self._compute_local_energies(
+                    unique_configs,
+                    nqs_chunk_size=config.nqs_chunk_size,
+                    diagonal_only=use_diagonal_only,
+                )
+                energy = (local_energies * nqs_probs).sum()
 
             # Update accumulated basis
             self._update_accumulated_basis(unique_configs)
@@ -502,6 +539,58 @@ class PhysicsGuidedFlowTrainer:
             total_metrics['accumulated_energy'] = acc_energy
 
         return total_metrics
+
+    def _compute_subspace_energy(
+        self,
+        configs: torch.Tensor,
+        nqs_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute energy by diagonalizing H in sampled subspace (paper's method).
+
+        From paper Section 3.2-3.3:
+        "Energy is computed by diagonalizing H restricted to the sampled subspace S"
+
+        This is the CORRECT approach, as opposed to local energy which includes
+        connections to states outside the sampled basis.
+
+        The key insight is that local energy E_loc(x) = <x|H|ψ>/<x|ψ> sums over ALL
+        Hamiltonian connections, even to states not in the basis. This gives
+        systematically different (higher) energy than true subspace diagonalization.
+
+        Args:
+            configs: (n_configs, num_sites) sampled configurations
+            nqs_probs: (n_configs,) NQS probabilities for each config
+
+        Returns:
+            Ground state energy in the subspace (scalar tensor for gradient flow)
+        """
+        config = self.config
+        n_configs = len(configs)
+
+        # For large bases, select top-N by NQS probability to keep computation tractable
+        if n_configs > config.max_subspace_diag_size:
+            _, top_indices = torch.topk(nqs_probs, config.max_subspace_diag_size)
+            configs = configs[top_indices]
+            n_configs = len(configs)
+
+        with torch.no_grad():
+            # Build subspace Hamiltonian H_ij = <x_i|H|x_j>
+            H_subspace = self.hamiltonian.matrix_elements(configs, configs)
+
+            # Ensure Hermitian symmetry
+            H_subspace = 0.5 * (H_subspace + H_subspace.T)
+
+            # Use float64 for numerical stability
+            H_sub = H_subspace.double()
+
+            # Diagonalize to get ground state energy
+            eigenvalues = torch.linalg.eigvalsh(H_sub)
+            E_ground = eigenvalues[0]
+
+        # Return as tensor that can flow through gradient computation
+        # (even though we detach it, keeping consistent tensor type helps)
+        return E_ground.float()
 
     def _compute_local_energies(
         self,

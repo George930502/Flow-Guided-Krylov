@@ -100,6 +100,108 @@ def set_to_configs(config_set: Set[tuple], n_sites: int, device: str) -> torch.T
     return torch.tensor(configs, dtype=torch.long, device=device)
 
 
+def check_essential_configs_discovered(
+    configs: torch.Tensor,
+    hamiltonian: 'MolecularHamiltonian',
+) -> Dict[str, int]:
+    """
+    Diagnostic: Check whether NF naturally discovered essential configurations.
+
+    After Phase 1 fix (subspace diagonalization), NF should naturally discover:
+    - HF state (rank_0): Has largest ground state coefficient (~0.9)
+    - Singles (rank_1): First-order excited determinants
+    - Doubles (rank_2): Most important for electron correlation
+
+    This is a DIAGNOSTIC function to verify the NF is working correctly.
+    If HF (rank_0) is missing after Phase 1 fix, it indicates a training issue.
+
+    Args:
+        configs: Tensor of sampled configurations
+        hamiltonian: Molecular Hamiltonian with get_hf_state() method
+
+    Returns:
+        Dictionary with bucket distribution by excitation rank
+    """
+    if not hasattr(hamiltonian, 'get_hf_state'):
+        return {'error': 'Not a molecular Hamiltonian'}
+
+    hf_state = hamiltonian.get_hf_state()
+    n_orb = hamiltonian.n_orbitals
+
+    # Compute excitation rank for each config
+    # rank = number of electrons in different positions from HF
+    bucket_dist = {}
+
+    for config in configs:
+        # Count differences from HF (alpha and beta separately)
+        alpha_diff = 0
+        beta_diff = 0
+
+        for i in range(n_orb):
+            if config[i] != hf_state[i]:
+                alpha_diff += 1
+            if config[i + n_orb] != hf_state[i + n_orb]:
+                beta_diff += 1
+
+        # Rank is half the total difference (since each excitation changes 2 orbitals)
+        # But we count the number of particles moved, not orbital changes
+        alpha_rank = alpha_diff // 2
+        beta_rank = beta_diff // 2
+        total_rank = alpha_rank + beta_rank
+
+        key = f'rank_{total_rank}'
+        bucket_dist[key] = bucket_dist.get(key, 0) + 1
+
+    # Sort by rank
+    sorted_dist = dict(sorted(bucket_dist.items(), key=lambda x: int(x[0].split('_')[1])))
+
+    return sorted_dist
+
+
+def print_hf_discovery_diagnostic(
+    configs: torch.Tensor,
+    hamiltonian: 'MolecularHamiltonian',
+    stage: str = "NF-NQS",
+):
+    """
+    Print diagnostic information about HF state discovery.
+
+    Args:
+        configs: Sampled configurations
+        hamiltonian: Molecular Hamiltonian
+        stage: Pipeline stage name for logging
+    """
+    bucket_dist = check_essential_configs_discovered(configs, hamiltonian)
+
+    if 'error' in bucket_dist:
+        return
+
+    print(f"\n  === {stage} Configuration Discovery Diagnostic ===")
+    print(f"  Bucket distribution by excitation rank:")
+
+    for key, count in bucket_dist.items():
+        rank = int(key.split('_')[1])
+        label = {0: 'HF', 1: 'Singles', 2: 'Doubles', 3: 'Triples', 4: 'Quadruples'}.get(rank, f'{rank}-tuple')
+        print(f"    {key} ({label}): {count}")
+
+    # Warnings for missing essential configs
+    if bucket_dist.get('rank_0', 0) == 0:
+        print(f"  ⚠️ WARNING: HF state NOT discovered by {stage}!")
+        print(f"     This may indicate insufficient training or wrong energy signal.")
+
+    if bucket_dist.get('rank_1', 0) == 0:
+        print(f"  ⚠️ WARNING: No singles discovered by {stage}!")
+        print(f"     Singles are important for orbital relaxation.")
+
+    if bucket_dist.get('rank_2', 0) == 0:
+        print(f"  ⚠️ WARNING: No doubles discovered by {stage}!")
+        print(f"     Doubles capture electron correlation.")
+
+    # Success indicators
+    if bucket_dist.get('rank_0', 0) > 0 and bucket_dist.get('rank_2', 0) > 0:
+        print(f"  ✓ {stage} successfully discovered HF and doubles")
+
+
 def compute_basis_energy(H: MolecularHamiltonian, basis: torch.Tensor,
                          check_asymmetry: bool = False) -> float:
     """
@@ -477,6 +579,10 @@ def run_benchmark(
     if training_energy is not None:
         gap = result.nf_energy - training_energy
         print(f"  Training vs Diag gap: {gap:.4f} Ha (expected: diag <= training)")
+
+    # Diagnostic: Check if NF naturally discovered essential configurations
+    # After Phase 1 fix (subspace diagonalization), HF and singles should appear
+    print_hf_discovery_diagnostic(nf_basis, H, stage="NF-NQS")
 
     # =======================================================================
     # Step 2: Residual Expansion
