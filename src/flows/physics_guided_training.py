@@ -129,6 +129,21 @@ class PhysicsGuidedConfig:
     # Set to 5-10 for faster training with periodic energy updates
     subspace_energy_interval: int = 1
 
+    # === ESSENTIAL CONFIGURATION INJECTION ===
+    # For molecular systems, always inject HF + low-excitation determinants
+    # into the sampled basis to ensure proper ground state discovery.
+    # Without this, NF may explore wrong region of Hilbert space.
+    inject_essential_configs: bool = True
+
+    # Include HF state in every subspace energy computation
+    always_include_hf: bool = True
+
+    # Include single excitations (important for orbital relaxation)
+    include_singles_in_basis: bool = True
+
+    # Include double excitations (most important for electron correlation)
+    include_doubles_in_basis: bool = True
+
 
 class PhysicsGuidedFlowTrainer:
     """
@@ -207,6 +222,131 @@ class PhysicsGuidedFlowTrainer:
         # Early stopping tracking
         self._best_energy = float('inf')
         self._patience_counter = 0
+
+        # Essential configurations (HF + singles + doubles) for molecular systems
+        self._essential_configs = None
+        if config.inject_essential_configs and hasattr(hamiltonian, 'n_alpha'):
+            self._essential_configs = self._generate_essential_configs()
+
+    def _generate_essential_configs(self) -> torch.Tensor:
+        """
+        Generate essential configurations: HF + singles + doubles.
+
+        These configurations are CRITICAL for accurate ground state energy:
+        - HF: Has largest coefficient (~0.9) in ground state
+        - Singles: Important for orbital relaxation
+        - Doubles: Capture electron correlation (most important for chemical accuracy)
+
+        Without these, NF may explore wrong region of Hilbert space and
+        the subspace energy signal won't guide NF toward ground state.
+
+        Returns:
+            Tensor of essential configurations
+        """
+        config = self.config
+        n_orb = self.hamiltonian.n_orbitals
+        n_alpha = self.hamiltonian.n_alpha
+        n_beta = self.hamiltonian.n_beta
+
+        # Get HF state
+        hf_state = self.hamiltonian.get_hf_state()
+        essential = [hf_state.clone()]
+
+        # Get occupied and virtual orbitals
+        occ_alpha = list(range(n_alpha))
+        occ_beta = list(range(n_beta))
+        virt_alpha = list(range(n_alpha, n_orb))
+        virt_beta = list(range(n_beta, n_orb))
+
+        # Add single excitations
+        if config.include_singles_in_basis:
+            # Alpha singles
+            for i in occ_alpha:
+                for a in virt_alpha:
+                    new_config = hf_state.clone()
+                    new_config[i] = 0
+                    new_config[a] = 1
+                    essential.append(new_config)
+
+            # Beta singles
+            for i in occ_beta:
+                for a in virt_beta:
+                    new_config = hf_state.clone()
+                    new_config[i + n_orb] = 0
+                    new_config[a + n_orb] = 1
+                    essential.append(new_config)
+
+        # Add double excitations
+        if config.include_doubles_in_basis:
+            from itertools import combinations
+
+            # Limit doubles for very large systems (avoid memory issues)
+            max_doubles = 5000
+
+            doubles_count = 0
+
+            # Alpha-alpha doubles
+            for i, j in combinations(occ_alpha, 2):
+                for a, b in combinations(virt_alpha, 2):
+                    if doubles_count >= max_doubles:
+                        break
+                    new_config = hf_state.clone()
+                    new_config[i] = 0
+                    new_config[j] = 0
+                    new_config[a] = 1
+                    new_config[b] = 1
+                    essential.append(new_config)
+                    doubles_count += 1
+                if doubles_count >= max_doubles:
+                    break
+
+            # Beta-beta doubles
+            for i, j in combinations(occ_beta, 2):
+                for a, b in combinations(virt_beta, 2):
+                    if doubles_count >= max_doubles:
+                        break
+                    new_config = hf_state.clone()
+                    new_config[i + n_orb] = 0
+                    new_config[j + n_orb] = 0
+                    new_config[a + n_orb] = 1
+                    new_config[b + n_orb] = 1
+                    essential.append(new_config)
+                    doubles_count += 1
+                if doubles_count >= max_doubles:
+                    break
+
+            # Alpha-beta doubles (most important for correlation)
+            for i in occ_alpha:
+                for j in occ_beta:
+                    for a in virt_alpha:
+                        for b in virt_beta:
+                            if doubles_count >= max_doubles:
+                                break
+                            new_config = hf_state.clone()
+                            new_config[i] = 0
+                            new_config[j + n_orb] = 0
+                            new_config[a] = 1
+                            new_config[b + n_orb] = 1
+                            essential.append(new_config)
+                            doubles_count += 1
+                        if doubles_count >= max_doubles:
+                            break
+                    if doubles_count >= max_doubles:
+                        break
+                if doubles_count >= max_doubles:
+                    break
+
+        # Stack and remove duplicates
+        essential_tensor = torch.stack(essential).to(self.device)
+        essential_tensor = torch.unique(essential_tensor, dim=0)
+
+        n_singles = len([c for c in essential if torch.sum(torch.abs(c - hf_state)) == 2])
+        n_doubles = len(essential_tensor) - n_singles - 1
+
+        print(f"Generated {len(essential_tensor)} essential configs: "
+              f"1 HF + {n_singles} singles + {n_doubles} doubles")
+
+        return essential_tensor
 
     def _warmup_cache_with_hf_neighborhood(self):
         """
@@ -551,12 +691,10 @@ class PhysicsGuidedFlowTrainer:
         From paper Section 3.2-3.3:
         "Energy is computed by diagonalizing H restricted to the sampled subspace S"
 
-        This is the CORRECT approach, as opposed to local energy which includes
-        connections to states outside the sampled basis.
-
-        The key insight is that local energy E_loc(x) = <x|H|ψ>/<x|ψ> sums over ALL
-        Hamiltonian connections, even to states not in the basis. This gives
-        systematically different (higher) energy than true subspace diagonalization.
+        CRITICAL FIX: Always include essential configurations (HF + singles + doubles)
+        in the subspace. Without this, the NF may explore a region of Hilbert space
+        that doesn't include HF, leading to a poor energy signal that doesn't guide
+        the NF toward the ground state.
 
         Args:
             configs: (n_configs, num_sites) sampled configurations
@@ -568,10 +706,38 @@ class PhysicsGuidedFlowTrainer:
         config = self.config
         n_configs = len(configs)
 
+        # CRITICAL: Merge with essential configs (HF + singles + doubles)
+        # This ensures the subspace always contains the ground state region
+        if self._essential_configs is not None:
+            configs = torch.cat([self._essential_configs, configs], dim=0)
+            configs = torch.unique(configs, dim=0)
+            n_configs = len(configs)
+
         # For large bases, select top-N by NQS probability to keep computation tractable
+        # But ALWAYS keep essential configs
         if n_configs > config.max_subspace_diag_size:
-            _, top_indices = torch.topk(nqs_probs, config.max_subspace_diag_size)
-            configs = configs[top_indices]
+            # Ensure essential configs are always included
+            if self._essential_configs is not None:
+                n_essential = len(self._essential_configs)
+                max_sampled = config.max_subspace_diag_size - n_essential
+
+                # Compute NQS probs for all configs to select best sampled ones
+                with torch.no_grad():
+                    all_log_amp = self.nqs.log_amplitude(configs.float())
+                    all_probs = torch.exp(2 * all_log_amp)
+
+                # Essential configs are at the beginning, keep them
+                # Select top from remaining
+                sampled_probs = all_probs[n_essential:]
+                if len(sampled_probs) > max_sampled:
+                    _, top_indices = torch.topk(sampled_probs, max_sampled)
+                    sampled_configs = configs[n_essential:][top_indices]
+                    configs = torch.cat([self._essential_configs, sampled_configs], dim=0)
+                    configs = torch.unique(configs, dim=0)
+            else:
+                _, top_indices = torch.topk(nqs_probs, config.max_subspace_diag_size)
+                configs = configs[top_indices]
+
             n_configs = len(configs)
 
         with torch.no_grad():
@@ -928,10 +1094,18 @@ class PhysicsGuidedFlowTrainer:
 
         Uses hash-based deduplication for O(n) complexity instead of
         torch.unique which is O(n log n).
+
+        CRITICAL: Always includes essential configs (HF + singles + doubles)
+        to ensure the accumulated basis contains the ground state region.
         """
         device = new_configs.device
         num_sites = new_configs.shape[1]
         max_size = self.config.max_accumulated_basis
+
+        # CRITICAL: Always include essential configs first
+        if self._essential_configs is not None and self.accumulated_basis is None:
+            # First call: initialize with essential configs
+            new_configs = torch.cat([self._essential_configs, new_configs], dim=0)
 
         # Use integer hash for fast deduplication
         # Note: CUDA doesn't support matmul for Long tensors, so we use float64
