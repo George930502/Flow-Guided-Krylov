@@ -714,26 +714,58 @@ class PhysicsGuidedFlowTrainer:
             n_configs = len(configs)
 
         # For large bases, select top-N by NQS probability to keep computation tractable
-        # But ALWAYS keep essential configs
+        # But ALWAYS keep essential configs (HF + singles + doubles)
         if n_configs > config.max_subspace_diag_size:
-            # Ensure essential configs are always included
             if self._essential_configs is not None:
                 n_essential = len(self._essential_configs)
-                max_sampled = config.max_subspace_diag_size - n_essential
 
-                # Compute NQS probs for all configs to select best sampled ones
-                with torch.no_grad():
-                    all_log_amp = self.nqs.log_amplitude(configs.float())
-                    all_probs = torch.exp(2 * all_log_amp)
+                if n_essential >= config.max_subspace_diag_size:
+                    # Essential configs alone exceed limit - select most important ones
+                    # Always keep HF (index 0), then select by diagonal energy
+                    with torch.no_grad():
+                        diag_energies = self.hamiltonian.diagonal_elements_batch(
+                            self._essential_configs
+                        )
+                    # HF is always index 0 - keep it. Select top by lowest diagonal energy.
+                    n_select = config.max_subspace_diag_size - 1
+                    _, top_idx = torch.topk(diag_energies[1:], min(n_select, len(diag_energies) - 1), largest=False)
+                    selected_essential = torch.cat([
+                        self._essential_configs[:1],  # HF
+                        self._essential_configs[1:][top_idx],
+                    ], dim=0)
+                    configs = selected_essential
+                else:
+                    # Essential configs fit within limit - add best NF configs for the remainder
+                    max_sampled = config.max_subspace_diag_size - n_essential
 
-                # Essential configs are at the beginning, keep them
-                # Select top from remaining
-                sampled_probs = all_probs[n_essential:]
-                if len(sampled_probs) > max_sampled:
-                    _, top_indices = torch.topk(sampled_probs, max_sampled)
-                    sampled_configs = configs[n_essential:][top_indices]
-                    configs = torch.cat([self._essential_configs, sampled_configs], dim=0)
-                    configs = torch.unique(configs, dim=0)
+                    # Compute NQS probs for all configs to select best sampled ones
+                    with torch.no_grad():
+                        all_log_amp = self.nqs.log_amplitude(configs.float())
+                        all_probs = torch.exp(2 * all_log_amp)
+
+                    # Identify which configs are NOT in essential set using integer encoding
+                    n_sites = configs.shape[1]
+                    powers = (2 ** torch.arange(n_sites, device=configs.device, dtype=torch.long)).flip(0)
+                    all_ints = (configs.long() * powers).sum(dim=1)
+                    ess_ints = (self._essential_configs.long() * powers).sum(dim=1)
+                    ess_set = set(ess_ints.cpu().tolist())
+
+                    # Mask for non-essential configs
+                    non_ess_mask = torch.tensor(
+                        [int(x) not in ess_set for x in all_ints.cpu().tolist()],
+                        device=configs.device, dtype=torch.bool,
+                    )
+
+                    if non_ess_mask.any() and max_sampled > 0:
+                        non_ess_probs = all_probs[non_ess_mask]
+                        non_ess_configs = configs[non_ess_mask]
+                        k = min(max_sampled, len(non_ess_probs))
+                        _, top_indices = torch.topk(non_ess_probs, k)
+                        sampled_configs = non_ess_configs[top_indices]
+                        configs = torch.cat([self._essential_configs, sampled_configs], dim=0)
+                        configs = torch.unique(configs, dim=0)
+                    else:
+                        configs = self._essential_configs
             else:
                 _, top_indices = torch.topk(nqs_probs, config.max_subspace_diag_size)
                 configs = configs[top_indices]
