@@ -1182,10 +1182,38 @@ class PhysicsGuidedFlowTrainer:
                 combined = torch.cat([self.accumulated_basis, new_configs], dim=0)
                 self.accumulated_basis = torch.unique(combined, dim=0)
 
-        # Prune if too large - keep random subset
+        # Prune if too large - keep essential configs + random subset of the rest
         if len(self.accumulated_basis) > max_size:
-            indices = torch.randperm(len(self.accumulated_basis), device=device)[:max_size]
-            self.accumulated_basis = self.accumulated_basis[indices]
+            if self._essential_configs is not None:
+                # CRITICAL: Always preserve essential configs (HF + singles + doubles)
+                # Previous bug: random pruning could lose these, causing NF to explore
+                # wrong region of Hilbert space for large systems like C2H4
+                n_essential = len(self._essential_configs)
+                n_sites = self.accumulated_basis.shape[1]
+                powers = (2.0 ** torch.arange(n_sites - 1, -1, -1, device=device, dtype=torch.float64))
+
+                ess_ints = set((self._essential_configs.double() @ powers).long().tolist())
+                acc_ints = (self.accumulated_basis.double() @ powers).long().tolist()
+
+                essential_mask = torch.tensor(
+                    [k in ess_ints for k in acc_ints], dtype=torch.bool, device=device
+                )
+                non_essential_mask = ~essential_mask
+
+                essential_part = self.accumulated_basis[essential_mask]
+                non_essential_part = self.accumulated_basis[non_essential_mask]
+
+                # Fill remaining budget with random non-essential configs
+                remaining_budget = max_size - len(essential_part)
+                if remaining_budget > 0 and len(non_essential_part) > 0:
+                    n_keep = min(remaining_budget, len(non_essential_part))
+                    rand_idx = torch.randperm(len(non_essential_part), device=device)[:n_keep]
+                    self.accumulated_basis = torch.cat([essential_part, non_essential_part[rand_idx]], dim=0)
+                else:
+                    self.accumulated_basis = essential_part[:max_size]
+            else:
+                indices = torch.randperm(len(self.accumulated_basis), device=device)[:max_size]
+                self.accumulated_basis = self.accumulated_basis[indices]
 
     def _compute_accumulated_energy(self) -> float:
         """

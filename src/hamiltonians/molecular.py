@@ -113,6 +113,20 @@ class MolecularHamiltonian(Hamiltonian):
         self.h1_offdiag_indices = torch.nonzero(h1_offdiag_mask)
         self.h1_offdiag_values = self.h1e[h1_offdiag_mask]
 
+        # Precompute Coulomb/Exchange tensors for single excitation Slater-Condon rules
+        # J_single[p,q,r] = h2e[p,q,r,r] (Coulomb-type for excitation p<-q with spectator r)
+        # K_single[p,q,r] = h2e[p,r,r,q] (Exchange-type for excitation p<-q with spectator r)
+        r_idx = torch.arange(n_orb, device=device)
+        self._J_single = self.h2e[:, :, r_idx, r_idx]  # (n_orb, n_orb, n_orb) axes: (p, q, r)
+        # h2e[:, r_idx, r_idx, :] gives axes (p, r, q) -> permute to (p, q, r)
+        self._K_single = self.h2e[:, r_idx, r_idx, :].permute(0, 2, 1)  # (n_orb, n_orb, n_orb)
+        # Combined tensor: J - K for same-spin contribution
+        self._JK_single = self._J_single - self._K_single  # (n_orb, n_orb, n_orb)
+
+        # Numpy versions for sequential get_connections
+        self._J_single_np = self._J_single.cpu().numpy()
+        self._K_single_np = self._K_single.cpu().numpy()
+
         # OPTIMIZATION: Precompute sparse h2e dictionary for double excitations
         # This avoids iterating over all (p,q,r,s) combinations in get_connections
         # For C2H4 (14 orbitals): reduces from 38,416 iterations to ~500-2000 nonzero
@@ -436,30 +450,55 @@ class MolecularHamiltonian(Hamiltonian):
         # Use precomputed numpy array (avoids GPU->CPU transfer per call)
         h2e_np = self._h2e_np
 
-        # ===== SINGLE EXCITATIONS (one-body terms) =====
+        # ===== SINGLE EXCITATIONS (Slater-Condon rules) =====
+        # Full matrix element for single excitation D -> D_{p<-q}:
+        #   <D_{p<-q}|H|D> = h_pq
+        #     + sum_{r in occ_same_spin, r!=q} [<pr|qr> - <pr|rq>]
+        #     + sum_{r' in occ_other_spin} <pr'|qr'>
+        # where <ab|cd> (physicist) = h2e[a,c,b,d] (chemist notation)
         occ_alpha_set = set(occ_alpha)
         occ_beta_set = set(occ_beta)
         virt_alpha_set = set(virt_alpha)
         virt_beta_set = set(virt_beta)
 
+        # Precomputed Slater-Condon tensors for efficient single excitation computation
+        J_single_np = self._J_single_np   # J_single[p,q,r] = h2e[p,q,r,r]
+        K_single_np = self._K_single_np   # K_single[p,q,r] = h2e[p,r,r,q]
+
         for p, q, h_pq in self.single_exc_data:
             # Alpha: q -> p
             if q in occ_alpha_set and p in virt_alpha_set:
-                new_config = config_np.copy()
-                new_config[q] = 0
-                new_config[p] = 1
-                sign = self._jw_sign_np(config_np, p, q)
-                connected_list.append(new_config)
-                elements_list.append(sign * h_pq)
+                # Full Slater-Condon: h_pq + sum_r n_alpha[r]*(J-K) + sum_r n_beta[r]*J
+                # Note: r=q contribution to (J-K) is zero since J[p,q,q]=K[p,q,q]=h2e[p,q,q,q]
+                val = h_pq
+                for r in occ_alpha:
+                    val += J_single_np[p, q, r] - K_single_np[p, q, r]
+                for r in occ_beta:
+                    val += J_single_np[p, q, r]
+
+                if abs(val) > 1e-12:
+                    new_config = config_np.copy()
+                    new_config[q] = 0
+                    new_config[p] = 1
+                    sign = self._jw_sign_np(config_np, p, q)
+                    connected_list.append(new_config)
+                    elements_list.append(sign * val)
 
             # Beta: q -> p
             if q in occ_beta_set and p in virt_beta_set:
-                new_config = config_np.copy()
-                new_config[q + n_orb] = 0
-                new_config[p + n_orb] = 1
-                sign = self._jw_sign_np(config_np, p + n_orb, q + n_orb)
-                connected_list.append(new_config)
-                elements_list.append(sign * h_pq)
+                val = h_pq
+                for r in occ_beta:
+                    val += J_single_np[p, q, r] - K_single_np[p, q, r]
+                for r in occ_alpha:
+                    val += J_single_np[p, q, r]
+
+                if abs(val) > 1e-12:
+                    new_config = config_np.copy()
+                    new_config[q + n_orb] = 0
+                    new_config[p + n_orb] = 1
+                    sign = self._jw_sign_np(config_np, p + n_orb, q + n_orb)
+                    connected_list.append(new_config)
+                    elements_list.append(sign * val)
 
         # ===== DOUBLE EXCITATIONS (two-body terms) =====
         # NOTE: Using original 4-nested-loops approach for correctness.
@@ -782,41 +821,76 @@ class MolecularHamiltonian(Hamiltonian):
             p_occ_beta = torch.gather(beta_occ, 1, p_idx)
             valid_beta = (q_occ_beta == 1) & (p_occ_beta == 0)
 
-            # Process alpha singles
+            # Process alpha singles with full Slater-Condon matrix elements
             if valid_alpha.any():
                 config_idx, exc_idx = valid_alpha.nonzero(as_tuple=True)
-                p_vals = self._single_p[exc_idx]
-                q_vals = self._single_q[exc_idx]
+                p_orb = self._single_p[exc_idx]  # orbital indices (no spin offset)
+                q_orb = self._single_q[exc_idx]
                 h_vals = self._single_h1e[exc_idx]
 
-                # Create new configs
-                new_configs = configs[config_idx].clone()
-                new_configs[torch.arange(len(config_idx), device=device), q_vals] = 0
-                new_configs[torch.arange(len(config_idx), device=device), p_vals] = 1
+                # Full Slater-Condon: h_pq + n_alpha·(J-K) + n_beta·J
+                JK_pq = self._JK_single[p_orb, q_orb, :]  # (n_exc, n_orb)
+                J_pq = self._J_single[p_orb, q_orb, :]     # (n_exc, n_orb)
+                alpha_n = alpha_occ[config_idx]              # (n_exc, n_orb)
+                beta_n = beta_occ[config_idx]                # (n_exc, n_orb)
+                two_body = (alpha_n * JK_pq).sum(dim=1) + (beta_n * J_pq).sum(dim=1)
+                full_vals = h_vals + two_body
 
-                # Compute JW signs vectorized
-                signs = self._jw_sign_vectorized(configs[config_idx], p_vals, q_vals)
+                # Filter out negligible elements
+                significant = full_vals.abs() > 1e-12
+                if significant.any():
+                    config_idx = config_idx[significant]
+                    p_orb = p_orb[significant]
+                    q_orb = q_orb[significant]
+                    full_vals = full_vals[significant]
 
-                all_connected.append(new_configs)
-                all_elements.append(signs * h_vals)
-                all_batch_idx.append(config_idx)
+                    # Create new configs (use orbital indices for alpha)
+                    new_configs = configs[config_idx].clone()
+                    arange_idx = torch.arange(len(config_idx), device=device)
+                    new_configs[arange_idx, q_orb] = 0
+                    new_configs[arange_idx, p_orb] = 1
 
-            # Process beta singles
+                    signs = self._jw_sign_vectorized(configs[config_idx], p_orb, q_orb)
+
+                    all_connected.append(new_configs)
+                    all_elements.append(signs * full_vals)
+                    all_batch_idx.append(config_idx)
+
+            # Process beta singles with full Slater-Condon matrix elements
             if valid_beta.any():
                 config_idx, exc_idx = valid_beta.nonzero(as_tuple=True)
-                p_vals = self._single_p[exc_idx] + n_orb  # Beta offset
-                q_vals = self._single_q[exc_idx] + n_orb
+                p_orb = self._single_p[exc_idx]  # orbital indices (no spin offset)
+                q_orb = self._single_q[exc_idx]
                 h_vals = self._single_h1e[exc_idx]
 
-                new_configs = configs[config_idx].clone()
-                new_configs[torch.arange(len(config_idx), device=device), q_vals] = 0
-                new_configs[torch.arange(len(config_idx), device=device), p_vals] = 1
+                # Full Slater-Condon: h_pq + n_beta·(J-K) + n_alpha·J
+                JK_pq = self._JK_single[p_orb, q_orb, :]
+                J_pq = self._J_single[p_orb, q_orb, :]
+                alpha_n = alpha_occ[config_idx]
+                beta_n = beta_occ[config_idx]
+                two_body = (beta_n * JK_pq).sum(dim=1) + (alpha_n * J_pq).sum(dim=1)
+                full_vals = h_vals + two_body
 
-                signs = self._jw_sign_vectorized(configs[config_idx], p_vals, q_vals)
+                significant = full_vals.abs() > 1e-12
+                if significant.any():
+                    config_idx = config_idx[significant]
+                    p_orb = p_orb[significant]
+                    q_orb = q_orb[significant]
+                    full_vals = full_vals[significant]
 
-                all_connected.append(new_configs)
-                all_elements.append(signs * h_vals)
-                all_batch_idx.append(config_idx)
+                    p_vals = p_orb + n_orb  # Beta offset for qubit indices
+                    q_vals = q_orb + n_orb
+
+                    new_configs = configs[config_idx].clone()
+                    arange_idx = torch.arange(len(config_idx), device=device)
+                    new_configs[arange_idx, q_vals] = 0
+                    new_configs[arange_idx, p_vals] = 1
+
+                    signs = self._jw_sign_vectorized(configs[config_idx], p_vals, q_vals)
+
+                    all_connected.append(new_configs)
+                    all_elements.append(signs * full_vals)
+                    all_batch_idx.append(config_idx)
 
         # ============================================================
         # DOUBLE EXCITATIONS: Same-spin (alpha-alpha, beta-beta)

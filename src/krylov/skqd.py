@@ -73,17 +73,16 @@ class SKQDConfig:
     # Hardware
     use_gpu: bool = True
 
-    # === KRYLOV SAMPLING LIMITS (increased for better discovery) ===
+    # === KRYLOV SAMPLING LIMITS ===
     # Maximum new configurations to add per Krylov step
-    # Increased from 500 to 2000 to improve discovery rate
-    max_new_configs_per_krylov_step: int = 2000
+    max_new_configs_per_krylov_step: int = 5000
 
     # Fraction of basis to sample when finding connected configs
     # Higher values = more thorough exploration but slower
-    krylov_basis_sample_fraction: float = 0.5
+    krylov_basis_sample_fraction: float = 0.8
 
     # Minimum number of basis states to sample regardless of fraction
-    min_krylov_basis_sample: int = 500
+    min_krylov_basis_sample: int = 1000
 
 
 class SampleBasedKrylovDiagonalization:
@@ -1258,12 +1257,16 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         psi = np.ones(n_subspace, dtype=np.complex128) / np.sqrt(n_subspace)
 
         self.krylov_samples = []
+        self._nf_guided_psi = None  # For importance-weighted exploration
 
         iterator = range(max_krylov_dim)
         if progress:
             iterator = tqdm(iterator, desc="NF-guided Krylov")
 
         for k in iterator:
+            # Store psi for importance-weighted exploration
+            self._nf_guided_psi = psi
+
             # Sample from current state
             samples = self._sample_from_subspace_basis(psi, current_basis)
             self.krylov_samples.append(samples)
@@ -1334,7 +1337,18 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         )
         n_sample = min(len(basis), n_sample)
 
-        indices = torch.randperm(len(basis))[:n_sample]
+        # Use importance-weighted sampling if we have state amplitudes
+        # Prefer exploring connections of high-amplitude basis states
+        if hasattr(self, '_nf_guided_psi') and self._nf_guided_psi is not None:
+            psi = self._nf_guided_psi
+            probs = np.abs(psi[:len(basis)]) ** 2
+            probs = probs / probs.sum()
+            indices_np = np.random.choice(
+                len(basis), size=n_sample, replace=False, p=probs
+            )
+            indices = torch.from_numpy(indices_np)
+        else:
+            indices = torch.randperm(len(basis))[:n_sample]
 
         # Collect all connected configs in batches for GPU-efficient processing
         all_connected = []

@@ -250,35 +250,44 @@ class PipelineConfig:
             self.samples_per_batch = 4000
 
         else:  # very_large
-            # Very large systems: maximum basis collection
+            # Very large systems (>20K valid configs, e.g. C2H4 with 9M)
+            #
+            # KEY INSIGHT: For very large systems, NF cannot efficiently explore
+            # the ground state region. Instead, we rely on:
+            # 1. Essential config injection (HF + singles + doubles) for subspace energy
+            # 2. Short NF training to learn nearby configurations
+            # 3. Aggressive residual expansion (Selected-CI) as the primary basis builder
+            # 4. Krylov for supplementary discovery
+            #
+            # Previous approach (800 epochs, performance hacks) wasted hours while
+            # NF explored wrong Hilbert space region. New approach: short training,
+            # full energy signal, then rely on CI expansion.
+
             self.max_accumulated_basis = 16384
             self.max_diverse_configs = min(n_valid_configs, 12288)
             self.residual_iterations = 20
             self.residual_configs_per_iter = 500
             self.residual_threshold = 1e-8
             self.use_perturbative_selection = True
-            # Maximum network capacity
-            self.nqs_hidden_dims = [512, 512, 512, 512, 512, 512]
-            self.nf_hidden_dims = [384, 384]
-            # Extended training with performance optimizations
-            self.max_epochs = max(self.max_epochs, 800)
-            self.min_epochs = max(self.min_epochs, 200)
-            self.samples_per_batch = 2000  # Reduced from 6000 for faster epochs
 
-            # === CRITICAL PERFORMANCE OPTIMIZATIONS FOR VERY LARGE SYSTEMS ===
-            # These settings reduce training time from ~14 hours to ~2-3 hours
+            # Network capacity
+            self.nqs_hidden_dims = [512, 512, 512, 512]
+            self.nf_hidden_dims = [256, 256]
 
-            # Truncate to top 200 connections per config (vs ~3000 for C2H4)
-            # Keeps singles + strongest doubles, provides ~10-15x speedup
-            self.max_connections_per_config = 200
+            # SHORT training: NF serves as warm-start, not primary basis builder
+            # Essential configs provide the energy signal; NF explores neighborhood
+            self.max_epochs = max(self.max_epochs, 200)
+            self.min_epochs = max(self.min_epochs, 50)
+            self.samples_per_batch = 2000
 
-            # Use diagonal-only for first 50 epochs (very fast warmup)
-            # Allows flow to find ground state region before expensive off-diag
-            self.diagonal_only_warmup_epochs = 50
-
-            # After warmup, use 30% of connections stochastically
-            # Provides unbiased estimate with ~3x speedup
-            self.stochastic_connections_fraction = 0.3
+            # IMPORTANT: Do NOT use performance hacks that cripple the energy signal
+            # - No connection truncation (loses important doubles)
+            # - No diagonal-only warmup (delays real energy signal)
+            # - No stochastic connections (adds noise to already weak signal)
+            # The essential config injection makes subspace energy fast enough
+            self.max_connections_per_config = 0  # Use all connections
+            self.diagonal_only_warmup_epochs = 0  # Full energy from epoch 1
+            self.stochastic_connections_fraction = 1.0  # Use all connections
 
         # Compute coverage statistics
         coverage_accumulated = min(1.0, self.max_accumulated_basis / n_valid_configs)
@@ -509,6 +518,17 @@ class FlowGuidedKrylovPipeline:
             self.results["diversity_stats"] = select_stats
         else:
             selected_basis = raw_basis
+
+        # CRITICAL: Always include essential configs (HF + singles + doubles)
+        # even if diversity selection filtered them out. For large systems,
+        # NF may never generate these, but they dominate the ground state.
+        if (self.is_molecular and hasattr(self, 'trainer') and
+                hasattr(self.trainer, '_essential_configs') and
+                self.trainer._essential_configs is not None):
+            essential = self.trainer._essential_configs
+            combined = torch.cat([essential.to(selected_basis.device), selected_basis], dim=0)
+            selected_basis = torch.unique(combined, dim=0)
+            print(f"After merging essential configs: {len(selected_basis)} total")
 
         self.nf_basis = selected_basis
         self.results["nf_basis_size"] = len(selected_basis)

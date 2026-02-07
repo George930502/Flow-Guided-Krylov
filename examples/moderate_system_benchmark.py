@@ -589,20 +589,22 @@ def run_benchmark(
     # =======================================================================
     print("\n--- Step 2: Residual (PT2) Expansion ---")
 
-    # Use adaptive energy bound based on NF energy, not exact reference
-    # The exact reference (CCSD) blocks PT2 when NF is far from ground state
-    # because PT2 finds configs that would lower energy below CCSD
-    # Instead, allow PT2 to go 50% below NF energy (catches real errors)
-    adaptive_bound = result.nf_energy - abs(result.nf_energy) * 0.5
-    print(f"  Adaptive energy bound: {adaptive_bound:.6f} Ha "
-          f"(50% below NF energy {result.nf_energy:.6f} Ha)")
+    # IMPORTANT: Do NOT set energy_lower_bound for large systems where
+    # reference is CCSD (not FCI). FCI energy CAN be below CCSD, so
+    # blocking expansion below CCSD prevents finding the true ground state.
+    # Only set a bound if the reference is FCI (exact).
+    if energy_type == "FCI":
+        energy_bound = E_exact - 1e-4  # Allow small numerical tolerance below FCI
+        print(f"  Energy bound: {energy_bound:.6f} Ha (FCI - 0.1 mHa tolerance)")
+    else:
+        energy_bound = None  # No bound for CCSD/HF reference
+        print(f"  Energy bound: NONE (reference is {energy_type}, not FCI)")
 
     residual_config = ResidualExpansionConfig(
         max_configs_per_iter=config.residual_configs_per_iter,
         max_iterations=config.residual_iterations,
         residual_threshold=config.residual_threshold,
-        # Use adaptive bound to allow legitimate PT2 expansion
-        energy_lower_bound=adaptive_bound,
+        energy_lower_bound=energy_bound,
     )
     expander = SelectedCIExpander(H, residual_config)
 
@@ -626,15 +628,18 @@ def run_benchmark(
         # Compute current energy with asymmetry checking
         current_energy = compute_basis_energy(H, expanded_basis, check_asymmetry=(i == 0))
 
-        # CRITICAL: Check variational principle
-        if current_energy < E_exact - 1e-6:
+        # Check variational principle (only meaningful for FCI reference)
+        if energy_type == "FCI" and current_energy < E_exact - 1e-4:
             violation_mha = (E_exact - current_energy) * 1000
             print(f"  WARNING: Iter {i+1}: Energy {current_energy:.6f} Ha is "
-                  f"{violation_mha:.2f} mHa BELOW reference {E_exact:.6f} Ha!")
+                  f"{violation_mha:.2f} mHa BELOW FCI {E_exact:.6f} Ha!")
             print(f"  STOPPING and reverting to previous basis.")
             expanded_basis = prev_basis
             variational_violation_detected = True
             break
+        elif energy_type != "FCI" and verbose:
+            error = abs(current_energy - E_exact) * 1000
+            print(f"    Iter {i+1}: E = {current_energy:.6f} Ha (error vs {energy_type}: {error:.2f} mHa)")
 
         if verbose:
             print(f"    Iter {i+1}: {old_size} -> {len(expanded_basis)} (+{added})")
