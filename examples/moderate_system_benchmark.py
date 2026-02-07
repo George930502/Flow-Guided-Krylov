@@ -562,8 +562,8 @@ def run_benchmark(
     pipeline = FlowGuidedKrylovPipeline(H, config=config, exact_energy=E_exact)
     pipeline.train_flow_nqs(progress=verbose)
 
-    # Get training energy for diagnostic comparison
-    training_energy = getattr(pipeline.trainer, 'best_energy', None)
+    # Get training energy for diagnostic comparison (not available in Direct-CI mode)
+    training_energy = getattr(getattr(pipeline, 'trainer', None), 'best_energy', None)
     if training_energy is not None:
         print(f"  NQS Training best energy: {training_energy:.6f} Ha")
 
