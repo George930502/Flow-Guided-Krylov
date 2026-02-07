@@ -549,9 +549,11 @@ def run_benchmark(
     print("\n--- Step 1: NF-NQS Training ---")
 
     # Use PipelineConfig with adapt_to_system_size for parameter tuning
+    # Direct-CI mode skips NF training for faster benchmarks
     config = PipelineConfig(
         use_residual_expansion=False,
         skip_skqd=True,
+        skip_nf_training=True,
         max_epochs=400,
         device=device,
     )

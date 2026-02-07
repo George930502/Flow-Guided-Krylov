@@ -174,6 +174,11 @@ class PipelineConfig:
     use_davidson: bool = True
     davidson_threshold: int = 500  # Use Davidson for bases larger than this
 
+    # Direct-CI mode: skip NF-NQS training entirely
+    # When True, pipeline goes directly from essential config generation → residual expansion → SKQD
+    # For molecular systems, essential configs (HF + singles + doubles) already dominate the ground state
+    skip_nf_training: bool = False
+
     # Hardware
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -217,8 +222,15 @@ class PipelineConfig:
         else:
             tier = "very_large"
 
+        # For molecular systems, skip NF training by default (Direct-CI mode)
+        # Essential configs (HF + singles + doubles) + residual expansion reach exact FCI
+        # NF training adds significant overhead with no energy improvement
+        self.skip_nf_training = True
+
         if verbose:
             print(f"System size: {n_valid_configs:,} valid configs -> {tier} tier")
+            if self.skip_nf_training:
+                print(f"Direct-CI mode: skipping NF-NQS training")
 
         if tier == "small":
             # Small systems: default parameters are fine
@@ -421,15 +433,135 @@ class FlowGuidedKrylovPipeline:
         else:
             self.reference_state = torch.zeros(self.num_sites, device=self.device)
 
+    def _generate_essential_configs(self) -> torch.Tensor:
+        """
+        Generate essential configurations (HF + singles + doubles) without NF training.
+
+        Reuses the same logic as PhysicsGuidedFlowTrainer._generate_essential_configs()
+        but can be called standalone for Direct-CI mode.
+
+        Returns:
+            Tensor of essential configurations
+        """
+        from itertools import combinations
+
+        n_orb = self.hamiltonian.n_orbitals
+        n_alpha = self.hamiltonian.n_alpha
+        n_beta = self.hamiltonian.n_beta
+
+        hf_state = self.hamiltonian.get_hf_state()
+        essential = [hf_state.clone()]
+
+        occ_alpha = list(range(n_alpha))
+        occ_beta = list(range(n_beta))
+        virt_alpha = list(range(n_alpha, n_orb))
+        virt_beta = list(range(n_beta, n_orb))
+
+        # Single excitations
+        for i in occ_alpha:
+            for a in virt_alpha:
+                new_config = hf_state.clone()
+                new_config[i] = 0
+                new_config[a] = 1
+                essential.append(new_config)
+
+        for i in occ_beta:
+            for a in virt_beta:
+                new_config = hf_state.clone()
+                new_config[i + n_orb] = 0
+                new_config[a + n_orb] = 1
+                essential.append(new_config)
+
+        # Double excitations (with limit for large systems)
+        max_doubles = 5000
+        doubles_count = 0
+
+        # Alpha-alpha doubles
+        for i, j in combinations(occ_alpha, 2):
+            for a, b in combinations(virt_alpha, 2):
+                if doubles_count >= max_doubles:
+                    break
+                new_config = hf_state.clone()
+                new_config[i] = 0
+                new_config[j] = 0
+                new_config[a] = 1
+                new_config[b] = 1
+                essential.append(new_config)
+                doubles_count += 1
+            if doubles_count >= max_doubles:
+                break
+
+        # Beta-beta doubles
+        for i, j in combinations(occ_beta, 2):
+            for a, b in combinations(virt_beta, 2):
+                if doubles_count >= max_doubles:
+                    break
+                new_config = hf_state.clone()
+                new_config[i + n_orb] = 0
+                new_config[j + n_orb] = 0
+                new_config[a + n_orb] = 1
+                new_config[b + n_orb] = 1
+                essential.append(new_config)
+                doubles_count += 1
+            if doubles_count >= max_doubles:
+                break
+
+        # Alpha-beta doubles (most important for correlation)
+        for i in occ_alpha:
+            for j in occ_beta:
+                for a in virt_alpha:
+                    for b in virt_beta:
+                        if doubles_count >= max_doubles:
+                            break
+                        new_config = hf_state.clone()
+                        new_config[i] = 0
+                        new_config[j + n_orb] = 0
+                        new_config[a] = 1
+                        new_config[b + n_orb] = 1
+                        essential.append(new_config)
+                        doubles_count += 1
+                    if doubles_count >= max_doubles:
+                        break
+                if doubles_count >= max_doubles:
+                    break
+            if doubles_count >= max_doubles:
+                break
+
+        essential_tensor = torch.stack(essential).to(self.device)
+        essential_tensor = torch.unique(essential_tensor, dim=0)
+
+        n_singles = len([c for c in essential if torch.sum(torch.abs(c - hf_state)) == 2])
+        n_doubles = len(essential_tensor) - n_singles - 1
+
+        print(f"Generated {len(essential_tensor)} essential configs: "
+              f"1 HF + {n_singles} singles + {n_doubles} doubles")
+
+        return essential_tensor
+
     def train_flow_nqs(self, progress: bool = True) -> Dict[str, list]:
         """
         Stage 1: Train NF-NQS with physics-guided objective.
+
+        If skip_nf_training is True (Direct-CI mode), generates essential
+        configs directly without any NF training.
         """
         print("=" * 60)
         print("Stage 1: Physics-Guided NF-NQS Training")
         print("=" * 60)
 
         cfg = self.config
+
+        # Direct-CI mode: skip NF training, use essential configs directly
+        if cfg.skip_nf_training and self.is_molecular:
+            print("Direct-CI mode: skipping NF-NQS training")
+            print("Generating essential configurations (HF + singles + doubles)...")
+
+            self._essential_configs = self._generate_essential_configs()
+            self.results["training_history"] = {"energies": [], "skipped": True}
+            self.results["nf_nqs_energy"] = None
+            self.results["skip_nf_training"] = True
+
+            return {"energies": [], "skipped": True}
 
         # Create physics-guided trainer
         train_config = PhysicsGuidedConfig(
@@ -468,12 +600,25 @@ class FlowGuidedKrylovPipeline:
     def extract_and_select_basis(self) -> torch.Tensor:
         """
         Stage 2: Extract basis with diversity-aware selection.
+
+        In Direct-CI mode, uses essential configs directly without
+        diversity selection (they are already a curated, physically-motivated set).
         """
         print("=" * 60)
         print("Stage 2: Diversity-Aware Basis Extraction")
         print("=" * 60)
 
         cfg = self.config
+
+        # Direct-CI mode: use essential configs directly
+        if cfg.skip_nf_training and hasattr(self, '_essential_configs'):
+            print("Direct-CI mode: using essential configs as basis")
+            selected_basis = self._essential_configs
+            print(f"Essential configs basis: {len(selected_basis)} configs")
+            self.nf_basis = selected_basis
+            self.results["nf_basis_size"] = len(selected_basis)
+            self.results["diversity_stats"] = {"skipped": True, "reason": "Direct-CI mode"}
+            return selected_basis
 
         # Get accumulated basis from training
         if hasattr(self, 'trainer') and self.trainer.accumulated_basis is not None:
@@ -853,7 +998,10 @@ class FlowGuidedKrylovPipeline:
         print("Results Summary")
         print("=" * 60)
 
-        if "nf_nqs_energy" in self.results:
+        if self.results.get("skip_nf_training"):
+            print(f"Mode:              Direct-CI (NF training skipped)")
+
+        if "nf_nqs_energy" in self.results and self.results["nf_nqs_energy"] is not None:
             print(f"NF-NQS Energy:     {self.results['nf_nqs_energy']:.8f}")
 
         if "nf_basis_size" in self.results:
@@ -929,11 +1077,12 @@ def run_molecular_benchmark(
     # Get exact energy
     E_exact = H.fci_energy()
 
-    # Configure pipeline
+    # Configure pipeline (Direct-CI mode by default for molecular systems)
     config = PipelineConfig(
         use_particle_conserving_flow=True,
         use_diversity_selection=True,
         use_residual_expansion=True,
+        skip_nf_training=True,
     )
 
     # Run pipeline
