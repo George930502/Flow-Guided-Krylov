@@ -51,6 +51,8 @@ class MoleculeData:
     hamiltonian: MolecularHamiltonian
     hf_energy: float
     ccsd_energy: Optional[float] = None
+    ccsd_t_energy: Optional[float] = None
+    fci_energy: Optional[float] = None
     geometry: list = None
     basis: str = "sto-3g"
 
@@ -63,7 +65,7 @@ class BenchmarkResult:
     n_electrons: int
     n_valid_configs: int
     exact_energy: float
-    energy_type: str = "FCI"  # FCI, CCSD, or HF
+    energy_type: str = "FCI"  # FCI, CCSD(T), CCSD, or HF
 
     # Configuration counts
     nf_configs: int = 0
@@ -98,6 +100,27 @@ def set_to_configs(config_set: Set[tuple], n_sites: int, device: str) -> torch.T
     """Convert set of tuples back to tensor."""
     configs = [list(c) for c in config_set]
     return torch.tensor(configs, dtype=torch.long, device=device)
+
+
+def format_energy_comparison(energy: float, reference: float, ref_type: str) -> str:
+    """
+    Format energy comparison, correctly handling sub-reference energies.
+
+    When energy < reference and reference is NOT FCI, this is expected
+    (FCI < CCSD < HF), so report as "below" rather than "error".
+    """
+    diff_mha = (energy - reference) * 1000
+
+    if ref_type == "FCI":
+        # For FCI reference, any deviation is error (variational principle)
+        error_mha = abs(diff_mha)
+        return f"error vs FCI: {error_mha:.2f} mHa"
+    else:
+        # For non-variational references (CCSD, CCSD(T)), energy CAN go below
+        if diff_mha < -0.01:  # Below reference
+            return f"{abs(diff_mha):.2f} mHa below {ref_type} (expected: FCI < {ref_type})"
+        else:
+            return f"{abs(diff_mha):.2f} mHa above {ref_type}"
 
 
 def check_essential_configs_discovered(
@@ -186,20 +209,20 @@ def print_hf_discovery_diagnostic(
 
     # Warnings for missing essential configs
     if bucket_dist.get('rank_0', 0) == 0:
-        print(f"  ⚠️ WARNING: HF state NOT discovered by {stage}!")
+        print(f"  WARNING: HF state NOT discovered by {stage}!")
         print(f"     This may indicate insufficient training or wrong energy signal.")
 
     if bucket_dist.get('rank_1', 0) == 0:
-        print(f"  ⚠️ WARNING: No singles discovered by {stage}!")
+        print(f"  WARNING: No singles discovered by {stage}!")
         print(f"     Singles are important for orbital relaxation.")
 
     if bucket_dist.get('rank_2', 0) == 0:
-        print(f"  ⚠️ WARNING: No doubles discovered by {stage}!")
+        print(f"  WARNING: No doubles discovered by {stage}!")
         print(f"     Doubles capture electron correlation.")
 
     # Success indicators
     if bucket_dist.get('rank_0', 0) > 0 and bucket_dist.get('rank_2', 0) > 0:
-        print(f"  ✓ {stage} successfully discovered HF and doubles")
+        print(f"  {stage} successfully discovered HF and doubles")
 
 
 def compute_basis_energy(H: MolecularHamiltonian, basis: torch.Tensor,
@@ -228,6 +251,48 @@ def compute_basis_energy(H: MolecularHamiltonian, basis: torch.Tensor,
     return float(eigenvalues[0])
 
 
+def compute_pyscf_fci(geometry, basis, charge=0, spin=0, max_memory=8000):
+    """
+    Compute FCI energy using PySCF's iterative Davidson solver.
+
+    Unlike our matrix-based FCI (which builds the full N x N matrix),
+    PySCF's FCI solver uses iterative methods and can handle much larger
+    spaces (up to ~10M determinants).
+
+    Args:
+        geometry: Molecular geometry
+        basis: Basis set name
+        charge: Molecular charge
+        spin: Spin multiplicity (2S)
+        max_memory: Maximum memory in MB
+
+    Returns:
+        FCI energy in Hartree, or None if computation fails
+    """
+    from pyscf import fci
+
+    mol = gto.Mole()
+    mol.atom = geometry
+    mol.basis = basis
+    mol.charge = charge
+    mol.spin = spin
+    mol.build()
+
+    if spin == 0:
+        mf = scf.RHF(mol)
+    else:
+        mf = scf.ROHF(mol)
+    mf.kernel()
+
+    cisolver = fci.FCI(mf)
+    cisolver.max_memory = max_memory
+    cisolver.max_cycle = 300
+    cisolver.conv_tol = 1e-10
+
+    e_fci, ci = cisolver.kernel()
+    return float(e_fci)
+
+
 # =============================================================================
 # Helper: Create Hamiltonian with Reference Energies
 # =============================================================================
@@ -247,6 +312,7 @@ def create_molecule_data(
     - MolecularHamiltonian
     - HF energy
     - CCSD energy (if requested)
+    - CCSD(T) energy (if CCSD succeeds)
     """
     # Build PySCF molecule
     mol = gto.Mole()
@@ -264,13 +330,21 @@ def create_molecule_data(
     mf.kernel()
     hf_energy = float(mf.e_tot)
 
-    # Run CCSD if requested
+    # Run CCSD and CCSD(T) if requested
     ccsd_energy = None
+    ccsd_t_energy = None
     if compute_ccsd:
         try:
             mycc = cc.CCSD(mf)
             mycc.kernel()
             ccsd_energy = float(mycc.e_tot)
+
+            # Compute CCSD(T) perturbative triples correction
+            try:
+                et = mycc.ccsd_t()
+                ccsd_t_energy = ccsd_energy + et
+            except Exception as e:
+                print(f"  CCSD(T) failed: {e}")
         except Exception as e:
             print(f"  CCSD failed: {e}")
 
@@ -300,6 +374,7 @@ def create_molecule_data(
         hamiltonian=hamiltonian,
         hf_energy=hf_energy,
         ccsd_energy=ccsd_energy,
+        ccsd_t_energy=ccsd_t_energy,
         geometry=geometry,
         basis=basis,
     )
@@ -317,7 +392,7 @@ def create_co_molecule(
     Create CO (carbon monoxide) molecule data.
 
     14 electrons, 10 orbitals in STO-3G = 20 qubits
-    Valid configs: C(10,7)² = 14,400
+    Valid configs: C(10,7)^2 = 14,400
     """
     geometry = [
         ("C", (0.0, 0.0, 0.0)),
@@ -506,32 +581,58 @@ def run_benchmark(
     print(f"  HF Energy: {mol_data.hf_energy:.8f} Ha")
     if mol_data.ccsd_energy:
         print(f"  CCSD Energy: {mol_data.ccsd_energy:.8f} Ha")
+    if mol_data.ccsd_t_energy:
+        print(f"  CCSD(T) Energy: {mol_data.ccsd_t_energy:.8f} Ha")
 
-    # Determine reference energy
+    # Determine best available reference energy
+    # Priority: FCI > CCSD(T) > CCSD > HF
+    E_exact = mol_data.hf_energy
     energy_type = "HF"
+
+    # Try matrix-based FCI for small systems
     if n_valid <= 100000:
-        print("Computing FCI energy...")
+        print("Computing FCI energy (matrix-based)...")
         try:
             E_exact = H.fci_energy()
             energy_type = "FCI"
             print(f"  FCI Energy: {E_exact:.8f} Ha")
         except Exception as e:
-            print(f"  FCI failed: {e}")
+            print(f"  Matrix-based FCI failed: {e}")
+
+    # Try PySCF iterative FCI for medium-large systems (up to ~10M configs)
+    if energy_type != "FCI" and n_valid <= 15_000_000:
+        print(f"Computing FCI energy (PySCF iterative Davidson, {n_valid:,} determinants)...")
+        print(f"  This may take several minutes for large spaces...")
+        try:
+            t0 = time.time()
+            E_fci = compute_pyscf_fci(mol_data.geometry, mol_data.basis)
+            elapsed = time.time() - t0
+            E_exact = E_fci
+            energy_type = "FCI"
+            mol_data.fci_energy = E_fci
+            print(f"  PySCF FCI Energy: {E_exact:.8f} Ha (computed in {elapsed:.1f}s)")
+
+            # Show how CCSD and CCSD(T) compare to FCI
             if mol_data.ccsd_energy:
-                E_exact = mol_data.ccsd_energy
-                energy_type = "CCSD"
-                print(f"  Using CCSD Energy: {E_exact:.8f} Ha (reference)")
-            else:
-                E_exact = mol_data.hf_energy
-                print(f"  Using HF Energy: {E_exact:.8f} Ha (reference)")
-    else:
-        print("FCI not feasible...")
-        if mol_data.ccsd_energy:
+                ccsd_err = abs(mol_data.ccsd_energy - E_exact) * 1000
+                print(f"  CCSD error vs FCI: {ccsd_err:.4f} mHa")
+            if mol_data.ccsd_t_energy:
+                ccsd_t_err = abs(mol_data.ccsd_t_energy - E_exact) * 1000
+                print(f"  CCSD(T) error vs FCI: {ccsd_t_err:.4f} mHa")
+        except Exception as e:
+            print(f"  PySCF FCI failed: {e}")
+
+    # Fall back to CCSD(T) or CCSD if FCI not available
+    if energy_type != "FCI":
+        if mol_data.ccsd_t_energy:
+            E_exact = mol_data.ccsd_t_energy
+            energy_type = "CCSD(T)"
+            print(f"  Using CCSD(T) Energy: {E_exact:.8f} Ha (reference)")
+        elif mol_data.ccsd_energy:
             E_exact = mol_data.ccsd_energy
             energy_type = "CCSD"
             print(f"  Using CCSD Energy: {E_exact:.8f} Ha (reference)")
         else:
-            E_exact = mol_data.hf_energy
             print(f"  Using HF Energy: {E_exact:.8f} Ha (reference)")
 
     result = BenchmarkResult(
@@ -544,7 +645,7 @@ def run_benchmark(
     )
 
     # =======================================================================
-    # Step 1: NF-NQS Training
+    # Step 1: NF-NQS Training / Direct-CI
     # =======================================================================
     print("\n--- Step 1: NF-NQS Training ---")
 
@@ -573,9 +674,9 @@ def run_benchmark(
     result.nf_configs = len(nf_set)
     result.nf_energy = compute_basis_energy(H, nf_basis, check_asymmetry=True)
 
-    nf_error = abs(result.nf_energy - E_exact) * 1000
+    nf_comparison = format_energy_comparison(result.nf_energy, E_exact, energy_type)
     print(f"  NF found: {len(nf_set)} configs")
-    print(f"  NF energy: {result.nf_energy:.8f} Ha (error: {nf_error:.4f} mHa)")
+    print(f"  NF energy: {result.nf_energy:.8f} Ha ({nf_comparison})")
 
     # Diagnostic: compare training vs diagonalization energy
     if training_energy is not None:
@@ -591,15 +692,14 @@ def run_benchmark(
     # =======================================================================
     print("\n--- Step 2: Residual (PT2) Expansion ---")
 
-    # IMPORTANT: Do NOT set energy_lower_bound for large systems where
-    # reference is CCSD (not FCI). FCI energy CAN be below CCSD, so
-    # blocking expansion below CCSD prevents finding the true ground state.
-    # Only set a bound if the reference is FCI (exact).
+    # IMPORTANT: Only set energy_lower_bound if reference is FCI (exact).
+    # For CCSD/CCSD(T) references, our energy CAN and SHOULD go below them
+    # because FCI < CCSD(T) < CCSD for correlated systems.
     if energy_type == "FCI":
         energy_bound = E_exact - 1e-4  # Allow small numerical tolerance below FCI
         print(f"  Energy bound: {energy_bound:.6f} Ha (FCI - 0.1 mHa tolerance)")
     else:
-        energy_bound = None  # No bound for CCSD/HF reference
+        energy_bound = None  # No bound for CCSD/CCSD(T)/HF reference
         print(f"  Energy bound: NONE (reference is {energy_type}, not FCI)")
 
     residual_config = ResidualExpansionConfig(
@@ -639,11 +739,10 @@ def run_benchmark(
             expanded_basis = prev_basis
             variational_violation_detected = True
             break
-        elif energy_type != "FCI" and verbose:
-            error = abs(current_energy - E_exact) * 1000
-            print(f"    Iter {i+1}: E = {current_energy:.6f} Ha (error vs {energy_type}: {error:.2f} mHa)")
 
         if verbose:
+            comparison = format_energy_comparison(current_energy, E_exact, energy_type)
+            print(f"    Iter {i+1}: E = {current_energy:.6f} Ha ({comparison})")
             print(f"    Iter {i+1}: {old_size} -> {len(expanded_basis)} (+{added})")
 
     residual_set = configs_to_set(expanded_basis)
@@ -651,9 +750,9 @@ def run_benchmark(
     result.residual_new_configs = len(residual_new)
     result.nf_residual_energy = compute_basis_energy(H, expanded_basis)
 
-    residual_error = abs(result.nf_residual_energy - E_exact) * 1000
+    residual_comparison = format_energy_comparison(result.nf_residual_energy, E_exact, energy_type)
     print(f"  Residual found: {len(residual_new)} NEW configs")
-    print(f"  NF+Residual energy: {result.nf_residual_energy:.8f} Ha (error: {residual_error:.4f} mHa)")
+    print(f"  NF+Residual energy: {result.nf_residual_energy:.8f} Ha ({residual_comparison})")
 
     if variational_violation_detected:
         print(f"  NOTE: Expansion was stopped early due to variational violation!")
@@ -677,7 +776,10 @@ def run_benchmark(
     print(f"  Using params: krylov_dim={krylov_dim}, "
           f"dt={dt:.4f}, shots={shots_per_krylov:,}")
 
-    skqd = FlowGuidedSKQD(H, nf_basis, skqd_config)
+    # FIX: Use expanded_basis (NF + Residual) for Krylov, not just nf_basis.
+    # This ensures Krylov time evolution starts from the best available basis,
+    # and any new Krylov configs complement the residual expansion results.
+    skqd = FlowGuidedSKQD(H, expanded_basis, skqd_config)
     skqd_results = skqd.run_with_nf(max_krylov_dim=krylov_dim, progress=verbose)
 
     # Collect Krylov configs
@@ -688,21 +790,17 @@ def run_benchmark(
             config = tuple(int(b) for b in bitstring)
             krylov_set.add(config)
 
-    krylov_new = krylov_set - nf_set
+    krylov_new = krylov_set - residual_set
     result.krylov_new_configs = len(krylov_new)
 
-    # Compute NF+Krylov energy
-    nf_krylov_set = nf_set | krylov_set
-    nf_krylov_basis = set_to_configs(nf_krylov_set, H.num_sites, device)
-    result.nf_krylov_energy = compute_basis_energy(H, nf_krylov_basis)
+    # Compute Residual+Krylov energy (Krylov now builds on expanded basis)
+    residual_krylov_set = residual_set | krylov_set
+    residual_krylov_basis = set_to_configs(residual_krylov_set, H.num_sites, device)
+    result.nf_krylov_energy = compute_basis_energy(H, residual_krylov_basis)
 
-    nf_krylov_error = abs(result.nf_krylov_energy - E_exact) * 1000
-    print(f"  Krylov found: {len(krylov_new)} NEW configs")
-    print(f"  NF+Krylov energy: {result.nf_krylov_energy:.8f} Ha (error: {nf_krylov_error:.4f} mHa)")
-
-    # Note: Krylov is computed from NF-only basis. If the new configs don't
-    # improve NF+Krylov energy, it means they have negligible weight in the
-    # ground state wavefunction, which is expected behavior.
+    krylov_comparison = format_energy_comparison(result.nf_krylov_energy, E_exact, energy_type)
+    print(f"  Krylov found: {len(krylov_new)} NEW configs (beyond Residual)")
+    print(f"  Residual+Krylov energy: {result.nf_krylov_energy:.8f} Ha ({krylov_comparison})")
 
     # =======================================================================
     # Step 4: Krylov-Unique Analysis
@@ -715,14 +813,14 @@ def run_benchmark(
     print(f"  Krylov-UNIQUE configs: {len(krylov_unique)}")
     print(f"  (Found by Krylov but NOT by NF+Residual)")
 
-    # Combined energy
-    all_configs = nf_set | residual_set | krylov_set
+    # Combined energy = Residual + Krylov (same as above since NF is subset of Residual)
+    all_configs = residual_set | krylov_set
     all_basis = set_to_configs(all_configs, H.num_sites, device)
     result.combined_energy = compute_basis_energy(H, all_basis)
 
-    combined_error = abs(result.combined_energy - E_exact) * 1000
+    combined_comparison = format_energy_comparison(result.combined_energy, E_exact, energy_type)
     print(f"  Combined basis: {len(all_configs)} configs")
-    print(f"  Combined energy: {result.combined_energy:.8f} Ha (error: {combined_error:.4f} mHa)")
+    print(f"  Combined energy: {result.combined_energy:.8f} Ha ({combined_comparison})")
 
     # =======================================================================
     # Step 5: Verdict
@@ -753,10 +851,18 @@ def run_benchmark(
     print(f"{'='*70}")
     print(f"  Qubits: {n_qubits}")
     print(f"  Valid Configs: {n_valid:,}")
+    print(f"  Reference: {energy_type} = {E_exact:.8f} Ha")
     print(f"  NF Configs: {result.nf_configs}")
     print(f"  Residual New: {result.residual_new_configs}")
     print(f"  Krylov New: {result.krylov_new_configs}")
     print(f"  Krylov-UNIQUE: {result.krylov_unique_configs}")
+    print(f"  Final Energy: {result.combined_energy:.8f} Ha")
+    final_comparison = format_energy_comparison(result.combined_energy, E_exact, energy_type)
+    print(f"  Accuracy: {final_comparison}")
+    if energy_type == "FCI":
+        error_mha = abs(result.combined_energy - E_exact) * 1000
+        chem_acc = "PASS" if error_mha < 1.6 else "FAIL"
+        print(f"  Chemical accuracy: {chem_acc} ({error_mha:.4f} mHa)")
     print(f"  SKQD Verdict: {result.verdict}")
     print(f"{'='*70}\n")
 
@@ -801,12 +907,12 @@ def main():
         print("\n" + "="*80)
         print("OVERALL RESULTS SUMMARY")
         print("="*80)
-        print(f"\n{'System':<20} {'Qubits':>8} {'Valid':>15} {'Krylov-Unique':>15} {'Verdict':<12}")
+        print(f"\n{'System':<20} {'Qubits':>8} {'Valid':>15} {'Ref':>8} {'Krylov-Unique':>15} {'Verdict':<12}")
         print("-"*80)
 
         for r in all_results:
             print(f"{r.system:<20} {r.n_qubits:>8} {r.n_valid_configs:>15,} "
-                  f"{r.krylov_unique_configs:>15} {r.verdict:<12}")
+                  f"{r.energy_type:>8} {r.krylov_unique_configs:>15} {r.verdict:<12}")
 
         print("-"*80)
 
