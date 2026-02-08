@@ -75,7 +75,7 @@ class SKQDConfig:
 
     # === KRYLOV SAMPLING LIMITS ===
     # Maximum new configurations to add per Krylov step
-    max_new_configs_per_krylov_step: int = 5000
+    max_new_configs_per_krylov_step: int = 1000
 
     # Fraction of basis to sample when finding connected configs
     # Higher values = more thorough exploration but slower
@@ -1277,6 +1277,7 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
         self.krylov_samples = []
         self._nf_guided_psi = None  # For importance-weighted exploration
+        H_subspace_cached = None  # Cache H when basis is frozen (expansion capped)
 
         iterator = range(max_krylov_dim)
         if progress:
@@ -1293,10 +1294,11 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             if k < max_krylov_dim - 1:
                 # Check if we've hit the expansion cap
                 if max_expansion > 0 and len(current_basis) >= max_expansion:
-                    # Skip expansion but still do time evolution in current subspace
-                    H_subspace = self._build_hamiltonian_in_basis(current_basis)
+                    # Basis is frozen — reuse cached H to avoid expensive rebuild
+                    if H_subspace_cached is None:
+                        H_subspace_cached = self._build_hamiltonian_in_basis(current_basis)
                     t = -1j * self.time_step
-                    psi = expm_multiply(t * H_subspace, psi)
+                    psi = expm_multiply(t * H_subspace_cached, psi)
                     psi = psi / np.linalg.norm(psi)
                     continue
 
