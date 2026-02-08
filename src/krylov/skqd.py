@@ -84,6 +84,11 @@ class SKQDConfig:
     # Minimum number of basis states to sample regardless of fraction
     min_krylov_basis_sample: int = 1000
 
+    # Maximum basis size for dense diagonalization in compute_ground_state_energy().
+    # If combined basis exceeds this, only the top configs (by energy importance)
+    # are used for diagonalization. Set to 0 to disable (no cap).
+    max_diag_basis_size: int = 15000
+
 
 class SampleBasedKrylovDiagonalization:
     """
@@ -979,6 +984,15 @@ class SampleBasedKrylovDiagonalization:
             cumulative = self.build_cumulative_basis()
             basis = self.get_basis_states(len(self.krylov_samples) - 1)
 
+        # Cap basis size to avoid building huge dense matrices (N^2 memory)
+        max_diag = self.config.max_diag_basis_size
+        if max_diag > 0 and len(basis) > max_diag:
+            # Keep first max_diag configs — pipeline orders by importance:
+            # essential configs (HF+singles+doubles) first, then PT2-ranked residual
+            original_size = len(basis)
+            basis = basis[:max_diag]
+            print(f"  Capped basis from {original_size} to {max_diag} configs for diagonalization")
+
         # Build projected Hamiltonian (stays on GPU)
         H_proj = self.hamiltonian.matrix_elements(basis, basis)
         n = H_proj.shape[0]
@@ -1250,7 +1264,12 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         # Create index mapping
         basis_set = {tuple(c.cpu().tolist()) for c in current_basis}
 
-        print(f"NF-guided Krylov: Starting with {n_initial} NF configs")
+        # Cap total expansion to max_diag_basis_size to avoid huge matrix builds
+        max_expansion = self.config.max_diag_basis_size
+        if max_expansion > 0:
+            print(f"NF-guided Krylov: Starting with {n_initial} NF configs (max expansion: {max_expansion})")
+        else:
+            print(f"NF-guided Krylov: Starting with {n_initial} NF configs")
 
         # Initialize state: uniform superposition over NF basis
         n_subspace = len(current_basis)
@@ -1272,8 +1291,25 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             self.krylov_samples.append(samples)
 
             if k < max_krylov_dim - 1:
+                # Check if we've hit the expansion cap
+                if max_expansion > 0 and len(current_basis) >= max_expansion:
+                    # Skip expansion but still do time evolution in current subspace
+                    H_subspace = self._build_hamiltonian_in_basis(current_basis)
+                    t = -1j * self.time_step
+                    psi = expm_multiply(t * H_subspace, psi)
+                    psi = psi / np.linalg.norm(psi)
+                    continue
+
                 # Expand subspace by finding connected configurations
                 new_configs = self._find_connected_configs(current_basis, basis_set)
+
+                # Trim new configs if they'd exceed the cap
+                if max_expansion > 0 and len(new_configs) > 0:
+                    room = max_expansion - len(current_basis)
+                    if room <= 0:
+                        new_configs = new_configs[:0]  # Empty tensor
+                    elif len(new_configs) > room:
+                        new_configs = new_configs[:room]
 
                 if len(new_configs) > 0:
                     # Add new configs to basis

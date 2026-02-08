@@ -762,45 +762,56 @@ def run_benchmark(
     # =======================================================================
     print("\n--- Step 3: Krylov Time Evolution ---")
 
-    # SKQD parameters - FlowGuidedSKQD automatically uses NF-guided mode for large systems
-    krylov_dim = 8
-    dt = 0.1
-    shots_per_krylov = 50000
+    # Check if residual expansion already achieved chemical accuracy
+    residual_error_mha = abs(result.nf_residual_energy - E_exact) * 1000 if energy_type == "FCI" else None
+    skip_krylov = residual_error_mha is not None and residual_error_mha < 1.0
 
-    skqd_config = SKQDConfig(
-        max_krylov_dim=krylov_dim,
-        time_step=dt,
-        shots_per_krylov=shots_per_krylov,
-    )
+    if skip_krylov:
+        print(f"  Residual expansion achieved {residual_error_mha:.2f} mHa error vs FCI.")
+        print(f"  Skipping Krylov time evolution (already within chemical accuracy).")
+        result.krylov_new_configs = 0
+        result.nf_krylov_energy = result.nf_residual_energy
+        krylov_set = set()
+    else:
+        # SKQD parameters - FlowGuidedSKQD automatically uses NF-guided mode for large systems
+        krylov_dim = 8
+        dt = 0.1
+        shots_per_krylov = 50000
 
-    print(f"  Using params: krylov_dim={krylov_dim}, "
-          f"dt={dt:.4f}, shots={shots_per_krylov:,}")
+        skqd_config = SKQDConfig(
+            max_krylov_dim=krylov_dim,
+            time_step=dt,
+            shots_per_krylov=shots_per_krylov,
+        )
 
-    # FIX: Use expanded_basis (NF + Residual) for Krylov, not just nf_basis.
-    # This ensures Krylov time evolution starts from the best available basis,
-    # and any new Krylov configs complement the residual expansion results.
-    skqd = FlowGuidedSKQD(H, expanded_basis, skqd_config)
-    skqd_results = skqd.run_with_nf(max_krylov_dim=krylov_dim, progress=verbose)
+        print(f"  Using params: krylov_dim={krylov_dim}, "
+              f"dt={dt:.4f}, shots={shots_per_krylov:,}")
 
-    # Collect Krylov configs
-    krylov_set = set()
-    cumulative = skqd.build_cumulative_basis()
-    if cumulative:
-        for bitstring in cumulative[-1].keys():
-            config = tuple(int(b) for b in bitstring)
-            krylov_set.add(config)
+        # FIX: Use expanded_basis (NF + Residual) for Krylov, not just nf_basis.
+        # This ensures Krylov time evolution starts from the best available basis,
+        # and any new Krylov configs complement the residual expansion results.
+        skqd = FlowGuidedSKQD(H, expanded_basis, skqd_config)
+        skqd_results = skqd.run_with_nf(max_krylov_dim=krylov_dim, progress=verbose)
 
-    krylov_new = krylov_set - residual_set
-    result.krylov_new_configs = len(krylov_new)
+        # Collect Krylov configs
+        krylov_set = set()
+        cumulative = skqd.build_cumulative_basis()
+        if cumulative:
+            for bitstring in cumulative[-1].keys():
+                config = tuple(int(b) for b in bitstring)
+                krylov_set.add(config)
 
-    # Compute Residual+Krylov energy (Krylov now builds on expanded basis)
-    residual_krylov_set = residual_set | krylov_set
-    residual_krylov_basis = set_to_configs(residual_krylov_set, H.num_sites, device)
-    result.nf_krylov_energy = compute_basis_energy(H, residual_krylov_basis)
+        krylov_new = krylov_set - residual_set
+        result.krylov_new_configs = len(krylov_new)
 
-    krylov_comparison = format_energy_comparison(result.nf_krylov_energy, E_exact, energy_type)
-    print(f"  Krylov found: {len(krylov_new)} NEW configs (beyond Residual)")
-    print(f"  Residual+Krylov energy: {result.nf_krylov_energy:.8f} Ha ({krylov_comparison})")
+        # Compute Residual+Krylov energy (Krylov now builds on expanded basis)
+        residual_krylov_set = residual_set | krylov_set
+        residual_krylov_basis = set_to_configs(residual_krylov_set, H.num_sites, device)
+        result.nf_krylov_energy = compute_basis_energy(H, residual_krylov_basis)
+
+        krylov_comparison = format_energy_comparison(result.nf_krylov_energy, E_exact, energy_type)
+        print(f"  Krylov found: {len(krylov_new)} NEW configs (beyond Residual)")
+        print(f"  Residual+Krylov energy: {result.nf_krylov_energy:.8f} Ha ({krylov_comparison})")
 
     # =======================================================================
     # Step 4: Krylov-Unique Analysis
