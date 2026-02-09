@@ -301,6 +301,10 @@ class PipelineConfig:
             self.diagonal_only_warmup_epochs = 0  # Full energy from epoch 1
             self.stochastic_connections_fraction = 1.0  # Use all connections
 
+            # Reduce Krylov dimension for large systems to avoid expensive sampling
+            # Per-dimension diagnostics are skipped anyway for large bases (>10k)
+            self.max_krylov_dim = 4  # Reduced from 8 for large systems
+
         # Compute coverage statistics
         coverage_accumulated = min(1.0, self.max_accumulated_basis / n_valid_configs)
         coverage_diverse = min(1.0, self.max_diverse_configs / n_valid_configs)

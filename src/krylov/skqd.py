@@ -1564,51 +1564,78 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         best_basis_size = len(self.nf_basis)
         instability_detected = False
 
-        for k in range(1, max_krylov_dim):
-            # Krylov only
+        # For large systems (>10k configs), skip per-dimension diagnostics
+        # and only compute final energy to avoid expensive matrix builds
+        skip_diagnostics = len(self.nf_basis) > 10000
+        if skip_diagnostics:
+            print(f"Large basis ({len(self.nf_basis)} configs): skipping per-dimension energy computation")
+            # Only compute final energy at last Krylov dimension
+            k = max_krylov_dim - 1
+            print(f"Computing final combined energy (k={k+1})...")
             krylov_basis = self.get_basis_states(k, cumulative=True)
-            E_krylov, _ = self.compute_ground_state_energy(
-                krylov_basis,
-                regularization=self.config.regularization
-            )
-
-            # Combined: NF basis + Krylov-discovered configs
             combined_basis = self.get_combined_basis(k, include_nf=True)
+            print(f"  Building Hamiltonian for {len(combined_basis)} configs...")
             E_combined, _ = self.compute_ground_state_energy(
                 combined_basis,
                 regularization=self.config.regularization
             )
-
-            # VARIATIONAL CHECK: Energy should decrease or stay same as basis grows
-            # If energy increases, likely numerical instability
-            if k > 1 and len(results["energies_combined"]) > 0:
-                prev_energy = results["energies_combined"][-1]
-                energy_change = E_combined - prev_energy
-
-                # Energy should not increase significantly
-                if energy_change > 0.001:  # 1 mHa tolerance
-                    warning = f"k={k+1}: Energy increased by {energy_change*1000:.4f} mHa (numerical instability)"
-                    results["numerical_warnings"].append(warning)
-                    print(f"WARNING: {warning}")
-                    instability_detected = True
-
-                # Large energy jumps can indicate numerical instability
-                if abs(energy_change) > 1.0:  # 1 Ha is suspicious for Krylov refinement
-                    warning = f"k={k+1}: Large energy jump {abs(energy_change):.4f} Ha"
-                    results["numerical_warnings"].append(warning)
-                    print(f"WARNING: {warning}")
-                    instability_detected = True
-
-            # Track best valid energy (variational principle)
-            if E_combined < best_energy:
-                best_energy = E_combined
-                best_basis_size = len(combined_basis)
+            print(f"  Final energy: {E_combined:.8f} Ha")
 
             results["krylov_dims"].append(k + 1)
-            results["energies_krylov"].append(E_krylov)
+            results["energies_krylov"].append(E_combined)  # Use combined for both
             results["energies_combined"].append(E_combined)
             results["basis_sizes_krylov"].append(len(krylov_basis))
             results["basis_sizes_combined"].append(len(combined_basis))
+
+            best_energy = E_combined
+            best_basis_size = len(combined_basis)
+        else:
+            # Standard path for smaller systems: compute energy at each Krylov dimension
+            for k in range(1, max_krylov_dim):
+                # Krylov only
+                krylov_basis = self.get_basis_states(k, cumulative=True)
+                E_krylov, _ = self.compute_ground_state_energy(
+                    krylov_basis,
+                    regularization=self.config.regularization
+                )
+
+                # Combined: NF basis + Krylov-discovered configs
+                combined_basis = self.get_combined_basis(k, include_nf=True)
+                E_combined, _ = self.compute_ground_state_energy(
+                    combined_basis,
+                    regularization=self.config.regularization
+                )
+
+                # VARIATIONAL CHECK: Energy should decrease or stay same as basis grows
+                # If energy increases, likely numerical instability
+                if k > 1 and len(results["energies_combined"]) > 0:
+                    prev_energy = results["energies_combined"][-1]
+                    energy_change = E_combined - prev_energy
+
+                    # Energy should not increase significantly
+                    if energy_change > 0.001:  # 1 mHa tolerance
+                        warning = f"k={k+1}: Energy increased by {energy_change*1000:.4f} mHa (numerical instability)"
+                        results["numerical_warnings"].append(warning)
+                        print(f"WARNING: {warning}")
+                        instability_detected = True
+
+                    # Large energy jumps can indicate numerical instability
+                    if abs(energy_change) > 1.0:  # 1 Ha is suspicious for Krylov refinement
+                        warning = f"k={k+1}: Large energy jump {abs(energy_change):.4f} Ha"
+                        results["numerical_warnings"].append(warning)
+                        print(f"WARNING: {warning}")
+                        instability_detected = True
+
+                # Track best valid energy (variational principle)
+                if E_combined < best_energy:
+                    best_energy = E_combined
+                    best_basis_size = len(combined_basis)
+
+                results["krylov_dims"].append(k + 1)
+                results["energies_krylov"].append(E_krylov)
+                results["energies_combined"].append(E_combined)
+                results["basis_sizes_krylov"].append(len(krylov_basis))
+                results["basis_sizes_combined"].append(len(combined_basis))
 
         # Report statistics on Krylov contribution
         if results["energies_combined"]:
