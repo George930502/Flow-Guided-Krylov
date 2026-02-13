@@ -3,13 +3,13 @@ Flow-Guided Krylov Pipeline for Molecular Ground State Energy Calculation.
 
 This module provides an end-to-end pipeline that combines:
 1. Normalizing Flow-Assisted Neural Quantum States (NF-NQS) for basis discovery
-2. Sample-Based Krylov Quantum Diagonalization (SKQD) for energy refinement
+2. Subspace diagonalization via SKQD (Krylov) or SQD (sampling-based)
 
 Key Features:
 - Particle Conservation: Samples valid molecular configurations only
 - Physics-Guided Training: Mixed objective with energy importance
 - Diversity Selection: Excitation-rank stratified basis selection
-- Residual Expansion: Selected-CI style basis recovery
+- Dual subspace mode: SKQD (Krylov time evolution) or SQD (batch diagonalization)
 - Adaptive Scaling: Automatic parameter adjustment for system size
 
 Usage:
@@ -86,29 +86,21 @@ except ImportError:
         adaptive_eigensolver,
     )
 
-# Krylov components
+# Krylov / subspace diagonalization components
 try:
-    from .krylov.residual_expansion import (
-        ResidualBasedExpander,
-        ResidualExpansionConfig,
-        iterative_residual_expansion,
-    )
     from .krylov.skqd import (
         SampleBasedKrylovDiagonalization,
         FlowGuidedSKQD,
         SKQDConfig,
     )
+    from .krylov.sqd import SQDSolver, SQDConfig
 except ImportError:
-    from krylov.residual_expansion import (
-        ResidualBasedExpander,
-        ResidualExpansionConfig,
-        iterative_residual_expansion,
-    )
     from krylov.skqd import (
         SampleBasedKrylovDiagonalization,
         FlowGuidedSKQD,
         SKQDConfig,
     )
+    from krylov.sqd import SQDSolver, SQDConfig
 
 
 @dataclass
@@ -152,14 +144,16 @@ class PipelineConfig:
     max_diverse_configs: int = 2048  # Base value, scaled automatically
     rank_2_fraction: float = 0.50  # Emphasize double excitations
 
-    # Residual expansion - ADAPTIVE: scaled by system size
-    use_residual_expansion: bool = True
-    residual_iterations: int = 8
-    residual_configs_per_iter: int = 150
-    residual_threshold: float = 1e-6
-    use_perturbative_selection: bool = True  # Use 2nd-order PT for selection
+    # Subspace diagonalization mode
+    subspace_mode: str = "skqd"  # "skqd" (Krylov time evolution) or "sqd" (SQD sampling-based)
 
-    # SKQD parameters
+    # SQD-specific parameters (used when subspace_mode="sqd")
+    sqd_num_batches: int = 5           # K batches for independent diagonalization
+    sqd_batch_size: int = 0            # d configs per batch (0 = auto from NF samples)
+    sqd_self_consistent_iters: int = 3 # Self-consistent config recovery iterations
+    sqd_spin_penalty: float = 0.0      # Lambda for S^2 penalty (0 = disabled)
+
+    # SKQD parameters (used when subspace_mode="skqd")
     max_krylov_dim: int = 8
     time_step: float = 0.1
     shots_per_krylov: int = 50000
@@ -175,8 +169,7 @@ class PipelineConfig:
     davidson_threshold: int = 500  # Use Davidson for bases larger than this
 
     # Direct-CI mode: skip NF-NQS training entirely
-    # When True, pipeline goes directly from essential config generation → residual expansion → SKQD
-    # For molecular systems, essential configs (HF + singles + doubles) already dominate the ground state
+    # When True, pipeline uses essential configs (HF + singles + doubles) → subspace diagonalization
     skip_nf_training: bool = False
 
     # Hardware
@@ -223,8 +216,7 @@ class PipelineConfig:
             tier = "very_large"
 
         # For molecular systems, skip NF training by default (Direct-CI mode)
-        # Essential configs (HF + singles + doubles) + residual expansion reach exact FCI
-        # NF training adds significant overhead with no energy improvement
+        # Essential configs (HF + singles + doubles) provide a strong initial basis
         self.skip_nf_training = True
 
         if verbose:
@@ -241,69 +233,51 @@ class PipelineConfig:
             # Medium systems: need more basis coverage
             self.max_accumulated_basis = min(n_valid_configs, 8192)
             self.max_diverse_configs = min(n_valid_configs, 4096)
-            self.residual_iterations = max(self.residual_iterations, 10)
-            self.residual_configs_per_iter = max(self.residual_configs_per_iter, 200)
             # Larger networks for more complex systems
             if len(self.nqs_hidden_dims) < 5:
                 self.nqs_hidden_dims = [384, 384, 384, 384, 384]
+            # SQD: more batches for better statistics
+            if self.subspace_mode == "sqd":
+                self.sqd_num_batches = max(self.sqd_num_batches, 8)
 
         elif tier == "large":
             # Large systems: aggressive basis collection
             self.max_accumulated_basis = min(n_valid_configs, 12288)
             self.max_diverse_configs = min(n_valid_configs, 8192)
-            self.residual_iterations = 15
-            self.residual_configs_per_iter = 300
-            self.residual_threshold = 1e-7
-            self.use_perturbative_selection = True
-            # Even larger networks
+            # Larger networks
             self.nqs_hidden_dims = [512, 512, 512, 512, 512]
             # More training
             self.max_epochs = max(self.max_epochs, 600)
             self.samples_per_batch = 4000
+            # SQD: more batches
+            if self.subspace_mode == "sqd":
+                self.sqd_num_batches = max(self.sqd_num_batches, 10)
 
         else:  # very_large
             # Very large systems (>20K valid configs, e.g. C2H4 with 9M)
-            #
-            # KEY INSIGHT: For very large systems, NF cannot efficiently explore
-            # the ground state region. Instead, we rely on:
-            # 1. Essential config injection (HF + singles + doubles) for subspace energy
-            # 2. Short NF training to learn nearby configurations
-            # 3. Aggressive residual expansion (Selected-CI) as the primary basis builder
-            # 4. Krylov for supplementary discovery
-            #
-            # Previous approach (800 epochs, performance hacks) wasted hours while
-            # NF explored wrong Hilbert space region. New approach: short training,
-            # full energy signal, then rely on CI expansion.
-
             self.max_accumulated_basis = 16384
             self.max_diverse_configs = min(n_valid_configs, 12288)
-            self.residual_iterations = 20
-            self.residual_configs_per_iter = 500
-            self.residual_threshold = 1e-8
-            self.use_perturbative_selection = True
 
             # Network capacity
             self.nqs_hidden_dims = [512, 512, 512, 512]
             self.nf_hidden_dims = [256, 256]
 
             # SHORT training: NF serves as warm-start, not primary basis builder
-            # Essential configs provide the energy signal; NF explores neighborhood
             self.max_epochs = max(self.max_epochs, 200)
             self.min_epochs = max(self.min_epochs, 50)
             self.samples_per_batch = 2000
 
             # IMPORTANT: Do NOT use performance hacks that cripple the energy signal
-            # - No connection truncation (loses important doubles)
-            # - No diagonal-only warmup (delays real energy signal)
-            # - No stochastic connections (adds noise to already weak signal)
-            # The essential config injection makes subspace energy fast enough
-            self.max_connections_per_config = 0  # Use all connections
-            self.diagonal_only_warmup_epochs = 0  # Full energy from epoch 1
-            self.stochastic_connections_fraction = 1.0  # Use all connections
+            self.max_connections_per_config = 0
+            self.diagonal_only_warmup_epochs = 0
+            self.stochastic_connections_fraction = 1.0
 
-            # Reduce Krylov dimension for large systems to avoid expensive sampling
-            # Per-dimension diagnostics are skipped anyway for large bases (>10k)
-            self.max_krylov_dim = 4  # Reduced from 8 for large systems
+            # Reduce Krylov dimension for large systems
+            self.max_krylov_dim = 4
+
+            # SQD: more batches for large systems
+            if self.subspace_mode == "sqd":
+                self.sqd_num_batches = max(self.sqd_num_batches, 10)
 
         # Compute coverage statistics
         coverage_accumulated = min(1.0, self.max_accumulated_basis / n_valid_configs)
@@ -311,10 +285,9 @@ class PipelineConfig:
 
         if verbose:
             print(f"Adapted parameters:")
+            print(f"  subspace_mode: {self.subspace_mode}")
             print(f"  max_accumulated_basis: {self.max_accumulated_basis:,} ({coverage_accumulated*100:.1f}% of valid)")
             print(f"  max_diverse_configs: {self.max_diverse_configs:,} ({coverage_diverse*100:.1f}% of valid)")
-            print(f"  residual_iterations: {self.residual_iterations}")
-            print(f"  residual_configs_per_iter: {self.residual_configs_per_iter}")
             print(f"  NQS hidden dims: {self.nqs_hidden_dims}")
 
         # Mark as adapted to prevent duplicate adaptation
@@ -325,20 +298,18 @@ class PipelineConfig:
 
 class FlowGuidedKrylovPipeline:
     """
-    Flow-Guided Krylov Pipeline for ground state energy computation.
+    Flow-Guided Pipeline for ground state energy computation.
 
     This pipeline combines:
     1. Particle-conserving normalizing flow for valid molecular configurations
     2. Physics-guided NF-NQS co-training with mixed objective
     3. Diversity-aware basis selection by excitation rank
-    4. Residual-based (Selected-CI style) basis expansion
-    5. SKQD refinement with Krylov subspace methods
+    4. Subspace diagonalization via SKQD (Krylov) or SQD (sampling-based)
 
     The workflow is:
     - Stage 1: Physics-guided NF-NQS training (discovers ground state support)
     - Stage 2: Diversity-aware basis extraction (stratified by excitation rank)
-    - Stage 3: Residual expansion (recovers missing important configurations)
-    - Stage 4: SKQD refinement (Krylov subspace diagonalization)
+    - Stage 3: Subspace diagonalization (SKQD or SQD)
 
     Example usage:
     ```python
@@ -684,230 +655,36 @@ class FlowGuidedKrylovPipeline:
 
         return selected_basis
 
-    def run_residual_expansion(self) -> torch.Tensor:
+    def run_subspace_diag(self, progress: bool = True) -> Dict[str, Any]:
         """
-        Stage 3: Expand basis using residual/perturbative analysis.
+        Stage 3: Subspace diagonalization via SKQD or SQD.
 
-        Uses Selected-CI style expansion that iteratively adds configurations
-        with the largest contributions to the ground state.
-
-        Includes early stopping when energy improvement stagnates.
+        Mode "skqd": Krylov time evolution expands the NF basis, then diagonalizes.
+        Mode "sqd": SQD sampling-based batch diagonalization with self-consistent
+                    configuration recovery (following the IBM quantum-centric paper).
         """
-        if not self.config.use_residual_expansion:
-            return self.nf_basis
+        cfg = self.config
+        nf_basis = self.nf_basis
 
+        if cfg.subspace_mode == "sqd":
+            return self._run_sqd(nf_basis, progress)
+        else:
+            return self._run_skqd(nf_basis, progress)
+
+    def _run_skqd(self, nf_basis: torch.Tensor, progress: bool = True) -> Dict[str, Any]:
+        """Run SKQD (Krylov time evolution) subspace diagonalization."""
         print("=" * 60)
-        print("Stage 3: Residual-Based Basis Expansion")
+        print("Stage 3: Sample-Based Krylov Quantum Diagonalization (SKQD)")
         print("=" * 60)
 
         cfg = self.config
 
-        # Early stopping parameters
-        min_improvement_mha = 0.05  # Stop if improvement < 0.05 mHa
-        stagnation_patience = 2  # Stop after 2 consecutive stagnant iterations
+        # Check if SKQD is disabled
+        if cfg.skip_skqd or cfg.max_krylov_dim <= 0:
+            print("SKQD disabled, computing direct diagonalization...")
+            return self._direct_diagonalize(nf_basis)
 
-        # Configure residual expansion based on system size
-        residual_config = ResidualExpansionConfig(
-            max_configs_per_iter=cfg.residual_configs_per_iter,
-            max_iterations=cfg.residual_iterations,
-            residual_threshold=cfg.residual_threshold,
-            max_basis_size=min(cfg.max_accumulated_basis * 2, self.n_valid_configs),
-            use_importance_sampling=True,
-            min_energy_improvement_mha=min_improvement_mha,
-            stagnation_patience=stagnation_patience,
-        )
-
-        # Use perturbative selection for better importance estimation
-        if cfg.use_perturbative_selection:
-            from krylov.residual_expansion import SelectedCIExpander
-            print("Using perturbative (2nd-order PT) selection for configuration importance")
-            print(f"Early stopping: improvement < {min_improvement_mha} mHa for {stagnation_patience} iterations")
-
-            expander = SelectedCIExpander(self.hamiltonian, residual_config)
-
-            # Run multiple rounds of expansion
-            expanded_basis = self.nf_basis.clone()
-            total_added = 0
-            initial_energy = None
-            prev_energy = None
-            stagnant_count = 0
-
-            best_energy = None
-            best_basis = expanded_basis.clone()
-
-            for iteration in range(cfg.residual_iterations):
-                old_size = len(expanded_basis)
-                expanded_basis, expand_stats = expander.expand_basis(expanded_basis)
-
-                current_energy = expand_stats['final_energy']
-
-                if initial_energy is None:
-                    initial_energy = expand_stats.get('initial_energy', current_energy)
-
-                # Track best energy and basis (variational principle)
-                if best_energy is None or current_energy < best_energy:
-                    best_energy = current_energy
-                    best_basis = expanded_basis.clone()
-
-                added = expand_stats['configs_added']
-                total_added += added
-
-                # Check for variational violation
-                if expand_stats.get('variational_violation', False):
-                    rejected_mha = expand_stats.get('rejected_increase_mha', 0)
-                    print(f"  Iter {iteration+1}: Rejected configs (would increase E by {rejected_mha:.4f} mHa)")
-                    stagnant_count += 1
-                    if stagnant_count >= stagnation_patience:
-                        print(f"  Converged: no improvement for {stagnation_patience} iterations")
-                        break
-                    continue
-
-                # Calculate energy improvement
-                if prev_energy is not None:
-                    improvement_mha = (prev_energy - current_energy) * 1000
-                    print(f"  Iter {iteration+1}: {old_size} -> {len(expanded_basis)} "
-                          f"(+{added}), E = {current_energy:.6f}, ΔE = {improvement_mha:.4f} mHa")
-
-                    # Check for stagnation
-                    if improvement_mha < min_improvement_mha:
-                        stagnant_count += 1
-                        if stagnant_count >= stagnation_patience:
-                            print(f"  Converged: energy improvement < {min_improvement_mha} mHa "
-                                  f"for {stagnation_patience} consecutive iterations")
-                            break
-                    else:
-                        stagnant_count = 0  # Reset stagnation counter
-                else:
-                    print(f"  Iter {iteration+1}: {old_size} -> {len(expanded_basis)} "
-                          f"(+{added}), E = {current_energy:.6f}")
-
-                prev_energy = current_energy
-
-                # Early termination if no new configs added
-                if added == 0:
-                    print("  Converged: no new configurations found")
-                    break
-
-                # Check if we've reached max basis size
-                if len(expanded_basis) >= residual_config.max_basis_size:
-                    print(f"  Reached max basis size: {residual_config.max_basis_size}")
-                    break
-
-            # Use best basis (ensures variational principle is respected)
-            expanded_basis = best_basis
-
-            expand_stats = {
-                'initial_basis_size': len(self.nf_basis),
-                'final_basis_size': len(expanded_basis),
-                'configs_added_total': total_added,
-                'iterations': iteration + 1,
-                'initial_energy': initial_energy,
-                'final_energy': best_energy if best_energy is not None else current_energy,
-                'converged_early': stagnant_count >= stagnation_patience,
-            }
-        else:
-            # Standard residual-based expansion
-            expander = ResidualBasedExpander(self.hamiltonian, residual_config)
-            expanded_basis, expand_stats = expander.expand_basis(self.nf_basis)
-
-        print(f"Expanded: {expand_stats['initial_basis_size']} -> {expand_stats['final_basis_size']}")
-        if expand_stats.get('initial_energy') is not None:
-            total_improvement_mha = (expand_stats['initial_energy'] - expand_stats['final_energy']) * 1000
-            print(f"Energy improvement: {expand_stats['initial_energy']:.6f} -> "
-                  f"{expand_stats['final_energy']:.6f} ({total_improvement_mha:.2f} mHa)")
-        else:
-            print(f"Final energy: {expand_stats['final_energy']:.6f}")
-
-        self.results["residual_expansion_stats"] = expand_stats
-        self.results["residual_energy"] = expand_stats['final_energy']
-        self.expanded_basis = expanded_basis
-
-        return expanded_basis
-
-    def run_skqd(self, progress: bool = True) -> Dict[str, Any]:
-        """
-        Stage 4: SKQD refinement with combined basis.
-
-        For small bases where residual expansion already achieved near-exact
-        energy, SKQD may introduce numerical instability. In such cases,
-        we use the residual expansion result directly.
-
-        Includes improved numerical stability handling:
-        - Uses regularization for ill-conditioned matrices
-        - Validates SKQD energy is variationally consistent
-        - Falls back to residual result if SKQD produces impossible results
-        """
-        print("=" * 60)
-        print("Stage 4: Sample-Based Krylov Quantum Diagonalization")
-        print("=" * 60)
-
-        cfg = self.config
-
-        # Use expanded basis if available
-        if hasattr(self, 'expanded_basis'):
-            nf_basis = self.expanded_basis
-        else:
-            nf_basis = self.nf_basis
-
-        # Get residual expansion energy if available
-        residual_energy = self.results.get("residual_energy", None)
-
-        # For small bases where residual expansion converged well,
-        # skip SKQD to avoid numerical instability
-        skip_skqd = False
-
-        # Check if SKQD is disabled by config
-        if cfg.skip_skqd:
-            print("SKQD disabled (skip_skqd=True)")
-            skip_skqd = True
-
-        if cfg.max_krylov_dim <= 0:
-            print("SKQD disabled (max_krylov_dim=0)")
-            skip_skqd = True
-
-        if residual_energy is not None and self.exact_energy is not None:
-            residual_error_mha = abs(residual_energy - self.exact_energy) * 1000
-            # If residual expansion already within 1 mHa, use it directly
-            if residual_error_mha < 1.0:
-                print(f"Residual expansion achieved {residual_error_mha:.4f} mHa error.")
-                print("Skipping SKQD to avoid numerical instability.")
-                skip_skqd = True
-
-        # Skip for very small bases if residual already converged well
-        if len(nf_basis) < 300 and residual_energy is not None:
-            if self.exact_energy is not None:
-                error_mha = abs(residual_energy - self.exact_energy) * 1000
-                if error_mha < 2.0:  # Within 2 mHa
-                    print(f"Basis size ({len(nf_basis)}) small and residual converged ({error_mha:.2f} mHa).")
-                    print("Skipping SKQD.")
-                    skip_skqd = True
-            else:
-                print(f"Basis size ({len(nf_basis)}) is small enough for direct diagonalization.")
-                skip_skqd = True
-
-        if skip_skqd:
-            # Compute NF basis energy if no residual energy available
-            if residual_energy is None:
-                print("Computing NF basis energy via direct diagonalization...")
-                H_matrix = self.hamiltonian.matrix_elements(nf_basis, nf_basis)
-                H_np = H_matrix.detach().cpu().numpy()
-                # Symmetrize for numerical stability
-                H_np = 0.5 * (H_np + H_np.T)
-                eigenvalues, _ = np.linalg.eigh(H_np)
-                nf_basis_energy = float(eigenvalues[0])
-                print(f"NF basis energy: {nf_basis_energy:.8f} Ha ({len(nf_basis)} configs)")
-                self.results["nf_basis_energy"] = nf_basis_energy
-                self.results["skqd_energy"] = nf_basis_energy
-                self.results["combined_energy"] = nf_basis_energy
-            else:
-                self.results["skqd_energy"] = residual_energy
-                self.results["combined_energy"] = residual_energy
-
-            self.results["skqd_skipped"] = True
-            final_energy = self.results.get("combined_energy", residual_energy)
-            return {"energies_combined": [final_energy], "skipped": True}
-
-        # Configure SKQD with regularization for numerical stability
+        # Configure SKQD
         skqd_config = SKQDConfig(
             max_krylov_dim=cfg.max_krylov_dim,
             time_step=cfg.time_step,
@@ -924,39 +701,68 @@ class FlowGuidedKrylovPipeline:
 
         results = skqd.run_with_nf(progress=progress)
 
-        # Use best stable energy from SKQD (handles numerical instability internally)
+        # Use best stable energy from SKQD
         skqd_energy = results.get("best_stable_energy", results["energies_combined"][-1])
 
         self.results["skqd_results"] = results
         self.results["skqd_energy"] = skqd_energy
 
-        # Validate energy is variationally consistent
-        if residual_energy is not None:
-            if self.exact_energy is not None:
-                # Check if SKQD energy is below exact (impossible for variational method)
-                if skqd_energy < self.exact_energy - 0.001:
-                    print(f"WARNING: SKQD energy ({skqd_energy:.6f}) is below exact ({self.exact_energy:.6f})!")
-                    print("This indicates numerical instability. Using residual expansion result.")
-                    self.results["combined_energy"] = residual_energy
-                    self.results["skqd_unstable"] = True
-                else:
-                    # Both are valid, use the lower (better) energy
-                    self.results["combined_energy"] = min(skqd_energy, residual_energy)
-            else:
-                # No exact reference, check if SKQD improved over residual
-                if skqd_energy < residual_energy:
-                    # SKQD improved energy - use it
-                    improvement_mha = (residual_energy - skqd_energy) * 1000
-                    print(f"SKQD improved energy by {improvement_mha:.4f} mHa")
-                    self.results["combined_energy"] = skqd_energy
-                else:
-                    # SKQD didn't help, use residual
-                    print("SKQD did not improve energy. Using residual expansion result.")
-                    self.results["combined_energy"] = residual_energy
-        else:
-            self.results["combined_energy"] = skqd_energy
+        # Variational consistency check
+        if self.exact_energy is not None and skqd_energy < self.exact_energy - 0.001:
+            print(f"WARNING: SKQD energy ({skqd_energy:.6f}) below exact ({self.exact_energy:.6f})!")
+            print("Numerical instability detected. Falling back to direct diagonalization.")
+            return self._direct_diagonalize(nf_basis)
 
+        self.results["combined_energy"] = skqd_energy
         return results
+
+    def _run_sqd(self, nf_basis: torch.Tensor, progress: bool = True) -> Dict[str, Any]:
+        """Run SQD (sampling-based) subspace diagonalization."""
+        print("=" * 60)
+        print("Stage 3: Sample-Based Quantum Diagonalization (SQD)")
+        print("=" * 60)
+
+        cfg = self.config
+
+        sqd_config = SQDConfig(
+            num_batches=cfg.sqd_num_batches,
+            batch_size=cfg.sqd_batch_size,
+            self_consistent_iters=cfg.sqd_self_consistent_iters,
+            spin_penalty=cfg.sqd_spin_penalty,
+        )
+
+        solver = SQDSolver(
+            hamiltonian=self.hamiltonian,
+            config=sqd_config,
+        )
+
+        results = solver.run(nf_basis)
+
+        sqd_energy = results["energy"]
+
+        self.results["sqd_results"] = results
+        self.results["sqd_energy"] = sqd_energy
+
+        # Variational consistency check
+        if self.exact_energy is not None and sqd_energy < self.exact_energy - 0.001:
+            print(f"WARNING: SQD energy ({sqd_energy:.6f}) below exact ({self.exact_energy:.6f})!")
+            print("Numerical instability detected. Falling back to direct diagonalization.")
+            return self._direct_diagonalize(nf_basis)
+
+        self.results["combined_energy"] = sqd_energy
+        return results
+
+    def _direct_diagonalize(self, basis: torch.Tensor) -> Dict[str, Any]:
+        """Compute energy by direct diagonalization of basis."""
+        print("Computing energy via direct diagonalization...")
+        H_matrix = self.hamiltonian.matrix_elements(basis, basis)
+        H_np = H_matrix.detach().cpu().numpy()
+        H_np = 0.5 * (H_np + H_np.T)
+        eigenvalues, _ = np.linalg.eigh(H_np)
+        energy = float(eigenvalues[0])
+        print(f"Direct diag energy: {energy:.8f} Ha ({len(basis)} configs)")
+        self.results["combined_energy"] = energy
+        return {"energies_combined": [energy], "direct_diag": True}
 
     def run(self, progress: bool = True) -> Dict[str, Any]:
         """
@@ -985,11 +791,8 @@ class FlowGuidedKrylovPipeline:
         # Stage 2: Basis extraction
         self.extract_and_select_basis()
 
-        # Stage 3: Residual expansion
-        self.run_residual_expansion()
-
-        # Stage 4: SKQD
-        self.run_skqd(progress=progress)
+        # Stage 3: Subspace diagonalization (SKQD or SQD)
+        self.run_subspace_diag(progress=progress)
 
         # Summary
         self._print_summary()
@@ -1005,23 +808,22 @@ class FlowGuidedKrylovPipeline:
         if self.results.get("skip_nf_training"):
             print(f"Mode:              Direct-CI (NF training skipped)")
 
+        print(f"Subspace mode:     {self.config.subspace_mode.upper()}")
+
         if "nf_nqs_energy" in self.results and self.results["nf_nqs_energy"] is not None:
             print(f"NF-NQS Energy:     {self.results['nf_nqs_energy']:.8f}")
 
         if "nf_basis_size" in self.results:
             print(f"NF Basis Size:     {self.results['nf_basis_size']}")
 
-        if "residual_expansion_stats" in self.results:
-            stats = self.results["residual_expansion_stats"]
-            print(f"Expanded Basis:    {stats['final_basis_size']}")
-
         if "combined_energy" in self.results:
-            print(f"Combined Energy:   {self.results['combined_energy']:.8f}")
+            print(f"Final Energy:      {self.results['combined_energy']:.8f}")
 
         if self.exact_energy is not None:
             best_energy = self.results.get("combined_energy",
                            self.results.get("skqd_energy",
-                           self.results.get("nf_nqs_energy")))
+                           self.results.get("sqd_energy",
+                           self.results.get("nf_nqs_energy"))))
             error_ha = abs(best_energy - self.exact_energy)
             error_mha = error_ha * 1000
             error_kcal = error_ha * 627.5
@@ -1085,7 +887,6 @@ def run_molecular_benchmark(
     config = PipelineConfig(
         use_particle_conserving_flow=True,
         use_diversity_selection=True,
-        use_residual_expansion=True,
         skip_nf_training=True,
     )
 

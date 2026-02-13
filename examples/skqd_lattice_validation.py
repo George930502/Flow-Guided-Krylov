@@ -219,7 +219,6 @@ def run_tfim_experiment(
     print("\n--- Mode B: NF Sampling Only ---")
     config_nf = PipelineConfig(
         use_particle_conserving_flow=False,  # No particle conservation for spin systems
-        use_residual_expansion=False,
         skip_skqd=True,
         max_epochs=400,
         device=device,
@@ -233,7 +232,6 @@ def run_tfim_experiment(
     print("\n--- Mode C: NF + SKQD Combined ---")
     config_combined = PipelineConfig(
         use_particle_conserving_flow=False,
-        use_residual_expansion=False,
         skip_skqd=False,
         max_krylov_dim=12,
         shots_per_krylov=100000,
@@ -356,7 +354,6 @@ def run_heisenberg_experiment(
     print("\n--- Mode B: NF Sampling Only ---")
     config_nf = PipelineConfig(
         use_particle_conserving_flow=False,
-        use_residual_expansion=False,
         skip_skqd=True,
         max_epochs=400,
         device=device,
@@ -370,7 +367,6 @@ def run_heisenberg_experiment(
     print("\n--- Mode C: NF + SKQD ---")
     config_combined = PipelineConfig(
         use_particle_conserving_flow=False,
-        use_residual_expansion=False,
         skip_skqd=False,
         max_krylov_dim=12,
         shots_per_krylov=100000,
@@ -545,7 +541,6 @@ def run_discovery_comparison(n_spins: int = 10, h_field: float = 0.5) -> Lattice
     print("\n--- NF Configuration Discovery ---")
     config_nf = PipelineConfig(
         use_particle_conserving_flow=False,
-        use_residual_expansion=False,
         skip_skqd=True,
         max_epochs=400,
         device=device,

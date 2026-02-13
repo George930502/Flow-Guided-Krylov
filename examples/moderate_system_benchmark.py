@@ -1,8 +1,13 @@
 """
-Moderate System Benchmark for SKQD Scaling Validation.
+Moderate System Benchmark: SKQD vs SQD Subspace Comparison.
 
-Tests molecular systems in the 20-30 qubit range to validate
-SKQD necessity scaling between CH4 and very large systems.
+Tests molecular systems in the 20-30 qubit range to compare two
+fundamentally different subspace construction strategies:
+
+- SKQD (Krylov-based): NF-NQS generates initial configs, Krylov time
+  evolution U^k = e^{-iHdt} expands subspace iteratively
+- SQD (Sampling-based): NF-NQS samples + configuration recovery +
+  batch diagonalization + self-consistent orbital occupancy loop
 
 Systems tested (ordered by qubit count):
 - CO (carbon monoxide): 20 qubits, 14 electrons
@@ -16,6 +21,7 @@ Systems tested (ordered by qubit count):
 Usage:
     docker-compose run --rm flow-krylov-gpu python examples/moderate_system_benchmark.py --system all
     docker-compose run --rm flow-krylov-gpu python examples/moderate_system_benchmark.py --system c2h4
+    docker-compose run --rm flow-krylov-gpu python examples/moderate_system_benchmark.py --system co --mode sqd
 """
 
 import sys
@@ -23,7 +29,7 @@ from pathlib import Path
 import argparse
 import time
 from math import comb
-from typing import Dict, Any, Set, Tuple, Optional
+from typing import Dict, Any, Optional
 from dataclasses import dataclass
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -32,7 +38,7 @@ import torch
 import numpy as np
 
 try:
-    from pyscf import gto, scf, ao2mo, cc
+    from pyscf import gto, scf, ao2mo, cc, fci
     PYSCF_AVAILABLE = True
 except ImportError:
     PYSCF_AVAILABLE = False
@@ -41,8 +47,6 @@ except ImportError:
 
 from hamiltonians.molecular import MolecularHamiltonian, MolecularIntegrals
 from pipeline import FlowGuidedKrylovPipeline, PipelineConfig
-from krylov.skqd import SampleBasedKrylovDiagonalization, FlowGuidedSKQD, SKQDConfig
-from krylov.residual_expansion import SelectedCIExpander, ResidualExpansionConfig
 
 
 @dataclass
@@ -69,19 +73,20 @@ class BenchmarkResult:
 
     # Configuration counts
     nf_configs: int = 0
-    residual_new_configs: int = 0
-    krylov_new_configs: int = 0
-    krylov_unique_configs: int = 0
 
-    # Energies
+    # Energies from each mode
     nf_energy: float = 0.0
-    nf_residual_energy: float = 0.0
-    nf_krylov_energy: float = 0.0
-    combined_energy: float = 0.0
+    skqd_energy: float = 0.0
+    sqd_energy: float = 0.0
 
-    # Verdict
-    verdict: str = ""
-    krylov_improvement_mha: float = 0.0
+    # Timing
+    time_nf: float = 0.0
+    time_skqd: float = 0.0
+    time_sqd: float = 0.0
+
+    # Errors (mHa)
+    skqd_error_mha: float = 0.0
+    sqd_error_mha: float = 0.0
 
 
 def print_banner(title: str):
@@ -91,186 +96,22 @@ def print_banner(title: str):
     print("=" * 70)
 
 
-def configs_to_set(configs: torch.Tensor) -> Set[tuple]:
-    """Convert tensor of configurations to set of tuples."""
-    return {tuple(c.cpu().tolist()) for c in configs}
-
-
-def set_to_configs(config_set: Set[tuple], n_sites: int, device: str) -> torch.Tensor:
-    """Convert set of tuples back to tensor."""
-    configs = [list(c) for c in config_set]
-    return torch.tensor(configs, dtype=torch.long, device=device)
-
-
 def format_energy_comparison(energy: float, reference: float, ref_type: str) -> str:
-    """
-    Format energy comparison, correctly handling sub-reference energies.
-
-    When energy < reference and reference is NOT FCI, this is expected
-    (FCI < CCSD < HF), so report as "below" rather than "error".
-    """
+    """Format energy comparison, correctly handling sub-reference energies."""
     diff_mha = (energy - reference) * 1000
 
     if ref_type == "FCI":
-        # For FCI reference, any deviation is error (variational principle)
         error_mha = abs(diff_mha)
         return f"error vs FCI: {error_mha:.2f} mHa"
     else:
-        # For non-variational references (CCSD, CCSD(T)), energy CAN go below
-        if diff_mha < -0.01:  # Below reference
+        if diff_mha < -0.01:
             return f"{abs(diff_mha):.2f} mHa below {ref_type} (expected: FCI < {ref_type})"
         else:
             return f"{abs(diff_mha):.2f} mHa above {ref_type}"
 
 
-def check_essential_configs_discovered(
-    configs: torch.Tensor,
-    hamiltonian: 'MolecularHamiltonian',
-) -> Dict[str, int]:
-    """
-    Diagnostic: Check whether NF naturally discovered essential configurations.
-
-    After Phase 1 fix (subspace diagonalization), NF should naturally discover:
-    - HF state (rank_0): Has largest ground state coefficient (~0.9)
-    - Singles (rank_1): First-order excited determinants
-    - Doubles (rank_2): Most important for electron correlation
-
-    This is a DIAGNOSTIC function to verify the NF is working correctly.
-    If HF (rank_0) is missing after Phase 1 fix, it indicates a training issue.
-
-    Args:
-        configs: Tensor of sampled configurations
-        hamiltonian: Molecular Hamiltonian with get_hf_state() method
-
-    Returns:
-        Dictionary with bucket distribution by excitation rank
-    """
-    if not hasattr(hamiltonian, 'get_hf_state'):
-        return {'error': 'Not a molecular Hamiltonian'}
-
-    hf_state = hamiltonian.get_hf_state()
-    n_orb = hamiltonian.n_orbitals
-
-    # Compute excitation rank for each config
-    # rank = number of electrons in different positions from HF
-    bucket_dist = {}
-
-    for config in configs:
-        # Count differences from HF (alpha and beta separately)
-        alpha_diff = 0
-        beta_diff = 0
-
-        for i in range(n_orb):
-            if config[i] != hf_state[i]:
-                alpha_diff += 1
-            if config[i + n_orb] != hf_state[i + n_orb]:
-                beta_diff += 1
-
-        # Rank is half the total difference (since each excitation changes 2 orbitals)
-        # But we count the number of particles moved, not orbital changes
-        alpha_rank = alpha_diff // 2
-        beta_rank = beta_diff // 2
-        total_rank = alpha_rank + beta_rank
-
-        key = f'rank_{total_rank}'
-        bucket_dist[key] = bucket_dist.get(key, 0) + 1
-
-    # Sort by rank
-    sorted_dist = dict(sorted(bucket_dist.items(), key=lambda x: int(x[0].split('_')[1])))
-
-    return sorted_dist
-
-
-def print_hf_discovery_diagnostic(
-    configs: torch.Tensor,
-    hamiltonian: 'MolecularHamiltonian',
-    stage: str = "NF-NQS",
-):
-    """
-    Print diagnostic information about HF state discovery.
-
-    Args:
-        configs: Sampled configurations
-        hamiltonian: Molecular Hamiltonian
-        stage: Pipeline stage name for logging
-    """
-    bucket_dist = check_essential_configs_discovered(configs, hamiltonian)
-
-    if 'error' in bucket_dist:
-        return
-
-    print(f"\n  === {stage} Configuration Discovery Diagnostic ===")
-    print(f"  Bucket distribution by excitation rank:")
-
-    for key, count in bucket_dist.items():
-        rank = int(key.split('_')[1])
-        label = {0: 'HF', 1: 'Singles', 2: 'Doubles', 3: 'Triples', 4: 'Quadruples'}.get(rank, f'{rank}-tuple')
-        print(f"    {key} ({label}): {count}")
-
-    # Warnings for missing essential configs
-    if bucket_dist.get('rank_0', 0) == 0:
-        print(f"  WARNING: HF state NOT discovered by {stage}!")
-        print(f"     This may indicate insufficient training or wrong energy signal.")
-
-    if bucket_dist.get('rank_1', 0) == 0:
-        print(f"  WARNING: No singles discovered by {stage}!")
-        print(f"     Singles are important for orbital relaxation.")
-
-    if bucket_dist.get('rank_2', 0) == 0:
-        print(f"  WARNING: No doubles discovered by {stage}!")
-        print(f"     Doubles capture electron correlation.")
-
-    # Success indicators
-    if bucket_dist.get('rank_0', 0) > 0 and bucket_dist.get('rank_2', 0) > 0:
-        print(f"  {stage} successfully discovered HF and doubles")
-
-
-def compute_basis_energy(H: MolecularHamiltonian, basis: torch.Tensor,
-                         check_asymmetry: bool = False) -> float:
-    """
-    Compute ground state energy by diagonalizing H in given basis.
-
-    Args:
-        H: Hamiltonian
-        basis: Basis configurations
-        check_asymmetry: If True, print warning for asymmetric matrices
-    """
-    H_matrix = H.matrix_elements(basis, basis)
-    H_np = H_matrix.cpu().numpy().astype(np.float64)
-
-    # Check asymmetry before symmetrization
-    if check_asymmetry:
-        asymmetry = np.abs(H_np - H_np.T).max()
-        if asymmetry > 1e-8:
-            print(f"  WARNING: Matrix asymmetry detected: {asymmetry:.2e}")
-
-    # The matrix should already be Hermitian from matrix_elements_fast()
-    # This is just a safety net for any residual numerical errors
-    H_np = 0.5 * (H_np + H_np.T)
-    eigenvalues, _ = np.linalg.eigh(H_np)
-    return float(eigenvalues[0])
-
-
 def compute_pyscf_fci(geometry, basis, charge=0, spin=0, max_memory=8000):
-    """
-    Compute FCI energy using PySCF's iterative Davidson solver.
-
-    Unlike our matrix-based FCI (which builds the full N x N matrix),
-    PySCF's FCI solver uses iterative methods and can handle much larger
-    spaces (up to ~10M determinants).
-
-    Args:
-        geometry: Molecular geometry
-        basis: Basis set name
-        charge: Molecular charge
-        spin: Spin multiplicity (2S)
-        max_memory: Maximum memory in MB
-
-    Returns:
-        FCI energy in Hartree, or None if computation fails
-    """
-    from pyscf import fci
-
+    """Compute FCI energy using PySCF's iterative Davidson solver."""
     mol = gto.Mole()
     mol.atom = geometry
     mol.basis = basis
@@ -305,16 +146,7 @@ def create_molecule_data(
     compute_ccsd: bool = True,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MoleculeData:
-    """
-    Create MoleculeData with Hamiltonian and reference energies.
-
-    Returns MoleculeData containing:
-    - MolecularHamiltonian
-    - HF energy
-    - CCSD energy (if requested)
-    - CCSD(T) energy (if CCSD succeeds)
-    """
-    # Build PySCF molecule
+    """Create MoleculeData with Hamiltonian and reference energies."""
     mol = gto.Mole()
     mol.atom = geometry
     mol.basis = basis
@@ -322,7 +154,6 @@ def create_molecule_data(
     mol.spin = spin
     mol.build()
 
-    # Run HF
     if spin == 0:
         mf = scf.RHF(mol)
     else:
@@ -330,7 +161,6 @@ def create_molecule_data(
     mf.kernel()
     hf_energy = float(mf.e_tot)
 
-    # Run CCSD and CCSD(T) if requested
     ccsd_energy = None
     ccsd_t_energy = None
     if compute_ccsd:
@@ -338,8 +168,6 @@ def create_molecule_data(
             mycc = cc.CCSD(mf)
             mycc.kernel()
             ccsd_energy = float(mycc.e_tot)
-
-            # Compute CCSD(T) perturbative triples correction
             try:
                 et = mycc.ccsd_t()
                 ccsd_t_energy = ccsd_energy + et
@@ -348,7 +176,6 @@ def create_molecule_data(
         except Exception as e:
             print(f"  CCSD failed: {e}")
 
-    # Get integrals in MO basis
     h1e = mf.mo_coeff.T @ mf.get_hcore() @ mf.mo_coeff
     h2e = ao2mo.kernel(mol, mf.mo_coeff)
     h2e = ao2mo.restore(1, h2e, mol.nao)
@@ -388,12 +215,7 @@ def create_co_molecule(
     bond_length: float = 1.128,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MoleculeData:
-    """
-    Create CO (carbon monoxide) molecule data.
-
-    14 electrons, 10 orbitals in STO-3G = 20 qubits
-    Valid configs: C(10,7)^2 = 14,400
-    """
+    """Create CO (carbon monoxide). 14e, 10 orb in STO-3G = 20 qubits."""
     geometry = [
         ("C", (0.0, 0.0, 0.0)),
         ("O", (0.0, 0.0, bond_length)),
@@ -406,12 +228,7 @@ def create_hcn_molecule(
     cn_length: float = 1.156,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MoleculeData:
-    """
-    Create HCN (hydrogen cyanide) molecule data.
-
-    14 electrons, 11 orbitals in STO-3G = 22 qubits
-    Linear geometry: H-C≡N
-    """
+    """Create HCN (hydrogen cyanide). 14e, 11 orb in STO-3G = 22 qubits."""
     geometry = [
         ("H", (0.0, 0.0, 0.0)),
         ("C", (0.0, 0.0, ch_length)),
@@ -425,12 +242,7 @@ def create_c2h2_molecule(
     ch_length: float = 1.063,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MoleculeData:
-    """
-    Create C2H2 (acetylene) molecule data.
-
-    14 electrons, 12 orbitals in STO-3G = 24 qubits
-    Linear geometry: H-C≡C-H
-    """
+    """Create C2H2 (acetylene). 14e, 12 orb in STO-3G = 24 qubits."""
     geometry = [
         ("H", (0.0, 0.0, -ch_length - cc_length/2)),
         ("C", (0.0, 0.0, -cc_length/2)),
@@ -445,11 +257,7 @@ def create_h2o_631g_molecule(
     angle: float = 104.5,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MoleculeData:
-    """
-    Create H2O (water) molecule data with 6-31G basis.
-
-    10 electrons, 13 orbitals in 6-31G = 26 qubits
-    """
+    """Create H2O with 6-31G basis. 10e, 13 orb = 26 qubits."""
     angle_rad = np.radians(angle)
     geometry = [
         ("O", (0.0, 0.0, 0.0)),
@@ -464,11 +272,7 @@ def create_h2s_molecule(
     angle: float = 92.1,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MoleculeData:
-    """
-    Create H2S (hydrogen sulfide) molecule data.
-
-    18 electrons, 13 orbitals in STO-3G = 26 qubits
-    """
+    """Create H2S (hydrogen sulfide). 18e, 13 orb in STO-3G = 26 qubits."""
     angle_rad = np.radians(angle)
     geometry = [
         ("S", (0.0, 0.0, 0.0)),
@@ -484,22 +288,13 @@ def create_c2h4_molecule(
     hcc_angle: float = 121.3,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MoleculeData:
-    """
-    Create C2H4 (ethylene) molecule data.
-
-    16 electrons, 14 orbitals in STO-3G = 28 qubits
-    Planar geometry
-    """
+    """Create C2H4 (ethylene). 16e, 14 orb in STO-3G = 28 qubits."""
     angle_rad = np.radians(hcc_angle)
-
     geometry = [
-        # Carbon atoms along z-axis
         ("C", (0.0, 0.0, -cc_length/2)),
         ("C", (0.0, 0.0, cc_length/2)),
-        # H atoms on first carbon (in xz plane)
         ("H", (ch_length * np.sin(angle_rad), 0.0, -cc_length/2 - ch_length * np.cos(angle_rad))),
         ("H", (-ch_length * np.sin(angle_rad), 0.0, -cc_length/2 - ch_length * np.cos(angle_rad))),
-        # H atoms on second carbon
         ("H", (ch_length * np.sin(angle_rad), 0.0, cc_length/2 + ch_length * np.cos(angle_rad))),
         ("H", (-ch_length * np.sin(angle_rad), 0.0, cc_length/2 + ch_length * np.cos(angle_rad))),
     ]
@@ -511,16 +306,10 @@ def create_nh3_631g_molecule(
     hnh_angle: float = 106.7,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MoleculeData:
-    """
-    Create NH3 (ammonia) molecule data with 6-31G basis.
-
-    10 electrons, 15 orbitals in 6-31G = 30 qubits
-    """
+    """Create NH3 with 6-31G basis. 10e, 15 orb = 30 qubits."""
     angle_rad = np.radians(hnh_angle)
-    # Height of N above H plane
     h = nh_length * np.cos(np.arcsin(np.sin(angle_rad/2) / np.sin(np.radians(60))))
-    r = np.sqrt(nh_length**2 - h**2)  # Radius of H triangle
-
+    r = np.sqrt(nh_length**2 - h**2)
     geometry = [
         ("N", (0.0, 0.0, h)),
         ("H", (r, 0.0, 0.0)),
@@ -536,16 +325,17 @@ def create_nh3_631g_molecule(
 
 def run_benchmark(
     molecule_key: str,
+    mode: str = "both",
     verbose: bool = True,
 ) -> BenchmarkResult:
     """
-    Run SKQD necessity benchmark for a single molecule.
+    Run subspace method benchmark for a single molecule.
 
     Args:
         molecule_key: Key for molecule factory
+        mode: "skqd", "sqd", or "both"
         verbose: Print detailed progress
     """
-    # System factories
     factories = {
         'co': (create_co_molecule, "CO (STO-3G)"),
         'hcn': (create_hcn_molecule, "HCN (STO-3G)"),
@@ -585,11 +375,9 @@ def run_benchmark(
         print(f"  CCSD(T) Energy: {mol_data.ccsd_t_energy:.8f} Ha")
 
     # Determine best available reference energy
-    # Priority: FCI > CCSD(T) > CCSD > HF
     E_exact = mol_data.hf_energy
     energy_type = "HF"
 
-    # Try matrix-based FCI for small systems
     if n_valid <= 100000:
         print("Computing FCI energy (matrix-based)...")
         try:
@@ -599,10 +387,8 @@ def run_benchmark(
         except Exception as e:
             print(f"  Matrix-based FCI failed: {e}")
 
-    # Try PySCF iterative FCI for medium-large systems (up to ~10M configs)
     if energy_type != "FCI" and n_valid <= 15_000_000:
         print(f"Computing FCI energy (PySCF iterative Davidson, {n_valid:,} determinants)...")
-        print(f"  This may take several minutes for large spaces...")
         try:
             t0 = time.time()
             E_fci = compute_pyscf_fci(mol_data.geometry, mol_data.basis)
@@ -611,29 +397,16 @@ def run_benchmark(
             energy_type = "FCI"
             mol_data.fci_energy = E_fci
             print(f"  PySCF FCI Energy: {E_exact:.8f} Ha (computed in {elapsed:.1f}s)")
-
-            # Show how CCSD and CCSD(T) compare to FCI
-            if mol_data.ccsd_energy:
-                ccsd_err = abs(mol_data.ccsd_energy - E_exact) * 1000
-                print(f"  CCSD error vs FCI: {ccsd_err:.4f} mHa")
-            if mol_data.ccsd_t_energy:
-                ccsd_t_err = abs(mol_data.ccsd_t_energy - E_exact) * 1000
-                print(f"  CCSD(T) error vs FCI: {ccsd_t_err:.4f} mHa")
         except Exception as e:
             print(f"  PySCF FCI failed: {e}")
 
-    # Fall back to CCSD(T) or CCSD if FCI not available
     if energy_type != "FCI":
         if mol_data.ccsd_t_energy:
             E_exact = mol_data.ccsd_t_energy
             energy_type = "CCSD(T)"
-            print(f"  Using CCSD(T) Energy: {E_exact:.8f} Ha (reference)")
         elif mol_data.ccsd_energy:
             E_exact = mol_data.ccsd_energy
             energy_type = "CCSD"
-            print(f"  Using CCSD Energy: {E_exact:.8f} Ha (reference)")
-        else:
-            print(f"  Using HF Energy: {E_exact:.8f} Ha (reference)")
 
     result = BenchmarkResult(
         system=system_name,
@@ -645,208 +418,78 @@ def run_benchmark(
     )
 
     # =======================================================================
-    # Step 1: NF-NQS Training / Direct-CI
+    # Run SKQD mode
     # =======================================================================
-    print("\n--- Step 1: NF-NQS Training ---")
+    if mode in ("skqd", "both"):
+        print("\n--- SKQD Mode (Krylov Time Evolution) ---")
+        t0 = time.time()
 
-    # Use PipelineConfig with adapt_to_system_size for parameter tuning
-    # Direct-CI mode skips NF training for faster benchmarks
-    config = PipelineConfig(
-        use_residual_expansion=False,
-        skip_skqd=True,
-        skip_nf_training=True,
-        max_epochs=400,
-        device=device,
-    )
-    config.adapt_to_system_size(n_valid)
+        config_skqd = PipelineConfig(
+            subspace_mode="skqd",
+            skip_nf_training=True,
+            max_epochs=400,
+            device=device,
+        )
+        config_skqd.adapt_to_system_size(n_valid)
 
-    pipeline = FlowGuidedKrylovPipeline(H, config=config, exact_energy=E_exact)
-    pipeline.train_flow_nqs(progress=verbose)
+        pipeline_skqd = FlowGuidedKrylovPipeline(H, config=config_skqd, exact_energy=E_exact)
+        results_skqd = pipeline_skqd.run(progress=verbose)
 
-    # Get training energy for diagnostic comparison (not available in Direct-CI mode)
-    training_energy = getattr(getattr(pipeline, 'trainer', None), 'best_energy', None)
-    if training_energy is not None:
-        print(f"  NQS Training best energy: {training_energy:.6f} Ha")
+        result.skqd_energy = results_skqd.get(
+            'combined_energy',
+            results_skqd.get('skqd_energy',
+            results_skqd.get('sqd_energy', float('inf')))
+        )
+        result.time_skqd = time.time() - t0
+        result.nf_configs = results_skqd.get('nf_basis_size', 0)
+        result.nf_energy = results_skqd.get('nf_nqs_energy', 0.0)
 
-    nf_basis = pipeline.extract_and_select_basis()
-
-    nf_set = configs_to_set(nf_basis)
-    result.nf_configs = len(nf_set)
-    result.nf_energy = compute_basis_energy(H, nf_basis, check_asymmetry=True)
-
-    nf_comparison = format_energy_comparison(result.nf_energy, E_exact, energy_type)
-    print(f"  NF found: {len(nf_set)} configs")
-    print(f"  NF energy: {result.nf_energy:.8f} Ha ({nf_comparison})")
-
-    # Diagnostic: compare training vs diagonalization energy
-    if training_energy is not None:
-        gap = result.nf_energy - training_energy
-        print(f"  Training vs Diag gap: {gap:.4f} Ha (expected: diag <= training)")
-
-    # Diagnostic: Check if NF naturally discovered essential configurations
-    # After Phase 1 fix (subspace diagonalization), HF and singles should appear
-    print_hf_discovery_diagnostic(nf_basis, H, stage="NF-NQS")
+        skqd_comparison = format_energy_comparison(result.skqd_energy, E_exact, energy_type)
+        print(f"  SKQD energy: {result.skqd_energy:.8f} Ha ({skqd_comparison})")
+        print(f"  SKQD time: {result.time_skqd:.1f}s")
 
     # =======================================================================
-    # Step 2: Residual Expansion
+    # Run SQD mode
     # =======================================================================
-    print("\n--- Step 2: Residual (PT2) Expansion ---")
+    if mode in ("sqd", "both"):
+        print("\n--- SQD Mode (Sampling-Based Batch Diagonalization) ---")
+        t0 = time.time()
 
-    # IMPORTANT: Only set energy_lower_bound if reference is FCI (exact).
-    # For CCSD/CCSD(T) references, our energy CAN and SHOULD go below them
-    # because FCI < CCSD(T) < CCSD for correlated systems.
-    if energy_type == "FCI":
-        energy_bound = E_exact - 1e-4  # Allow small numerical tolerance below FCI
-        print(f"  Energy bound: {energy_bound:.6f} Ha (FCI - 0.1 mHa tolerance)")
-    else:
-        energy_bound = None  # No bound for CCSD/CCSD(T)/HF reference
-        print(f"  Energy bound: NONE (reference is {energy_type}, not FCI)")
+        config_sqd = PipelineConfig(
+            subspace_mode="sqd",
+            skip_nf_training=True,
+            max_epochs=400,
+            sqd_num_batches=5,
+            sqd_self_consistent_iters=3,
+            device=device,
+        )
+        config_sqd.adapt_to_system_size(n_valid)
 
-    residual_config = ResidualExpansionConfig(
-        max_configs_per_iter=config.residual_configs_per_iter,
-        max_iterations=config.residual_iterations,
-        residual_threshold=config.residual_threshold,
-        energy_lower_bound=energy_bound,
-    )
-    expander = SelectedCIExpander(H, residual_config)
+        pipeline_sqd = FlowGuidedKrylovPipeline(H, config=config_sqd, exact_energy=E_exact)
+        results_sqd = pipeline_sqd.run(progress=verbose)
 
-    print(f"  Using params: {config.residual_iterations} iterations, "
-          f"{config.residual_configs_per_iter} configs/iter")
+        result.sqd_energy = results_sqd.get(
+            'combined_energy',
+            results_sqd.get('sqd_energy',
+            results_sqd.get('skqd_energy', float('inf')))
+        )
+        result.time_sqd = time.time() - t0
 
-    expanded_basis = nf_basis.clone()
-    prev_basis = nf_basis.clone()  # Track previous basis for rollback
-    variational_violation_detected = False
-
-    for i in range(config.residual_iterations):
-        old_size = len(expanded_basis)
-        prev_basis = expanded_basis.clone()  # Save before expansion
-
-        expanded_basis, stats = expander.expand_basis(expanded_basis)
-        added = stats['configs_added']
-
-        if added == 0:
-            break
-
-        # Compute current energy with asymmetry checking
-        current_energy = compute_basis_energy(H, expanded_basis, check_asymmetry=(i == 0))
-
-        # Check variational principle (only meaningful for FCI reference)
-        if energy_type == "FCI" and current_energy < E_exact - 1e-4:
-            violation_mha = (E_exact - current_energy) * 1000
-            print(f"  WARNING: Iter {i+1}: Energy {current_energy:.6f} Ha is "
-                  f"{violation_mha:.2f} mHa BELOW FCI {E_exact:.6f} Ha!")
-            print(f"  STOPPING and reverting to previous basis.")
-            expanded_basis = prev_basis
-            variational_violation_detected = True
-            break
-
-        if verbose:
-            comparison = format_energy_comparison(current_energy, E_exact, energy_type)
-            print(f"    Iter {i+1}: E = {current_energy:.6f} Ha ({comparison})")
-            print(f"    Iter {i+1}: {old_size} -> {len(expanded_basis)} (+{added})")
-
-    residual_set = configs_to_set(expanded_basis)
-    residual_new = residual_set - nf_set
-    result.residual_new_configs = len(residual_new)
-    result.nf_residual_energy = compute_basis_energy(H, expanded_basis)
-
-    residual_comparison = format_energy_comparison(result.nf_residual_energy, E_exact, energy_type)
-    print(f"  Residual found: {len(residual_new)} NEW configs")
-    print(f"  NF+Residual energy: {result.nf_residual_energy:.8f} Ha ({residual_comparison})")
-
-    if variational_violation_detected:
-        print(f"  NOTE: Expansion was stopped early due to variational violation!")
+        sqd_comparison = format_energy_comparison(result.sqd_energy, E_exact, energy_type)
+        print(f"  SQD energy: {result.sqd_energy:.8f} Ha ({sqd_comparison})")
+        print(f"  SQD time: {result.time_sqd:.1f}s")
 
     # =======================================================================
-    # Step 3: Krylov Time Evolution
+    # Compute errors
     # =======================================================================
-    print("\n--- Step 3: Krylov Time Evolution ---")
-
-    # Always run Krylov — it can discover unique configs beyond PT2 selection.
-    # The max_diag_basis_size cap in SKQD prevents OOM during diagonalization.
-    krylov_dim = 8
-    dt = 0.1
-    shots_per_krylov = 50000
-
-    skqd_config = SKQDConfig(
-        max_krylov_dim=krylov_dim,
-        time_step=dt,
-        shots_per_krylov=shots_per_krylov,
-    )
-
-    print(f"  Using params: krylov_dim={krylov_dim}, "
-          f"dt={dt:.4f}, shots={shots_per_krylov:,}")
-
-    # Use expanded_basis (NF + Residual) for Krylov, not just nf_basis.
-    # This ensures Krylov time evolution starts from the best available basis,
-    # and any new Krylov configs complement the residual expansion results.
-    skqd = FlowGuidedSKQD(H, expanded_basis, skqd_config)
-    skqd_results = skqd.run_with_nf(max_krylov_dim=krylov_dim, progress=verbose)
-
-    # Collect Krylov configs
-    krylov_set = set()
-    cumulative = skqd.build_cumulative_basis()
-    if cumulative:
-        for bitstring in cumulative[-1].keys():
-            config = tuple(int(b) for b in bitstring)
-            krylov_set.add(config)
-
-    krylov_new = krylov_set - residual_set
-    result.krylov_new_configs = len(krylov_new)
-
-    # Compute Residual+Krylov energy (Krylov now builds on expanded basis)
-    residual_krylov_set = residual_set | krylov_set
-    residual_krylov_basis = set_to_configs(residual_krylov_set, H.num_sites, device)
-    result.nf_krylov_energy = compute_basis_energy(H, residual_krylov_basis)
-
-    krylov_comparison = format_energy_comparison(result.nf_krylov_energy, E_exact, energy_type)
-    print(f"  Krylov found: {len(krylov_new)} NEW configs (beyond Residual)")
-    print(f"  Residual+Krylov energy: {result.nf_krylov_energy:.8f} Ha ({krylov_comparison})")
+    if result.skqd_energy != 0.0:
+        result.skqd_error_mha = abs(result.skqd_energy - E_exact) * 1000
+    if result.sqd_energy != 0.0:
+        result.sqd_error_mha = abs(result.sqd_energy - E_exact) * 1000
 
     # =======================================================================
-    # Step 4: Krylov-Unique Analysis
-    # =======================================================================
-    print("\n--- Step 4: Krylov-Unique Analysis ---")
-
-    krylov_unique = krylov_set - residual_set
-    result.krylov_unique_configs = len(krylov_unique)
-
-    print(f"  Krylov-UNIQUE configs: {len(krylov_unique)}")
-    print(f"  (Found by Krylov but NOT by NF+Residual)")
-
-    # Combined energy = Residual + Krylov (same as above since NF is subset of Residual)
-    all_configs = residual_set | krylov_set
-    all_basis = set_to_configs(all_configs, H.num_sites, device)
-    result.combined_energy = compute_basis_energy(H, all_basis)
-
-    combined_comparison = format_energy_comparison(result.combined_energy, E_exact, energy_type)
-    print(f"  Combined basis: {len(all_configs)} configs")
-    print(f"  Combined energy: {result.combined_energy:.8f} Ha ({combined_comparison})")
-
-    # =======================================================================
-    # Step 5: Verdict
-    # =======================================================================
-    print("\n--- Step 5: SKQD Necessity Verdict ---")
-
-    if len(krylov_unique) > 0:
-        krylov_improvement = (result.nf_residual_energy - result.combined_energy) * 1000
-        result.krylov_improvement_mha = krylov_improvement
-
-        if krylov_improvement > 0.1:
-            result.verdict = "NECESSARY"
-            reason = f"Found {len(krylov_unique)} unique configs, {krylov_improvement:.2f} mHa improvement"
-        else:
-            result.verdict = "HELPFUL"
-            reason = f"Found {len(krylov_unique)} unique configs, minimal energy impact"
-    else:
-        result.verdict = "REDUNDANT"
-        result.krylov_improvement_mha = 0.0
-        reason = "All Krylov configs already found by NF+Residual"
-
-    print(f"\n  VERDICT: {result.verdict}")
-    print(f"  Reason: {reason}")
-
     # Summary
+    # =======================================================================
     print(f"\n{'='*70}")
     print(f"SUMMARY: {system_name}")
     print(f"{'='*70}")
@@ -854,24 +497,32 @@ def run_benchmark(
     print(f"  Valid Configs: {n_valid:,}")
     print(f"  Reference: {energy_type} = {E_exact:.8f} Ha")
     print(f"  NF Configs: {result.nf_configs}")
-    print(f"  Residual New: {result.residual_new_configs}")
-    print(f"  Krylov New: {result.krylov_new_configs}")
-    print(f"  Krylov-UNIQUE: {result.krylov_unique_configs}")
-    print(f"  Final Energy: {result.combined_energy:.8f} Ha")
-    final_comparison = format_energy_comparison(result.combined_energy, E_exact, energy_type)
-    print(f"  Accuracy: {final_comparison}")
+
+    if mode in ("skqd", "both"):
+        print(f"  SKQD Energy: {result.skqd_energy:.8f} Ha (error: {result.skqd_error_mha:.4f} mHa)")
+    if mode in ("sqd", "both"):
+        print(f"  SQD Energy:  {result.sqd_energy:.8f} Ha (error: {result.sqd_error_mha:.4f} mHa)")
+
+    if mode == "both" and result.skqd_energy != 0.0 and result.sqd_energy != 0.0:
+        better = "SKQD" if result.skqd_error_mha < result.sqd_error_mha else "SQD"
+        diff = abs(result.skqd_error_mha - result.sqd_error_mha)
+        print(f"  Better method: {better} (by {diff:.4f} mHa)")
+
     if energy_type == "FCI":
-        error_mha = abs(result.combined_energy - E_exact) * 1000
-        chem_acc = "PASS" if error_mha < 1.6 else "FAIL"
-        print(f"  Chemical accuracy: {chem_acc} ({error_mha:.4f} mHa)")
-    print(f"  SKQD Verdict: {result.verdict}")
+        best_error = min(
+            result.skqd_error_mha if result.skqd_energy != 0.0 else float('inf'),
+            result.sqd_error_mha if result.sqd_energy != 0.0 else float('inf'),
+        )
+        chem_acc = "PASS" if best_error < 1.6 else "FAIL"
+        print(f"  Chemical accuracy: {chem_acc} (best error: {best_error:.4f} mHa)")
+
     print(f"{'='*70}\n")
 
     return result
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Moderate System SKQD Benchmark")
+    parser = argparse.ArgumentParser(description="Moderate System Subspace Benchmark")
     parser.add_argument(
         "--system",
         type=str,
@@ -879,11 +530,17 @@ def main():
         choices=["co", "hcn", "c2h2", "h2o_631g", "h2s", "c2h4", "nh3_631g", "all"],
         help="System to benchmark",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="both",
+        choices=["skqd", "sqd", "both"],
+        help="Subspace mode to run (default: both)",
+    )
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
 
     args = parser.parse_args()
 
-    # Order by qubit count (ascending)
     system_order = ["co", "hcn", "c2h2", "h2o_631g", "h2s", "c2h4", "nh3_631g"]
 
     if args.system == "all":
@@ -895,7 +552,7 @@ def main():
 
     for system_key in systems_to_run:
         try:
-            result = run_benchmark(system_key, verbose=not args.quiet)
+            result = run_benchmark(system_key, mode=args.mode, verbose=not args.quiet)
             all_results.append(result)
         except Exception as e:
             print(f"\nError running {system_key}: {e}")
@@ -905,35 +562,46 @@ def main():
 
     # Final summary
     if len(all_results) > 1:
-        print("\n" + "="*80)
+        print("\n" + "="*90)
         print("OVERALL RESULTS SUMMARY")
-        print("="*80)
-        print(f"\n{'System':<20} {'Qubits':>8} {'Valid':>15} {'Ref':>8} {'Krylov-Unique':>15} {'Verdict':<12}")
-        print("-"*80)
+        print("="*90)
 
-        for r in all_results:
-            print(f"{r.system:<20} {r.n_qubits:>8} {r.n_valid_configs:>15,} "
-                  f"{r.energy_type:>8} {r.krylov_unique_configs:>15} {r.verdict:<12}")
+        if args.mode == "both":
+            print(f"\n{'System':<20} {'Qubits':>8} {'Valid':>12} {'Ref':>8} "
+                  f"{'SKQD err':>10} {'SQD err':>10} {'Better':<8}")
+            print("-"*90)
 
-        print("-"*80)
+            for r in all_results:
+                better = ""
+                if r.skqd_energy != 0.0 and r.sqd_energy != 0.0:
+                    better = "SKQD" if r.skqd_error_mha < r.sqd_error_mha else "SQD"
+                print(f"{r.system:<20} {r.n_qubits:>8} {r.n_valid_configs:>12,} "
+                      f"{r.energy_type:>8} {r.skqd_error_mha:>10.4f} "
+                      f"{r.sqd_error_mha:>10.4f} {better:<8}")
+        else:
+            print(f"\n{'System':<20} {'Qubits':>8} {'Valid':>12} {'Ref':>8} "
+                  f"{'Error (mHa)':>12} {'Time (s)':>10}")
+            print("-"*80)
 
-        # Count verdicts
-        necessary_count = sum(1 for r in all_results if r.verdict == 'NECESSARY')
-        helpful_count = sum(1 for r in all_results if r.verdict == 'HELPFUL')
-        redundant_count = sum(1 for r in all_results if r.verdict == 'REDUNDANT')
+            for r in all_results:
+                error = r.skqd_error_mha if args.mode == "skqd" else r.sqd_error_mha
+                t = r.time_skqd if args.mode == "skqd" else r.time_sqd
+                print(f"{r.system:<20} {r.n_qubits:>8} {r.n_valid_configs:>12,} "
+                      f"{r.energy_type:>8} {error:>12.4f} {t:>10.1f}")
 
-        print(f"\nSKQD Necessity Summary:")
-        print(f"  NECESSARY: {necessary_count} systems")
-        print(f"  HELPFUL: {helpful_count} systems")
-        print(f"  REDUNDANT: {redundant_count} systems")
+        print("-"*90)
 
-        # Find threshold
-        sorted_results = sorted(all_results, key=lambda x: x.n_valid_configs)
-        for r in sorted_results:
-            if r.krylov_unique_configs > 0:
-                print(f"\n  SKQD becomes necessary around {r.n_valid_configs:,} valid configs")
-                print(f"  ({r.system}, {r.n_qubits} qubits)")
-                break
+        # Chemical accuracy count
+        chem_acc_count = sum(
+            1 for r in all_results
+            if r.energy_type == "FCI" and min(
+                r.skqd_error_mha if r.skqd_energy != 0.0 else float('inf'),
+                r.sqd_error_mha if r.sqd_energy != 0.0 else float('inf'),
+            ) < 1.6
+        )
+        fci_count = sum(1 for r in all_results if r.energy_type == "FCI")
+        if fci_count > 0:
+            print(f"\nChemical accuracy (<1.6 mHa): {chem_acc_count}/{fci_count} systems with FCI reference")
 
 
 if __name__ == "__main__":

@@ -50,7 +50,12 @@ except ImportError:
 
 from pipeline import FlowGuidedKrylovPipeline, PipelineConfig
 from krylov.skqd import SampleBasedKrylovDiagonalization, FlowGuidedSKQD, SKQDConfig
-from krylov.residual_expansion import SelectedCIExpander, ResidualExpansionConfig
+try:
+    from krylov.residual_expansion import SelectedCIExpander, ResidualExpansionConfig
+    RESIDUAL_AVAILABLE = True
+except ImportError:
+    RESIDUAL_AVAILABLE = False
+    print("WARNING: residual_expansion module not available. PT2 steps will be skipped.")
 
 
 @dataclass
@@ -156,7 +161,6 @@ def run_necessity_test(molecule_key: str, verbose: bool = True) -> NecessityResu
     # =======================================================================
     print("\n--- Step 1: NF-NQS Training ---")
     config_nf = PipelineConfig(
-        use_residual_expansion=False,
         skip_skqd=True,
         max_epochs=400,
         device=device,

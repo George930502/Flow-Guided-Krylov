@@ -1158,15 +1158,19 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         nf_basis: torch.Tensor,
         config: Optional[SKQDConfig] = None,
         initial_state: Optional[torch.Tensor] = None,
+        force_nf_guided: bool = False,
     ):
         # Check if we should use NF-guided mode for large systems
-        self._use_nf_guided_mode = False
-        if hasattr(hamiltonian, 'n_alpha') and hasattr(hamiltonian, 'n_beta'):
-            n_valid = comb(hamiltonian.n_orbitals, hamiltonian.n_alpha) * \
-                      comb(hamiltonian.n_orbitals, hamiltonian.n_beta)
-            if n_valid > self.MAX_FULL_SUBSPACE_SIZE:
-                self._use_nf_guided_mode = True
-                print(f"Using NF-guided Krylov mode for large system ({n_valid:,} configs)")
+        self._use_nf_guided_mode = force_nf_guided
+        if not self._use_nf_guided_mode:
+            if hasattr(hamiltonian, 'n_alpha') and hasattr(hamiltonian, 'n_beta'):
+                n_valid = comb(hamiltonian.n_orbitals, hamiltonian.n_alpha) * \
+                          comb(hamiltonian.n_orbitals, hamiltonian.n_beta)
+                if n_valid > self.MAX_FULL_SUBSPACE_SIZE:
+                    self._use_nf_guided_mode = True
+
+        if self._use_nf_guided_mode:
+            print(f"Using NF-guided Krylov mode")
 
         # For NF-guided mode, temporarily disable molecular detection
         # to prevent full subspace setup

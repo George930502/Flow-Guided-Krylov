@@ -2,14 +2,14 @@
 SKQD Validation Experiments: Demonstrating Krylov's Unique Contribution
 
 This benchmark is designed to validate the research hypothesis:
-"SKQD provides important configurations not found by NF sampling or PT2 residual expansion"
+"SKQD provides important configurations not found by NF sampling alone"
 
 Experiment Modes:
-1. ISOLATED_SKQD: Disable residual expansion, test SKQD alone
+1. ISOLATED_SKQD: Test SKQD in isolation (NF only vs NF + SKQD)
 2. PROVENANCE_TRACKING: Track which method discovers each configuration
 3. STRETCHED_BONDS: Test strongly correlated systems where Krylov should help
 4. POOR_INITIAL_STATE: Test with random/degraded initial states
-5. LARGE_BASIS: Test with larger basis sets where exhaustive PT2 is slow
+5. LARGER_BASIS: Test with larger basis sets
 
 Usage:
     docker-compose run --rm flow-krylov-gpu python examples/skqd_validation.py --mode all
@@ -57,11 +57,9 @@ class ExperimentResult:
     exact_energy: float
     nf_only_energy: Optional[float] = None
     skqd_only_energy: Optional[float] = None
-    residual_only_energy: Optional[float] = None
     combined_energy: Optional[float] = None
     nf_basis_size: int = 0
     skqd_unique_configs: int = 0
-    residual_unique_configs: int = 0
     total_basis_size: int = 0
     time_seconds: float = 0.0
     notes: str = ""
@@ -75,18 +73,17 @@ def print_banner(title: str):
 
 
 # =============================================================================
-# Experiment 1: Isolated SKQD (No Residual Expansion)
+# Experiment 1: Isolated SKQD (NF only vs NF + SKQD)
 # =============================================================================
 
 def run_isolated_skqd_experiment(molecule: str = "lih") -> ExperimentResult:
     """
-    Test SKQD in isolation by disabling residual expansion.
+    Test SKQD in isolation: NF only vs NF + SKQD.
 
-    This shows what Krylov time evolution contributes when PT2 is unavailable.
+    This shows what Krylov time evolution contributes on top of NF sampling.
     """
     print_banner(f"EXPERIMENT: Isolated SKQD on {molecule.upper()}")
 
-    # Create Hamiltonian
     H = create_hamiltonian(molecule)
     E_exact = H.fci_energy()
 
@@ -97,10 +94,10 @@ def run_isolated_skqd_experiment(molecule: str = "lih") -> ExperimentResult:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     start_time = time.time()
 
-    # Mode A: NF sampling only (no SKQD, no residual)
+    # Mode A: NF sampling only (no SKQD)
     print("\n--- Mode A: NF Sampling Only (baseline) ---")
     config_nf_only = PipelineConfig(
-        use_residual_expansion=False,
+        subspace_mode="skqd",
         skip_skqd=True,
         max_epochs=400,
         device=device,
@@ -110,11 +107,11 @@ def run_isolated_skqd_experiment(molecule: str = "lih") -> ExperimentResult:
     E_nf_only = results_nf.get('combined_energy', results_nf.get('nf_nqs_energy'))
     nf_basis_size = results_nf.get('nf_basis_size', 0)
 
-    # Mode B: NF + SKQD (no residual expansion)
-    print("\n--- Mode B: NF + SKQD (no residual) ---")
+    # Mode B: NF + SKQD
+    print("\n--- Mode B: NF + SKQD ---")
     config_with_skqd = PipelineConfig(
-        use_residual_expansion=False,  # DISABLE residual expansion
-        skip_skqd=False,  # ENABLE SKQD
+        subspace_mode="skqd",
+        skip_skqd=False,
         max_krylov_dim=12,
         shots_per_krylov=100000,
         max_epochs=400,
@@ -126,7 +123,6 @@ def run_isolated_skqd_experiment(molecule: str = "lih") -> ExperimentResult:
 
     elapsed = time.time() - start_time
 
-    # Results
     error_nf = abs(E_nf_only - E_exact) * 1000
     error_skqd = abs(E_with_skqd - E_exact) * 1000
     improvement = error_nf - error_skqd
@@ -179,7 +175,6 @@ def run_provenance_experiment(molecule: str = "lih") -> ExperimentResult:
     # Step 1: Run NF-NQS training to get NF basis
     print("\n--- Step 1: NF-NQS Training ---")
     config = PipelineConfig(
-        use_residual_expansion=False,
         skip_skqd=True,
         max_epochs=400,
         device=device,
@@ -201,7 +196,6 @@ def run_provenance_experiment(molecule: str = "lih") -> ExperimentResult:
     skqd = SampleBasedKrylovDiagonalization(H, skqd_config)
     skqd.generate_krylov_samples(max_krylov_dim=12, progress=True)
 
-    # Get all Krylov-discovered configs
     krylov_configs_set = set()
     cumulative = skqd.build_cumulative_basis()
     for bitstring in cumulative[-1].keys():
@@ -225,20 +219,16 @@ def run_provenance_experiment(molecule: str = "lih") -> ExperimentResult:
     # Step 3: Compute energies for each basis
     print("\n--- Step 3: Computing Energies ---")
 
-    # NF-only energy
     E_nf_only = compute_basis_energy(H, nf_basis)
 
-    # Krylov-only energy
     krylov_basis = set_to_configs(krylov_configs_set, H.num_sites, device)
     E_krylov_only = compute_basis_energy(H, krylov_basis)
 
-    # Combined energy
     combined_basis = set_to_configs(combined, H.num_sites, device)
     E_combined = compute_basis_energy(H, combined_basis)
 
     elapsed = time.time() - start_time
 
-    # Results
     error_nf = abs(E_nf_only - E_exact) * 1000
     error_krylov = abs(E_krylov_only - E_exact) * 1000
     error_combined = abs(E_combined - E_exact) * 1000
@@ -278,7 +268,7 @@ def run_provenance_experiment(molecule: str = "lih") -> ExperimentResult:
 
 def create_stretched_h2o(stretch_factor: float = 2.0) -> MolecularHamiltonian:
     """Create H2O with stretched OH bonds (strongly correlated)."""
-    oh_eq = 0.96  # Equilibrium OH distance in Angstrom
+    oh_eq = 0.96
     oh_stretched = oh_eq * stretch_factor
     angle = 104.5
 
@@ -295,7 +285,7 @@ def create_stretched_h2o(stretch_factor: float = 2.0) -> MolecularHamiltonian:
 
 def create_stretched_n2(stretch_factor: float = 2.0) -> MolecularHamiltonian:
     """Create N2 with stretched NN bond (strongly correlated triple bond breaking)."""
-    nn_eq = 1.10  # Equilibrium NN distance in Angstrom
+    nn_eq = 1.10
     nn_stretched = nn_eq * stretch_factor
 
     geometry = [
@@ -336,24 +326,24 @@ def run_stretched_bond_experiment(molecule: str = "h2o", stretch_factor: float =
     device = "cuda" if torch.cuda.is_available() else "cpu"
     start_time = time.time()
 
-    # Mode A: NF + Residual (standard pipeline)
-    print("\n--- Mode A: NF + Residual (standard) ---")
-    config_standard = PipelineConfig(
-        use_residual_expansion=True,
+    # Mode A: NF only (no SKQD)
+    print("\n--- Mode A: NF Only (baseline) ---")
+    config_nf = PipelineConfig(
+        subspace_mode="skqd",
         skip_skqd=True,
-        max_epochs=600,  # More epochs for difficult systems
+        max_epochs=600,
         device=device,
     )
-    pipeline_std = FlowGuidedKrylovPipeline(H, config=config_standard, exact_energy=E_exact)
-    results_std = pipeline_std.run(progress=True)
-    E_standard = results_std.get('combined_energy', results_std.get('residual_energy'))
+    pipeline_nf = FlowGuidedKrylovPipeline(H, config=config_nf, exact_energy=E_exact)
+    results_nf = pipeline_nf.run(progress=True)
+    E_nf = results_nf.get('combined_energy', results_nf.get('nf_nqs_energy'))
 
-    # Mode B: NF + SKQD (no residual)
-    print("\n--- Mode B: NF + SKQD (no residual) ---")
+    # Mode B: NF + SKQD
+    print("\n--- Mode B: NF + SKQD ---")
     config_skqd = PipelineConfig(
-        use_residual_expansion=False,
+        subspace_mode="skqd",
         skip_skqd=False,
-        max_krylov_dim=15,  # More Krylov steps for difficult systems
+        max_krylov_dim=15,
         shots_per_krylov=150000,
         max_epochs=600,
         device=device,
@@ -362,27 +352,11 @@ def run_stretched_bond_experiment(molecule: str = "h2o", stretch_factor: float =
     results_skqd = pipeline_skqd.run(progress=True)
     E_skqd = results_skqd.get('combined_energy', results_skqd.get('skqd_energy'))
 
-    # Mode C: Full pipeline (NF + Residual + SKQD)
-    print("\n--- Mode C: Full Pipeline (NF + Residual + SKQD) ---")
-    config_full = PipelineConfig(
-        use_residual_expansion=True,
-        skip_skqd=False,
-        max_krylov_dim=15,
-        shots_per_krylov=150000,
-        max_epochs=600,
-        device=device,
-    )
-    # Force SKQD to run by setting a very small threshold
-    pipeline_full = FlowGuidedKrylovPipeline(H, config=config_full, exact_energy=E_exact)
-    results_full = pipeline_full.run(progress=True)
-    E_full = results_full.get('combined_energy')
-
     elapsed = time.time() - start_time
 
-    # Results
-    error_std = abs(E_standard - E_exact) * 1000
+    error_nf = abs(E_nf - E_exact) * 1000
     error_skqd = abs(E_skqd - E_exact) * 1000
-    error_full = abs(E_full - E_exact) * 1000
+    improvement = error_nf - error_skqd
 
     print("\n" + "=" * 70)
     print(f"STRETCHED {molecule.upper()} RESULTS (stretch={stretch_factor}x):")
@@ -390,24 +364,19 @@ def run_stretched_bond_experiment(molecule: str = "h2o", stretch_factor: float =
     print(f"{'Method':<30} {'Energy (Ha)':<16} {'Error (mHa)':<14}")
     print("-" * 60)
     print(f"{'Exact (FCI)':<30} {E_exact:<16.8f} {0:<14.4f}")
-    print(f"{'NF + Residual':<30} {E_standard:<16.8f} {error_std:<14.4f}")
-    print(f"{'NF + SKQD (no residual)':<30} {E_skqd:<16.8f} {error_skqd:<14.4f}")
-    print(f"{'Full (NF + Residual + SKQD)':<30} {E_full:<16.8f} {error_full:<14.4f}")
+    print(f"{'NF Only':<30} {E_nf:<16.8f} {error_nf:<14.4f}")
+    print(f"{'NF + SKQD':<30} {E_skqd:<16.8f} {error_skqd:<14.4f}")
     print("-" * 60)
-
-    best_method = "Full" if error_full <= min(error_std, error_skqd) else \
-                  ("SKQD" if error_skqd < error_std else "Residual")
-    print(f"Best method: {best_method}")
+    print(f"SKQD improvement: {improvement:.4f} mHa")
 
     return ExperimentResult(
         name=f"stretched_{molecule}_{stretch_factor}x",
         molecule=molecule,
         exact_energy=E_exact,
-        residual_only_energy=E_standard,
-        skqd_only_energy=E_skqd,
-        combined_energy=E_full,
+        nf_only_energy=E_nf,
+        combined_energy=E_skqd,
         time_seconds=elapsed,
-        notes=f"Stretch={stretch_factor}x, Best={best_method}"
+        notes=f"Stretch={stretch_factor}x, SKQD improvement={improvement:.4f} mHa"
     )
 
 
@@ -435,9 +404,8 @@ def run_poor_initial_state_experiment(molecule: str = "lih") -> ExperimentResult
     # Mode A: Limited NF training (simulates poor convergence)
     print("\n--- Mode A: Limited NF Training (poor initial) ---")
     config_limited = PipelineConfig(
-        max_epochs=50,  # Very limited training
+        max_epochs=50,
         min_epochs=50,
-        use_residual_expansion=False,
         skip_skqd=True,
         device=device,
     )
@@ -448,9 +416,8 @@ def run_poor_initial_state_experiment(molecule: str = "lih") -> ExperimentResult
     # Mode B: Limited NF + SKQD
     print("\n--- Mode B: Limited NF + SKQD ---")
     config_limited_skqd = PipelineConfig(
-        max_epochs=50,  # Same limited training
+        max_epochs=50,
         min_epochs=50,
-        use_residual_expansion=False,
         skip_skqd=False,
         max_krylov_dim=15,
         shots_per_krylov=150000,
@@ -464,7 +431,6 @@ def run_poor_initial_state_experiment(molecule: str = "lih") -> ExperimentResult
     print("\n--- Mode C: Full NF Training (reference) ---")
     config_full = PipelineConfig(
         max_epochs=400,
-        use_residual_expansion=False,
         skip_skqd=True,
         device=device,
     )
@@ -474,7 +440,6 @@ def run_poor_initial_state_experiment(molecule: str = "lih") -> ExperimentResult
 
     elapsed = time.time() - start_time
 
-    # Results
     error_limited = abs(E_limited - E_exact) * 1000
     error_limited_skqd = abs(E_limited_skqd - E_exact) * 1000
     error_full = abs(E_full - E_exact) * 1000
@@ -536,12 +501,8 @@ def run_larger_basis_experiment(molecule: str = "h2") -> ExperimentResult:
     Test with larger basis sets where configuration space is bigger.
 
     With 6-31G basis:
-    - H2: 4 orbitals -> C(4,1)^2 = 16 configs (still small but larger)
+    - H2: 4 orbitals -> C(4,1)^2 = 16 configs
     - LiH: 11 orbitals -> C(11,2) * C(11,2) = 3025 configs
-
-    Larger basis means:
-    - PT2 residual expansion takes longer
-    - More room for Krylov to discover unique configs
     """
     print_banner(f"EXPERIMENT: Larger Basis (6-31G) for {molecule.upper()}")
 
@@ -567,7 +528,6 @@ def run_larger_basis_experiment(molecule: str = "h2") -> ExperimentResult:
     # Mode A: NF only
     print("\n--- Mode A: NF Only ---")
     config_nf = PipelineConfig(
-        use_residual_expansion=False,
         skip_skqd=True,
         max_epochs=400,
         device=device,
@@ -579,7 +539,7 @@ def run_larger_basis_experiment(molecule: str = "h2") -> ExperimentResult:
     # Mode B: NF + SKQD
     print("\n--- Mode B: NF + SKQD ---")
     config_skqd = PipelineConfig(
-        use_residual_expansion=False,
+        subspace_mode="skqd",
         skip_skqd=False,
         max_krylov_dim=12,
         shots_per_krylov=100000,
@@ -590,24 +550,11 @@ def run_larger_basis_experiment(molecule: str = "h2") -> ExperimentResult:
     results_skqd = pipeline_skqd.run(progress=True)
     E_skqd = results_skqd.get('combined_energy', results_skqd.get('skqd_energy'))
 
-    # Mode C: NF + Residual
-    print("\n--- Mode C: NF + Residual ---")
-    config_residual = PipelineConfig(
-        use_residual_expansion=True,
-        skip_skqd=True,
-        max_epochs=400,
-        device=device,
-    )
-    pipeline_residual = FlowGuidedKrylovPipeline(H, config=config_residual, exact_energy=E_exact)
-    results_residual = pipeline_residual.run(progress=True)
-    E_residual = results_residual.get('combined_energy')
-
     elapsed = time.time() - start_time
 
-    # Results
     error_nf = abs(E_nf - E_exact) * 1000
     error_skqd = abs(E_skqd - E_exact) * 1000
-    error_residual = abs(E_residual - E_exact) * 1000
+    improvement = error_nf - error_skqd
 
     print("\n" + "=" * 70)
     print(f"LARGER BASIS (6-31G) RESULTS for {molecule.upper()}:")
@@ -617,11 +564,11 @@ def run_larger_basis_experiment(molecule: str = "h2") -> ExperimentResult:
     print(f"{'Exact (FCI)':<25} {E_exact:<16.8f} {0:<14.4f}")
     print(f"{'NF Only':<25} {E_nf:<16.8f} {error_nf:<14.4f}")
     print(f"{'NF + SKQD':<25} {E_skqd:<16.8f} {error_skqd:<14.4f}")
-    print(f"{'NF + Residual':<25} {E_residual:<16.8f} {error_residual:<14.4f}")
     print("-" * 55)
+    print(f"SKQD improvement: {improvement:.4f} mHa")
 
-    best = min(error_nf, error_skqd, error_residual)
-    best_method = "NF" if best == error_nf else ("SKQD" if best == error_skqd else "Residual")
+    best = min(error_nf, error_skqd)
+    best_method = "SKQD" if error_skqd < error_nf else "NF"
     print(f"Best method: {best_method}")
 
     return ExperimentResult(
@@ -630,141 +577,8 @@ def run_larger_basis_experiment(molecule: str = "h2") -> ExperimentResult:
         exact_energy=E_exact,
         nf_only_energy=E_nf,
         skqd_only_energy=E_skqd,
-        residual_only_energy=E_residual,
         time_seconds=elapsed,
         notes=f"6-31G basis, {n_valid} configs, Best={best_method}"
-    )
-
-
-# =============================================================================
-# Experiment 6: Direct Krylov vs Residual Comparison
-# =============================================================================
-
-def run_krylov_vs_residual_experiment(molecule: str = "lih") -> ExperimentResult:
-    """
-    Direct comparison: which finds more important configurations?
-
-    Starting from the same NF basis:
-    - How many new configs does Krylov find?
-    - How many new configs does PT2 residual find?
-    - How much does each improve energy?
-    """
-    print_banner(f"EXPERIMENT: Krylov vs Residual on {molecule.upper()}")
-
-    H = create_hamiltonian(molecule)
-    E_exact = H.fci_energy()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    start_time = time.time()
-
-    # Step 1: Get common NF basis
-    print("\n--- Step 1: NF-NQS Training (common starting point) ---")
-    config_base = PipelineConfig(
-        use_residual_expansion=False,
-        skip_skqd=True,
-        max_epochs=400,
-        device=device,
-    )
-    pipeline_base = FlowGuidedKrylovPipeline(H, config=config_base, exact_energy=E_exact)
-    pipeline_base.train_flow_nqs(progress=True)
-    nf_basis = pipeline_base.extract_and_select_basis()
-
-    E_nf_only = compute_basis_energy(H, nf_basis)
-    nf_set = configs_to_set(nf_basis)
-    print(f"NF basis: {len(nf_set)} configs, E = {E_nf_only:.8f} Ha")
-
-    # Step 2: Krylov expansion from NF basis
-    print("\n--- Step 2: Krylov Expansion ---")
-    skqd_config = SKQDConfig(
-        max_krylov_dim=12,
-        time_step=0.1,
-        shots_per_krylov=100000,
-    )
-    skqd = FlowGuidedSKQD(H, nf_basis, skqd_config)
-    skqd_results = skqd.run_with_nf(max_krylov_dim=12, progress=True)
-
-    # Get Krylov-discovered configs
-    krylov_set = set()
-    cumulative = skqd.build_cumulative_basis()
-    for bitstring in cumulative[-1].keys():
-        config = tuple(int(b) for b in bitstring)
-        krylov_set.add(config)
-
-    krylov_new = krylov_set - nf_set
-    combined_krylov = nf_set | krylov_set
-    combined_krylov_basis = set_to_configs(combined_krylov, H.num_sites, device)
-    E_with_krylov = compute_basis_energy(H, combined_krylov_basis)
-
-    print(f"Krylov found {len(krylov_new)} NEW configs (not in NF basis)")
-    print(f"Combined (NF+Krylov): {len(combined_krylov)} configs, E = {E_with_krylov:.8f} Ha")
-
-    # Step 3: Residual expansion from NF basis
-    print("\n--- Step 3: Residual (PT2) Expansion ---")
-    from krylov.residual_expansion import SelectedCIExpander, ResidualExpansionConfig
-
-    residual_config = ResidualExpansionConfig(
-        max_configs_per_iter=300,
-        max_iterations=10,
-    )
-    expander = SelectedCIExpander(H, residual_config)
-
-    expanded_basis = nf_basis.clone()
-    for i in range(10):
-        old_size = len(expanded_basis)
-        expanded_basis, stats = expander.expand_basis(expanded_basis)
-        if stats['configs_added'] == 0:
-            break
-        print(f"  Iter {i+1}: {old_size} -> {len(expanded_basis)} configs")
-
-    residual_set = configs_to_set(expanded_basis)
-    residual_new = residual_set - nf_set
-    E_with_residual = compute_basis_energy(H, expanded_basis)
-
-    print(f"Residual found {len(residual_new)} NEW configs (not in NF basis)")
-    print(f"Expanded (NF+Residual): {len(residual_set)} configs, E = {E_with_residual:.8f} Ha")
-
-    # Step 4: Analyze unique contributions
-    krylov_unique = krylov_new - residual_set  # Configs found ONLY by Krylov
-    residual_unique = residual_new - krylov_set  # Configs found ONLY by Residual
-    both_found = krylov_new & residual_new  # New configs found by both
-
-    elapsed = time.time() - start_time
-
-    # Results
-    error_nf = abs(E_nf_only - E_exact) * 1000
-    error_krylov = abs(E_with_krylov - E_exact) * 1000
-    error_residual = abs(E_with_residual - E_exact) * 1000
-
-    krylov_improvement = error_nf - error_krylov
-    residual_improvement = error_nf - error_residual
-
-    print("\n" + "=" * 70)
-    print("KRYLOV vs RESIDUAL RESULTS:")
-    print("=" * 70)
-    print(f"{'Metric':<35} {'Krylov':<15} {'Residual':<15}")
-    print("-" * 65)
-    print(f"{'New configs found':<35} {len(krylov_new):<15} {len(residual_new):<15}")
-    print(f"{'Unique configs (not in other)':<35} {len(krylov_unique):<15} {len(residual_unique):<15}")
-    print(f"{'Energy improvement (mHa)':<35} {krylov_improvement:<15.4f} {residual_improvement:<15.4f}")
-    print("-" * 65)
-    print(f"Configs found by BOTH methods: {len(both_found)}")
-    print(f"\nKrylov-unique configs: {len(krylov_unique)}")
-    print(f"Residual-unique configs: {len(residual_unique)}")
-
-    if len(krylov_unique) > 0:
-        print(f"\n>>> Krylov found {len(krylov_unique)} configs that Residual MISSED <<<")
-
-    return ExperimentResult(
-        name="krylov_vs_residual",
-        molecule=molecule,
-        exact_energy=E_exact,
-        nf_only_energy=E_nf_only,
-        skqd_only_energy=E_with_krylov,
-        residual_only_energy=E_with_residual,
-        skqd_unique_configs=len(krylov_unique),
-        residual_unique_configs=len(residual_unique),
-        time_seconds=elapsed,
-        notes=f"Krylov-unique: {len(krylov_unique)}, Residual-unique: {len(residual_unique)}"
     )
 
 
@@ -815,12 +629,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Experiment Modes:
-    isolated    - Test SKQD alone (no residual expansion)
+    isolated    - Test SKQD alone (NF only vs NF + SKQD)
     provenance  - Track which method finds each configuration
     stretched   - Test on stretched geometries (strong correlation)
     poor_init   - Test with limited NF training
     larger_basis- Test with 6-31G basis set
-    krylov_vs_residual - Direct comparison of methods
     all         - Run all experiments
         """
     )
@@ -829,7 +642,7 @@ Experiment Modes:
         type=str,
         default="all",
         choices=["isolated", "provenance", "stretched", "poor_init",
-                 "larger_basis", "krylov_vs_residual", "all"],
+                 "larger_basis", "all"],
         help="Experiment mode"
     )
     parser.add_argument(
@@ -872,9 +685,6 @@ Experiment Modes:
     if args.mode in ["larger_basis", "all"]:
         results.append(run_larger_basis_experiment("lih" if args.mode == "all" else args.molecule))
 
-    if args.mode in ["krylov_vs_residual", "all"]:
-        results.append(run_krylov_vs_residual_experiment(args.molecule))
-
     # Final summary
     print("\n" + "=" * 80)
     print("EXPERIMENT SUMMARY")
@@ -887,16 +697,15 @@ Experiment Modes:
     print("=" * 80)
     print("""
 These experiments demonstrate:
-1. ISOLATED_SKQD: How much Krylov helps when PT2 is unavailable
+1. ISOLATED_SKQD: How much Krylov helps on top of NF sampling
 2. PROVENANCE: What percentage of configs are uniquely Krylov-discovered
 3. STRETCHED: Whether Krylov helps more for strongly correlated systems
 4. POOR_INIT: Whether Krylov compensates for poor NF training
 5. LARGER_BASIS: Scalability to larger configuration spaces
-6. KRYLOV_VS_RESIDUAL: Direct head-to-head comparison
 
 Look for:
-- Krylov-unique configs > 0 (Krylov finds things Residual misses)
-- Energy improvement from Krylov when Residual is disabled
+- Krylov-unique configs > 0 (Krylov finds things NF misses)
+- Energy improvement from Krylov on top of NF
 - Better performance on stretched/correlated systems
     """)
 

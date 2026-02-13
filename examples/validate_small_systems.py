@@ -71,11 +71,10 @@ def validate_system(name, create_fn, bond_length=None, verbose=True):
     print(f"  FCI Energy: {E_fci:.8f} Ha")
 
     # Configure pipeline for small systems
-    # Direct-CI mode: skip NF training, go straight to essential configs + residual expansion
+    # Direct-CI mode: skip NF training, use essential configs + subspace diag
     config = PipelineConfig(
         use_particle_conserving_flow=True,
         use_diversity_selection=True,
-        use_residual_expansion=True,
         skip_nf_training=True,
         max_epochs=200,
         min_epochs=30,
@@ -92,7 +91,7 @@ def validate_system(name, create_fn, bond_length=None, verbose=True):
     # Extract final energy
     final_energy = results.get("combined_energy",
                      results.get("skqd_energy",
-                     results.get("residual_energy",
+                     results.get("sqd_energy",
                      results.get("nf_nqs_energy", float('inf')))))
 
     error_mha = abs(final_energy - E_fci) * 1000
