@@ -259,10 +259,10 @@ class QuantumCircuitSKQD:
             dt_scale: Multiplier for dt (0.5 for second-order Trotter half-steps).
         """
         theta = coeff * self.dt * dt_scale
-        cos_t = np.cos(theta)
-        sin_t = np.sin(theta)
+        cos_t = torch.tensor(np.cos(theta), dtype=torch.complex128, device=psi.device)
+        sin_t = torch.tensor(np.sin(theta), dtype=torch.complex128, device=psi.device)
 
-        if abs(sin_t) < 1e-15:
+        if abs(sin_t.real.item()) < 1e-15:
             return cos_t * psi
 
         # P|psi>: flip bits and apply phase

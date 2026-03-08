@@ -96,7 +96,7 @@ class PauliSum:
         """Remove near-zero terms in place."""
         self.terms = {ps: c for ps, c in self.terms.items() if abs(c) > threshold}
 
-    def to_real_lists(self, threshold: float = 1e-12) -> Tuple[List[float], List[str]]:
+    def to_real_lists(self, threshold: float = 1e-8) -> Tuple[List[float], List[str]]:
         """
         Export as (coefficients, pauli_words) with real coefficients.
 
