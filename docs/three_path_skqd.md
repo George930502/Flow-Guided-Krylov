@@ -23,7 +23,7 @@
 SKQD 來自 Yu et al. (arXiv:2501.09702) 的演算法。其核心思想是：
 
 1. 從一個參考態 $`\lvert \psi_0\rangle`$（通常是 Hartree-Fock 態）出發
-2. 透過時間演化算子 $U = e^{-iH\Delta t}$ 反覆作用，生成 **Krylov 態序列**：
+2. 透過時間演化算子 $`U = e^{-iH\Delta t}`$ 反覆作用，生成 **Krylov 態序列**：
    $$\lvert \psi_k\rangle = U^k \lvert \psi_0\rangle = e^{-ikH\Delta t} \lvert \psi_0\rangle, \quad k = 0, 1, \dots, d-1$$
 3. 對每個 Krylov 態 $`\lvert \psi_k\rangle`$ 進行計算基底（computational basis）量測取樣
 4. 收集所有取樣到的 bitstring，累積形成一個 **子空間基底**（subspace basis）
@@ -32,7 +32,7 @@ SKQD 來自 Yu et al. (arXiv:2501.09702) 的演算法。其核心思想是：
 
 ### 1.2 最佳時間步長（Theorem 3.1, Epperly et al.）
 
-時間演化的步長 $\Delta t$ 決定了 Krylov 子空間的品質。根據 Epperly 定理：
+時間演化的步長 Δt 決定了 Krylov 子空間的品質。根據 Epperly 定理：
 
 $$\Delta t_{\text{optimal}} = \frac{\pi}{E_{\max} - E_{\min}}$$
 
@@ -47,7 +47,7 @@ $$\Delta t_{\text{optimal}} = \frac{\pi}{E_{\max} - E_{\min}}$$
 量子電路需要 Pauli 表示的 Hamiltonian。**Jordan-Wigner 變換** 將二次量化的費米子算子轉換為 qubit 算子：
 
 - **數目算子**：$`a_p^\dagger a_p \rightarrow \frac{1}{2}(I - Z_p)`$
-- **跳躍算子** ($p < q$)：$`a_p^\dagger a_q \rightarrow \frac{1}{4}(XX + YY + iXY - iYX) \cdot Z_{\text{chain}}`$
+- **跳躍算子** (p < q)：$`a_p^\dagger a_q \rightarrow \frac{1}{4}(XX + YY + iXY - iYX) \cdot Z_{\text{chain}}`$
   - 其中 $`Z_{\text{chain}} = Z_{p+1} \cdots Z_{q-1}`$ 是 Jordan-Wigner 弦（string）
 
 雙體算子透過單體算子的乘積組合而成：
@@ -58,7 +58,7 @@ $$a_p^\dagger a_r^\dagger a_s a_q = (a_p^\dagger a_q)(a_r^\dagger a_s) - \delta_
 
 ### 1.4 Suzuki-Trotter 分解
 
-量子電路無法直接實現 $e^{-iH\Delta t}$（因為 $`H = \sum_k c_k P_k`$ 中各 Pauli 項不對易）。Trotter 分解提供了近似：
+量子電路無法直接實現 $`e^{-iH\Delta t}`$（因為 $`H = \sum_k c_k P_k`$ 中各 Pauli 項不對易）。Trotter 分解提供了近似：
 
 **一階 Trotter：**
 $$e^{-iH\Delta t} \approx \prod_k e^{-ic_k \Delta t \cdot P_k}$$
@@ -66,7 +66,7 @@ $$e^{-iH\Delta t} \approx \prod_k e^{-ic_k \Delta t \cdot P_k}$$
 **二階 Suzuki-Trotter（本專案預設）：**
 $$S_2(\Delta t) = \prod_{k=1}^{L} e^{-ic_k \frac{\Delta t}{2} P_k} \cdot \prod_{k=L}^{1} e^{-ic_k \frac{\Delta t}{2} P_k}$$
 
-對稱結構使得誤差為 $O(\Delta t^3)$，優於一階的 $O(\Delta t^2)$。
+對稱結構使得誤差為 O(Δt³)，優於一階的 O(Δt²)。
 
 ### 1.5 投影對角化
 
@@ -74,7 +74,7 @@ $$S_2(\Delta t) = \prod_{k=1}^{L} e^{-ic_k \frac{\Delta t}{2} P_k} \cdot \prod_{
 
 $$H_{\text{eff}}[i,j] = \langle s_i \rvert H \lvert s_j \rangle$$
 
-由於 computational basis 是正交歸一的，重疊矩陣 $S = I$，因此只需求解 **標準特徵值問題**（不需廣義特徵值問題）。
+由於 computational basis 是正交歸一的，重疊矩陣 S = I，因此只需求解 **標準特徵值問題**（不需廣義特徵值問題）。
 
 對角化使用的方法視矩陣大小而定：
 - 小矩陣：`torch.linalg.eigh`（dense）
@@ -87,16 +87,16 @@ $$H_{\text{eff}}[i,j] = \langle s_i \rvert H \lvert s_j \rangle$$
 | 屬性 | Direct Diag (No Krylov) | Path C (Exact Lanczos) | Path B (Trotterized State-Vector) | Path A (CUDA-Q Circuit) |
 |------|------------------------|------------------------|-----------------------------------|------------------------|
 | **子空間構建方法** | 組合列舉（HF+singles+doubles） | Krylov 時間演化取樣 | Krylov 時間演化取樣 | Krylov 時間演化取樣 |
-| **時間演化方法** | 無（不使用時間演化） | 精確 $e^{-iHt}$（Lanczos） | 二階 Suzuki-Trotter（state-vector） | 二階 Suzuki-Trotter（量子電路） |
-| **Trotter 誤差** | 無 | 無 | 有（$O(\Delta t^3)$） | 有（$O(\Delta t^3)$） |
+| **時間演化方法** | 無（不使用時間演化） | 精確 $`e^{-iHt}`$（Lanczos） | 二階 Suzuki-Trotter（state-vector） | 二階 Suzuki-Trotter（量子電路） |
+| **Trotter 誤差** | 無 | 無 | 有（O(Δt³)） | 有（O(Δt³)） |
 | **取樣噪聲** | 無（確定性列舉） | 有限 shots | 有限 shots | 有限 shots |
 | **量子硬體噪聲** | 無 | 無 | 無 | 無（模擬器） |
-| **Hilbert 空間** | 粒子數守恆子空間 | 完整 $2^n$ | 完整 $2^n$ | 完整 $2^n$ |
+| **Hilbert 空間** | 粒子數守恆子空間 | 完整 2ⁿ | 完整 2ⁿ | 完整 2ⁿ |
 | **初始態** | 不適用 | HF（Hartree-Fock） | HF（Hartree-Fock） | HF（Hartree-Fock） |
 | **取樣方式** | 確定性列舉 | `torch.multinomial` | `torch.multinomial` | `cudaq.sample` |
 | **RNG seed** | 不適用（無隨機性） | `seed + k + 1000` | `seed + k + 1000` | `seed + k`（CUDA-Q 內部） |
 | **實作位置** | `pipeline.py:_generate_essential_configs` + `projected_hamiltonian.py` | `quantum_skqd.py:_sample_exact` | `quantum_skqd.py:_sample_classical_trotterized` | `quantum_skqd.py:_sample_cudaq` |
-| **系統規模限制** | 組合爆炸（doubles 數量 $\propto n^4$） | 記憶體（Lanczos 向量） | `phase_table`（n\_terms × 2^n）；2^n ≤ 100,000 | CUDA-Q 電路深度 |
+| **系統規模限制** | 組合爆炸（doubles 數量 ∝ n⁴） | 記憶體（Lanczos 向量） | `phase_table`（n\_terms × 2^n）；2^n ≤ 100,000 | CUDA-Q 電路深度 |
 | **依賴** | PySCF + SciPy | PyTorch | PyTorch | CUDA-Q（`cuda-quantum-cu12`） |
 
 **Path A/B/C 的唯一變因**：三條 Krylov 路徑之間 **只有時間演化方法不同**，所有其他變因完全一致。
@@ -181,7 +181,7 @@ Direct Diag 是最簡單的子空間對角化方法：**完全不使用時間演
 
 - 只有 **單激發**（single excitation）和 **雙激發**（double excitation）與 HF 態之間有非零的 Hamiltonian 矩陣元素
 - 基態波函數以 HF 態為主導，主要修正來自 doubles（佔 > 90% 的相關能量），其次是 singles
-- 對於小系統（$\leq 18$ qubits），HF + singles + doubles 已涵蓋整個粒子數守恆子空間（即 Full CI）
+- 對於小系統（≤ 18 qubits），HF + singles + doubles 已涵蓋整個粒子數守恆子空間（即 Full CI）
 
 因此，Direct Diag 在小系統上等價於 **精確 FCI**（Full Configuration Interaction），是無偏差的精確解。
 
@@ -285,18 +285,18 @@ $$n_{\text{doubles}} = \binom{n_{\alpha}^{\text{occ}}}{1}\binom{n_{\alpha}^{\tex
 | 維度 | Direct Diag | Krylov 路徑 (Path A/B/C) |
 |------|-------------|--------------------------|
 | 子空間構建 | 組合列舉（確定性） | 時間演化取樣（隨機性） |
-| 基底來源 | 物理直覺（Slater-Condon） | 動力學探索（$e^{-iHt}$ 驅動） |
+| 基底來源 | 物理直覺（Slater-Condon） | 動力學探索（$`e^{-iHt}`$ 驅動） |
 | 高階激發 | 不包含（僅到 doubles） | 可自然探索到 triples+ |
 | 隨機性 | 無 | 有（shots 取樣） |
 | 可重現性 | 完全確定性 | 依賴 seed |
 | Hamiltonian 表示 | 二次量化（Slater-Condon） | Pauli 表示（Jordan-Wigner） |
-| 計算成本 | $O(N^2)$ 矩陣元素 | $O(d \times \text{shots} \times N^2)$ |
+| 計算成本 | O(N²) 矩陣元素 | $`O(d \times \text{shots} \times N^2)`$ |
 
 ### 4.6 適用場景
 
-- **小系統（$\leq 18$ qubits）**：Direct Diag 通常已達 FCI，Krylov 無額外貢獻
+- **小系統（≤ 18 qubits）**：Direct Diag 通常已達 FCI，Krylov 無額外貢獻
 - **中型系統（20-24 qubits）**：Direct Diag 給出 CISD 級精度，Krylov 可補充 triples/quadruples
-- **大型系統（$\geq 26$ qubits）**：doubles 數量組合爆炸（$\propto n^4$），Direct Diag 本身的矩陣建構也成為瓶頸；此時需 NF-NQS 取樣
+- **大型系統（≥ 26 qubits）**：doubles 數量組合爆炸（∝ n⁴），Direct Diag 本身的矩陣建構也成為瓶頸；此時需 NF-NQS 取樣
 
 ### 4.7 特點
 
@@ -311,13 +311,13 @@ $$n_{\text{doubles}} = \binom{n_{\alpha}^{\text{occ}}}{1}\binom{n_{\alpha}^{\tex
 
 ### 5.1 理論
 
-Path C 在完整的 $2^n$ Hilbert 空間中計算 **精確的** $e^{-iHt}\lvert \psi\rangle$，不使用 Trotter 分解。這是實驗的 **黃金標準參考**（gold standard reference）。
+Path C 在完整的 2ⁿ Hilbert 空間中計算 **精確的** $`e^{-iHt}\lvert \psi\rangle`$，不使用 Trotter 分解。這是實驗的 **黃金標準參考**（gold standard reference）。
 
 Lanczos 演算法將矩陣指數投影到一個小的 Krylov 子空間上：
 
 1. 建構 Lanczos 基底 $`\{v_0, v_1, \dots, v_{m-1}\}`$，其中 $`v_0 = \lvert \psi\rangle / \lVert \lvert \psi\rangle\rVert `$
-2. 在 Lanczos 基底中，$H$ 的投影為三對角矩陣 $T$（$m \times m$，$m \ll 2^n$）
-3. 計算小矩陣 $e^{-itT}$（$m$ 通常 $\leq 30$，可 dense 對角化）
+2. 在 Lanczos 基底中，H 的投影為三對角矩陣 T（m × m，m ≪ 2ⁿ）
+3. 計算小矩陣 $`e^{-itT}`$（m 通常 ≤ 30，可 dense 對角化）
 4. 投影回原空間：$`e^{-iHt}\lvert \psi\rangle \approx \lVert \lvert \psi\rangle\rVert \cdot V \cdot e^{-itT} \cdot e_0`$
 
 ### 5.2 實作流程
@@ -347,20 +347,20 @@ Lanczos 演算法將矩陣指數投影到一個小的 Krylov 子空間上：
 
 ### 5.3 Hamiltonian matvec 實作
 
-Path C 的 Lanczos 需要反覆計算 $H\lvert \psi\rangle$。使用 **輕量級 Pauli mask**（`_precompute_pauli_masks_lightweight()`）：
+Path C 的 Lanczos 需要反覆計算 H|ψ⟩。使用 **輕量級 Pauli mask**（`_precompute_pauli_masks_lightweight()`）：
 
 - 僅儲存 $`O(n_{\text{terms}})`$ 的整數遮罩（flip mask、YZ mask），不儲存 $`O(n_{\text{terms}} \times 2^n)`$ 的 phase table
 - 每個 Pauli term 的相位透過 **bit parity** 即時計算：
   $$\text{phase}(x) = i^{n_Y} \cdot (-1)^{\text{popcount}(x \wedge \text{yz\_mask})}$$
 - 分塊處理（`chunk_size` 根據維度自適應）以控制 GPU 記憶體
 
-這使得 Path C 能處理 $\geq 18$ qubit 的系統（$2^{18} = 262{,}144$ 維），而不像 Path B 那樣被 `phase_table` 的記憶體限制。
+這使得 Path C 能處理 ≥ 18 qubit 的系統（2¹⁸ = 262,144 維），而不像 Path B 那樣被 `phase_table` 的記憶體限制。
 
 ### 5.4 特點
 
-- **零 Trotter 誤差**：結果等價於在 $2^n$ 空間中做精確對角化的 Krylov 方法
+- **零 Trotter 誤差**：結果等價於在 2ⁿ 空間中做精確對角化的 Krylov 方法
 - **取樣誤差依然存在**：使用有限 shots 取樣，因此結果不完全等於 FCI
-- **適用所有系統大小**：記憶體瓶頸在 Lanczos 向量（$O(2^n)$），而非 phase table
+- **適用所有系統大小**：記憶體瓶頸在 Lanczos 向量（O(2ⁿ)），而非 phase table
 
 ---
 
@@ -370,11 +370,11 @@ Path C 的 Lanczos 需要反覆計算 $H\lvert \psi\rangle$。使用 **輕量級
 
 Path B 在 GPU 上使用 **state-vector 模擬** 實現 Trotterized 時間演化。這是量子電路（Path A）的 **精確經典模擬**——兩者具有完全相同的 Trotter 分解結構，但 Path B 用數值計算取代量子閘操作。
 
-每個 Pauli 旋轉 $`e^{-i\theta P_k}`$ 利用 $P^2 = I$ 的性質解析求解：
+每個 Pauli 旋轉 $`e^{-i\theta P_k}`$ 利用 P² = I 的性質解析求解：
 
 $$e^{-i\theta P}\lvert \psi\rangle = \cos(\theta)\lvert \psi\rangle - i\sin(\theta) P\lvert \psi\rangle$$
 
-其中 $P\lvert \psi\rangle$ 透過預計算的 **flip mask** 和 **phase table** 在 $O(2^n)$ 時間內完成。
+其中 P|ψ⟩ 透過預計算的 **flip mask** 和 **phase table** 在 O(2ⁿ) 時間內完成。
 
 ### 6.2 預計算結構
 
@@ -382,17 +382,17 @@ $$e^{-i\theta P}\lvert \psi\rangle = \cos(\theta)\lvert \psi\rangle - i\sin(\the
 
 **Flip mask**（$`n_{\text{terms}}`$ 個整數）：
 
-每個 Pauli term 的 flip mask 記錄了 X 和 Y 算子的位置。對 basis state $\lvert x\rangle$：
+每個 Pauli term 的 flip mask 記錄了 X 和 Y 算子的位置。對 basis state |x⟩：
 $$P_k\lvert x\rangle = \text{phase}(x) \cdot \lvert x \oplus \text{flip\_mask}_k\rangle$$
 
 **Phase table**（$`n_{\text{terms}} \times 2^n`$ complex128 張量）：
 
 對每個 (term, state) 對，記錄複數相位。相位由 Z 和 Y 算子的貢獻決定：
-- Z 在 bit=1 的位置：因子 $-1$（即 $i^2$）
-- Y 在 bit=0 的位置：因子 $+i$（即 $i^1$）
-- Y 在 bit=1 的位置：因子 $-i$（即 $i^3$）
+- Z 在 bit=1 的位置：因子 −1（即 i²）
+- Y 在 bit=0 的位置：因子 +i（即 i¹）
+- Y 在 bit=1 的位置：因子 −i（即 i³）
 
-所有相位累積 mod 4，然後映射到 $\{1, i, -1, -i\}$。
+所有相位累積 mod 4，然後映射到 {1, i, −1, −i}。
 
 ### 6.3 實作流程
 
@@ -436,14 +436,14 @@ $$P_k\lvert x\rangle = \text{phase}(x) \cdot \lvert x \oplus \text{flip\_mask}_k
 每個 Krylov step 的成本：
 $$O(k \cdot n_{\text{trotter\_steps}} \cdot 2 \cdot n_{\text{terms}} \cdot 2^n)$$
 
-例如 LiH（12 qubits, ~630 Pauli terms, 1 Trotter step, $2^{12} = 4{,}096$）：
+例如 LiH（12 qubits, ~630 Pauli terms, 1 Trotter step, 2¹² = 4,096）：
 $$\text{每個 } k: 630 \times 2 \times 4{,}096 \approx 5.2\text{M 浮點運算}$$
 
 ### 6.5 記憶體限制
 
 Phase table 的大小為 $`n_{\text{terms}} \times 2^n \times 16`$ bytes（complex128）。這限制了 Path B 的最大系統大小：
 
-| 系統 | Qubits | $2^n$ | Pauli terms | Phase table 大小 |
+| 系統 | Qubits | 2ⁿ | Pauli terms | Phase table 大小 |
 |------|--------|-------|-------------|-----------------|
 | H2   | 4      | 16    | ~15         | 3.8 KB          |
 | LiH  | 12     | 4,096 | ~630        | 39.3 MB         |
@@ -452,7 +452,7 @@ Phase table 的大小為 $`n_{\text{terms}} \times 2^n \times 16`$ bytes（compl
 | NH3  | 16     | 65,536| ~3,000      | 3.0 GB          |
 | CH4  | 18     | 262K  | ~6,000      | 24 GB           |
 
-**因此，Path B 在 $2^n > 100{,}000$（約 $\geq 18$ qubits）時自動跳過**，以避免 OOM。
+**因此，Path B 在 2ⁿ > 100,000（約 ≥ 18 qubits）時自動跳過**，以避免 OOM。
 
 ### 6.6 特點
 
@@ -585,12 +585,12 @@ else:
 | Hamiltonian | 相同 | 同一個 `MolecularHamiltonian` 實例 |
 | Pauli 分解 | 相同 | 同一次 Jordan-Wigner 轉換結果 |
 | 初始態 | 相同 | 都是 HF 態 |
-| 時間步長 $\Delta t$ | 相同 | 都用 π / spectral\_range |
+| 時間步長 Δt | 相同 | 都用 π / spectral\_range |
 | Krylov 維度 | 相同 | 都是 15 |
 | Trotter 階數 | 相同 | 都是二階（Path C 雖不使用 Trotter，但設定一致） |
 | Shots 數 | 相同 | 都是 100,000 |
 | 累積策略 | 相同 | 都是 cumulative union |
-| Hilbert 空間 | 相同 | 都在完整 $2^n$ 空間中操作 |
+| Hilbert 空間 | 相同 | 都在完整 2ⁿ 空間中操作 |
 | 投影對角化 | 相同 | 都用 Slater-Condon 規則 + `torch.linalg.eigh` |
 | **時間演化方法** | **不同** | Path C: Lanczos, Path B: Trotter state-vector, Path A: Trotter circuit |
 
@@ -713,7 +713,7 @@ $$\text{error} < 1.594 \text{ mHa} \approx 1 \text{ kcal/mol}$$
 | N2   | 20     | 1.1427       | skip         | 1.1003       | ---               |
 
 - 所有 7 個系統在所有可用路徑上均通過化學精度 (< 1.594 mHa)
-- CH4/N2 的 Path B 因 `phase_table` 記憶體限制（$2^n > 100{,}000$）而跳過
+- CH4/N2 的 Path B 因 `phase_table` 記憶體限制（2ⁿ > 100,000）而跳過
 - Trotter 效應（B-C 差異）隨系統大小增加，但仍在 0.1 mHa 量級
 
 ### 10.2 觀察
@@ -732,7 +732,7 @@ $$\text{error} < 1.594 \text{ mHa} \approx 1 \text{ kcal/mol}$$
 | `src/krylov/quantum_skqd.py` | **三路徑核心實作**。`QuantumCircuitSKQD` 類別同時實現 Path A (`_sample_cudaq`)、Path B (`_sample_classical_trotterized`)、Path C (`_sample_exact`) |
 | `src/krylov/skqd.py` | **經典 SKQD**（pipeline 主路徑使用）。在粒子數守恆子空間中做精確 `gpu_expm_multiply`，不使用 Pauli 分解 |
 | `src/hamiltonians/pauli_mapping.py` | Jordan-Wigner 轉換。`PauliSum` 代數、`molecular_hamiltonian_to_pauli()` |
-| `src/krylov/spectral_utils.py` | `compute_optimal_dt()`：從光譜範圍計算最佳 $\Delta t$ |
+| `src/krylov/spectral_utils.py` | `compute_optimal_dt()`：從光譜範圍計算最佳 Δt |
 | `src/utils/gpu_linalg.py` | GPU 加速線性代數：`gpu_eigh`, `gpu_eigsh`, `gpu_expm_multiply` |
 | `examples/quantum_vs_classical_krylov.py` | **三路徑比較腳本**。入口點 `run_comparison()`，輸出 summary table |
 
@@ -744,9 +744,9 @@ $$\text{error} < 1.594 \text{ mHa} \approx 1 \text{ kcal/mol}$$
 
 | 屬性 | Path C (quantum_skqd.py) | Pipeline Classical SKQD (skqd.py) |
 |------|-------------------------|-----------------------------------|
-| 空間 | 完整 $2^n$ Hilbert space | 粒子數守恆子空間（$\ll 2^n$） |
+| 空間 | 完整 2ⁿ Hilbert space | 粒子數守恆子空間（≪ 2ⁿ） |
 | Hamiltonian 表示 | Pauli 字串 | Slater-Condon 規則 |
 | 時間演化 | Lanczos matvec（Pauli masks） | `gpu_expm_multiply`（dense 子空間矩陣） |
 | 用途 | 三路徑比較實驗 | Pipeline 生產路徑 |
 
-Path C 故意在完整 $2^n$ 空間操作，以確保與 Path A/B 使用相同的 Hilbert 空間，維持受控實驗的公平性。Pipeline 的 Classical SKQD 則利用粒子數守恆子空間大幅加速，是生產環境的最佳選擇。
+Path C 故意在完整 2ⁿ 空間操作，以確保與 Path A/B 使用相同的 Hilbert 空間，維持受控實驗的公平性。Pipeline 的 Classical SKQD 則利用粒子數守恆子空間大幅加速，是生產環境的最佳選擇。
