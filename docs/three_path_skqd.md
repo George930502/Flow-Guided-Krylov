@@ -22,12 +22,12 @@
 
 SKQD 來自 Yu et al. (arXiv:2501.09702) 的演算法。其核心思想是：
 
-1. 從一個參考態 $|\psi_0\rangle$（通常是 Hartree-Fock 態）出發
+1. 從一個參考態 $\lvert \psi_0\rangle$（通常是 Hartree-Fock 態）出發
 2. 透過時間演化算子 $U = e^{-iH\Delta t}$ 反覆作用，生成 **Krylov 態序列**：
-   $$|\psi_k\rangle = U^k |\psi_0\rangle = e^{-ikH\Delta t} |\psi_0\rangle, \quad k = 0, 1, \dots, d-1$$
-3. 對每個 Krylov 態 $|\psi_k\rangle$ 進行計算基底（computational basis）量測取樣
+   $$\lvert \psi_k\rangle = U^k \lvert \psi_0\rangle = e^{-ikH\Delta t} \lvert \psi_0\rangle, \quad k = 0, 1, \dots, d-1$$
+3. 對每個 Krylov 態 $\lvert \psi_k\rangle$ 進行計算基底（computational basis）量測取樣
 4. 收集所有取樣到的 bitstring，累積形成一個 **子空間基底**（subspace basis）
-5. 在此基底上投影 Hamiltonian：$H_{\text{eff}}[i,j] = \langle s_i | H | s_j \rangle$
+5. 在此基底上投影 Hamiltonian：$H_{\text{eff}}[i,j] = \langle s_i \rvert H \lvert s_j \rangle$
 6. 對投影後的有效 Hamiltonian 進行對角化，取最小特徵值作為基態能量估計
 
 ### 1.2 最佳時間步長（Theorem 3.1, Epperly et al.）
@@ -70,9 +70,9 @@ $$S_2(\Delta t) = \prod_{k=1}^{L} e^{-ic_k \frac{\Delta t}{2} P_k} \cdot \prod_{
 
 ### 1.5 投影對角化
 
-給定一組取樣到的 computational basis 態 $\{|s_i\rangle\}_{i=1}^{N}$，投影 Hamiltonian 矩陣為：
+給定一組取樣到的 computational basis 態 $\{\lvert s_i\rangle\}_{i=1}^{N}$，投影 Hamiltonian 矩陣為：
 
-$$H_{\text{eff}}[i,j] = \langle s_i | H | s_j \rangle$$
+$$H_{\text{eff}}[i,j] = \langle s_i \rvert H \lvert s_j \rangle$$
 
 由於 computational basis 是正交歸一的，重疊矩陣 $S = I$，因此只需求解 **標準特徵值問題**（不需廣義特徵值問題）。
 
@@ -311,14 +311,14 @@ $$n_{\text{doubles}} = \binom{n_{\alpha}^{\text{occ}}}{1}\binom{n_{\alpha}^{\tex
 
 ### 5.1 理論
 
-Path C 在完整的 $2^n$ Hilbert 空間中計算 **精確的** $e^{-iHt}|\psi\rangle$，不使用 Trotter 分解。這是實驗的 **黃金標準參考**（gold standard reference）。
+Path C 在完整的 $2^n$ Hilbert 空間中計算 **精確的** $e^{-iHt}\lvert \psi\rangle$，不使用 Trotter 分解。這是實驗的 **黃金標準參考**（gold standard reference）。
 
 Lanczos 演算法將矩陣指數投影到一個小的 Krylov 子空間上：
 
-1. 建構 Lanczos 基底 $\{v_0, v_1, \dots, v_{m-1}\}$，其中 $v_0 = |\psi\rangle / \||\psi\rangle\|$
+1. 建構 Lanczos 基底 $\{v_0, v_1, \dots, v_{m-1}\}$，其中 $v_0 = \lvert \psi\rangle / \lVert \lvert \psi\rangle\rVert $
 2. 在 Lanczos 基底中，$H$ 的投影為三對角矩陣 $T$（$m \times m$，$m \ll 2^n$）
 3. 計算小矩陣 $e^{-itT}$（$m$ 通常 $\leq 30$，可 dense 對角化）
-4. 投影回原空間：$e^{-iHt}|\psi\rangle \approx \||\psi\rangle\| \cdot V \cdot e^{-itT} \cdot e_0$
+4. 投影回原空間：$e^{-iHt}\lvert \psi\rangle \approx \lVert \lvert \psi\rangle\rVert \cdot V \cdot e^{-itT} \cdot e_0$
 
 ### 5.2 實作流程
 
@@ -347,7 +347,7 @@ Lanczos 演算法將矩陣指數投影到一個小的 Krylov 子空間上：
 
 ### 5.3 Hamiltonian matvec 實作
 
-Path C 的 Lanczos 需要反覆計算 $H|\psi\rangle$。使用 **輕量級 Pauli mask**（`_precompute_pauli_masks_lightweight()`）：
+Path C 的 Lanczos 需要反覆計算 $H\lvert \psi\rangle$。使用 **輕量級 Pauli mask**（`_precompute_pauli_masks_lightweight()`）：
 
 - 僅儲存 $O(n_{\text{terms}})$ 的整數遮罩（flip mask、YZ mask），不儲存 $O(n_{\text{terms}} \times 2^n)$ 的 phase table
 - 每個 Pauli term 的相位透過 **bit parity** 即時計算：
@@ -372,9 +372,9 @@ Path B 在 GPU 上使用 **state-vector 模擬** 實現 Trotterized 時間演化
 
 每個 Pauli 旋轉 $e^{-i\theta P_k}$ 利用 $P^2 = I$ 的性質解析求解：
 
-$$e^{-i\theta P}|\psi\rangle = \cos(\theta)|\psi\rangle - i\sin(\theta) P|\psi\rangle$$
+$$e^{-i\theta P}\lvert \psi\rangle = \cos(\theta)\lvert \psi\rangle - i\sin(\theta) P\lvert \psi\rangle$$
 
-其中 $P|\psi\rangle$ 透過預計算的 **flip mask** 和 **phase table** 在 $O(2^n)$ 時間內完成。
+其中 $P\lvert \psi\rangle$ 透過預計算的 **flip mask** 和 **phase table** 在 $O(2^n)$ 時間內完成。
 
 ### 6.2 預計算結構
 
@@ -382,8 +382,8 @@ $$e^{-i\theta P}|\psi\rangle = \cos(\theta)|\psi\rangle - i\sin(\theta) P|\psi\r
 
 **Flip mask**（$n_{\text{terms}}$ 個整數）：
 
-每個 Pauli term 的 flip mask 記錄了 X 和 Y 算子的位置。對 basis state $|x\rangle$：
-$$P_k|x\rangle = \text{phase}(x) \cdot |x \oplus \text{flip\_mask}_k\rangle$$
+每個 Pauli term 的 flip mask 記錄了 X 和 Y 算子的位置。對 basis state $\lvert x\rangle$：
+$$P_k\lvert x\rangle = \text{phase}(x) \cdot \lvert x \oplus \text{flip\_mask}_k\rangle$$
 
 **Phase table**（$n_{\text{terms}} \times 2^n$ complex128 張量）：
 
