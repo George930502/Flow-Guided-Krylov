@@ -1,13 +1,15 @@
 """
-Moderate System Benchmark: SKQD vs SQD Subspace Comparison.
+Moderate System Benchmark: SKQD vs SQD-Clean vs SQD-Recovery Comparison.
 
-Tests molecular systems in the 20-30 qubit range to compare two
-fundamentally different subspace construction strategies:
+Tests molecular systems in the 20-30 qubit range to compare three
+subspace construction strategies:
 
 - SKQD (Krylov-based): NF-NQS generates initial configs, Krylov time
   evolution U^k = e^{-iHdt} expands subspace iteratively
-- SQD (Sampling-based): NF-NQS samples + configuration recovery +
-  batch diagonalization + self-consistent orbital occupancy loop
+- SQD-Clean (Sampling-based, no noise): Particle-conserving NF-NQS
+  samples -> batch diagonalization + energy-variance extrapolation
+- SQD-Recovery (Sampling-based, with noise): Particle-conserving NF-NQS
+  samples + depolarizing noise -> S-CORE configuration recovery + batch diag
 
 Systems tested (ordered by qubit count):
 - CO (carbon monoxide): 20 qubits, 14 electrons
@@ -21,7 +23,8 @@ Systems tested (ordered by qubit count):
 Usage:
     docker-compose run --rm flow-krylov-gpu python examples/moderate_system_benchmark.py --system all
     docker-compose run --rm flow-krylov-gpu python examples/moderate_system_benchmark.py --system c2h4
-    docker-compose run --rm flow-krylov-gpu python examples/moderate_system_benchmark.py --system co --mode sqd
+    docker-compose run --rm flow-krylov-gpu python examples/moderate_system_benchmark.py --system co --mode sqd-recovery
+    docker-compose run --rm flow-krylov-gpu python examples/moderate_system_benchmark.py --noise-rate 0.15
 """
 
 import sys
@@ -77,16 +80,19 @@ class BenchmarkResult:
     # Energies from each mode
     nf_energy: float = 0.0
     skqd_energy: float = 0.0
-    sqd_energy: float = 0.0
+    sqd_clean_energy: float = 0.0
+    sqd_recovery_energy: float = 0.0
 
     # Timing
     time_nf: float = 0.0
     time_skqd: float = 0.0
-    time_sqd: float = 0.0
+    time_sqd_clean: float = 0.0
+    time_sqd_recovery: float = 0.0
 
     # Errors (mHa)
     skqd_error_mha: float = 0.0
-    sqd_error_mha: float = 0.0
+    sqd_clean_error_mha: float = 0.0
+    sqd_recovery_error_mha: float = 0.0
 
 
 def print_banner(title: str):
@@ -325,7 +331,8 @@ def create_nh3_631g_molecule(
 
 def run_benchmark(
     molecule_key: str,
-    mode: str = "both",
+    mode: str = "all",
+    noise_rate: float = 0.1,
     verbose: bool = True,
 ) -> BenchmarkResult:
     """
@@ -333,7 +340,8 @@ def run_benchmark(
 
     Args:
         molecule_key: Key for molecule factory
-        mode: "skqd", "sqd", or "both"
+        mode: "skqd", "sqd-clean", "sqd-recovery", or "all"
+        noise_rate: Depolarizing noise rate for SQD-Recovery mode
         verbose: Print detailed progress
     """
     factories = {
@@ -417,10 +425,17 @@ def run_benchmark(
         energy_type=energy_type,
     )
 
+    def _get_energy(results):
+        return results.get(
+            'combined_energy',
+            results.get('skqd_energy',
+            results.get('sqd_energy', float('inf')))
+        )
+
     # =======================================================================
     # Run SKQD mode
     # =======================================================================
-    if mode in ("skqd", "both"):
+    if mode in ("skqd", "all"):
         print("\n--- SKQD Mode (Krylov Time Evolution) ---")
         t0 = time.time()
 
@@ -435,11 +450,7 @@ def run_benchmark(
         pipeline_skqd = FlowGuidedKrylovPipeline(H, config=config_skqd, exact_energy=E_exact)
         results_skqd = pipeline_skqd.run(progress=verbose)
 
-        result.skqd_energy = results_skqd.get(
-            'combined_energy',
-            results_skqd.get('skqd_energy',
-            results_skqd.get('sqd_energy', float('inf')))
-        )
+        result.skqd_energy = _get_energy(results_skqd)
         result.time_skqd = time.time() - t0
         result.nf_configs = results_skqd.get('nf_basis_size', 0)
         result.nf_energy = results_skqd.get('nf_nqs_energy', 0.0)
@@ -449,43 +460,70 @@ def run_benchmark(
         print(f"  SKQD time: {result.time_skqd:.1f}s")
 
     # =======================================================================
-    # Run SQD mode
+    # Run SQD-Clean mode
     # =======================================================================
-    if mode in ("sqd", "both"):
-        print("\n--- SQD Mode (Sampling-Based Batch Diagonalization) ---")
+    if mode in ("sqd-clean", "all"):
+        print("\n--- SQD-Clean Mode (Batch Diag, No Noise) ---")
         t0 = time.time()
 
-        config_sqd = PipelineConfig(
+        config_sqd_clean = PipelineConfig(
             subspace_mode="sqd",
             skip_nf_training=True,
             max_epochs=400,
             sqd_num_batches=5,
             sqd_self_consistent_iters=3,
+            sqd_noise_rate=0.0,
             device=device,
         )
-        config_sqd.adapt_to_system_size(n_valid)
+        config_sqd_clean.adapt_to_system_size(n_valid)
 
-        pipeline_sqd = FlowGuidedKrylovPipeline(H, config=config_sqd, exact_energy=E_exact)
+        pipeline_sqd = FlowGuidedKrylovPipeline(H, config=config_sqd_clean, exact_energy=E_exact)
         results_sqd = pipeline_sqd.run(progress=verbose)
 
-        result.sqd_energy = results_sqd.get(
-            'combined_energy',
-            results_sqd.get('sqd_energy',
-            results_sqd.get('skqd_energy', float('inf')))
-        )
-        result.time_sqd = time.time() - t0
+        result.sqd_clean_energy = _get_energy(results_sqd)
+        result.time_sqd_clean = time.time() - t0
 
-        sqd_comparison = format_energy_comparison(result.sqd_energy, E_exact, energy_type)
-        print(f"  SQD energy: {result.sqd_energy:.8f} Ha ({sqd_comparison})")
-        print(f"  SQD time: {result.time_sqd:.1f}s")
+        sqd_comparison = format_energy_comparison(result.sqd_clean_energy, E_exact, energy_type)
+        print(f"  SQD-Clean energy: {result.sqd_clean_energy:.8f} Ha ({sqd_comparison})")
+        print(f"  SQD-Clean time: {result.time_sqd_clean:.1f}s")
+
+    # =======================================================================
+    # Run SQD-Recovery mode
+    # =======================================================================
+    if mode in ("sqd-recovery", "all"):
+        print(f"\n--- SQD-Recovery Mode (Noise={noise_rate}, S-CORE Recovery) ---")
+        t0 = time.time()
+
+        config_sqd_recovery = PipelineConfig(
+            subspace_mode="sqd",
+            skip_nf_training=True,
+            max_epochs=400,
+            sqd_num_batches=5,
+            sqd_self_consistent_iters=5,
+            sqd_noise_rate=noise_rate,
+            device=device,
+        )
+        config_sqd_recovery.adapt_to_system_size(n_valid)
+
+        pipeline_sqd = FlowGuidedKrylovPipeline(H, config=config_sqd_recovery, exact_energy=E_exact)
+        results_sqd = pipeline_sqd.run(progress=verbose)
+
+        result.sqd_recovery_energy = _get_energy(results_sqd)
+        result.time_sqd_recovery = time.time() - t0
+
+        sqd_comparison = format_energy_comparison(result.sqd_recovery_energy, E_exact, energy_type)
+        print(f"  SQD-Recovery energy: {result.sqd_recovery_energy:.8f} Ha ({sqd_comparison})")
+        print(f"  SQD-Recovery time: {result.time_sqd_recovery:.1f}s")
 
     # =======================================================================
     # Compute errors
     # =======================================================================
     if result.skqd_energy != 0.0:
         result.skqd_error_mha = abs(result.skqd_energy - E_exact) * 1000
-    if result.sqd_energy != 0.0:
-        result.sqd_error_mha = abs(result.sqd_energy - E_exact) * 1000
+    if result.sqd_clean_energy != 0.0:
+        result.sqd_clean_error_mha = abs(result.sqd_clean_energy - E_exact) * 1000
+    if result.sqd_recovery_energy != 0.0:
+        result.sqd_recovery_error_mha = abs(result.sqd_recovery_energy - E_exact) * 1000
 
     # =======================================================================
     # Summary
@@ -498,20 +536,30 @@ def run_benchmark(
     print(f"  Reference: {energy_type} = {E_exact:.8f} Ha")
     print(f"  NF Configs: {result.nf_configs}")
 
-    if mode in ("skqd", "both"):
-        print(f"  SKQD Energy: {result.skqd_energy:.8f} Ha (error: {result.skqd_error_mha:.4f} mHa)")
-    if mode in ("sqd", "both"):
-        print(f"  SQD Energy:  {result.sqd_energy:.8f} Ha (error: {result.sqd_error_mha:.4f} mHa)")
+    if mode in ("skqd", "all"):
+        print(f"  SKQD Energy:         {result.skqd_energy:.8f} Ha (error: {result.skqd_error_mha:.4f} mHa)")
+    if mode in ("sqd-clean", "all"):
+        print(f"  SQD-Clean Energy:    {result.sqd_clean_energy:.8f} Ha (error: {result.sqd_clean_error_mha:.4f} mHa)")
+    if mode in ("sqd-recovery", "all"):
+        print(f"  SQD-Recovery Energy: {result.sqd_recovery_energy:.8f} Ha (error: {result.sqd_recovery_error_mha:.4f} mHa)")
 
-    if mode == "both" and result.skqd_energy != 0.0 and result.sqd_energy != 0.0:
-        better = "SKQD" if result.skqd_error_mha < result.sqd_error_mha else "SQD"
-        diff = abs(result.skqd_error_mha - result.sqd_error_mha)
-        print(f"  Better method: {better} (by {diff:.4f} mHa)")
+    if mode == "all":
+        errors = {}
+        if result.skqd_energy != 0.0:
+            errors["SKQD"] = result.skqd_error_mha
+        if result.sqd_clean_energy != 0.0:
+            errors["SQD-Clean"] = result.sqd_clean_error_mha
+        if result.sqd_recovery_energy != 0.0:
+            errors["SQD-Recovery"] = result.sqd_recovery_error_mha
+        if errors:
+            best = min(errors, key=errors.get)
+            print(f"  Best method: {best} ({errors[best]:.4f} mHa)")
 
     if energy_type == "FCI":
         best_error = min(
             result.skqd_error_mha if result.skqd_energy != 0.0 else float('inf'),
-            result.sqd_error_mha if result.sqd_energy != 0.0 else float('inf'),
+            result.sqd_clean_error_mha if result.sqd_clean_energy != 0.0 else float('inf'),
+            result.sqd_recovery_error_mha if result.sqd_recovery_energy != 0.0 else float('inf'),
         )
         chem_acc = "PASS" if best_error < 1.6 else "FAIL"
         print(f"  Chemical accuracy: {chem_acc} (best error: {best_error:.4f} mHa)")
@@ -533,9 +581,15 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        default="both",
-        choices=["skqd", "sqd", "both"],
-        help="Subspace mode to run (default: both)",
+        default="all",
+        choices=["skqd", "sqd-clean", "sqd-recovery", "all"],
+        help="Subspace mode to run (default: all)",
+    )
+    parser.add_argument(
+        "--noise-rate",
+        type=float,
+        default=0.1,
+        help="Depolarizing noise rate for SQD-Recovery mode (default: 0.1)",
     )
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
 
@@ -552,7 +606,7 @@ def main():
 
     for system_key in systems_to_run:
         try:
-            result = run_benchmark(system_key, mode=args.mode, verbose=not args.quiet)
+            result = run_benchmark(system_key, mode=args.mode, noise_rate=args.noise_rate, verbose=not args.quiet)
             all_results.append(result)
         except Exception as e:
             print(f"\nError running {system_key}: {e}")
@@ -566,37 +620,48 @@ def main():
         print("OVERALL RESULTS SUMMARY")
         print("="*90)
 
-        if args.mode == "both":
+        if args.mode == "all":
             print(f"\n{'System':<20} {'Qubits':>8} {'Valid':>12} {'Ref':>8} "
-                  f"{'SKQD err':>10} {'SQD err':>10} {'Better':<8}")
-            print("-"*90)
+                  f"{'SKQD err':>10} {'Clean err':>10} {'Recov err':>10} {'Best':<10}")
+            print("-"*110)
 
             for r in all_results:
-                better = ""
-                if r.skqd_energy != 0.0 and r.sqd_energy != 0.0:
-                    better = "SKQD" if r.skqd_error_mha < r.sqd_error_mha else "SQD"
+                errors = {}
+                if r.skqd_energy != 0.0:
+                    errors["SKQD"] = r.skqd_error_mha
+                if r.sqd_clean_energy != 0.0:
+                    errors["Clean"] = r.sqd_clean_error_mha
+                if r.sqd_recovery_energy != 0.0:
+                    errors["Recovery"] = r.sqd_recovery_error_mha
+                best = min(errors, key=errors.get) if errors else ""
                 print(f"{r.system:<20} {r.n_qubits:>8} {r.n_valid_configs:>12,} "
                       f"{r.energy_type:>8} {r.skqd_error_mha:>10.4f} "
-                      f"{r.sqd_error_mha:>10.4f} {better:<8}")
+                      f"{r.sqd_clean_error_mha:>10.4f} {r.sqd_recovery_error_mha:>10.4f} "
+                      f"{best:<10}")
         else:
             print(f"\n{'System':<20} {'Qubits':>8} {'Valid':>12} {'Ref':>8} "
                   f"{'Error (mHa)':>12} {'Time (s)':>10}")
             print("-"*80)
 
             for r in all_results:
-                error = r.skqd_error_mha if args.mode == "skqd" else r.sqd_error_mha
-                t = r.time_skqd if args.mode == "skqd" else r.time_sqd
+                if args.mode == "skqd":
+                    error, t = r.skqd_error_mha, r.time_skqd
+                elif args.mode == "sqd-clean":
+                    error, t = r.sqd_clean_error_mha, r.time_sqd_clean
+                else:
+                    error, t = r.sqd_recovery_error_mha, r.time_sqd_recovery
                 print(f"{r.system:<20} {r.n_qubits:>8} {r.n_valid_configs:>12,} "
                       f"{r.energy_type:>8} {error:>12.4f} {t:>10.1f}")
 
-        print("-"*90)
+        print("-"*110)
 
         # Chemical accuracy count
         chem_acc_count = sum(
             1 for r in all_results
             if r.energy_type == "FCI" and min(
                 r.skqd_error_mha if r.skqd_energy != 0.0 else float('inf'),
-                r.sqd_error_mha if r.sqd_energy != 0.0 else float('inf'),
+                r.sqd_clean_error_mha if r.sqd_clean_energy != 0.0 else float('inf'),
+                r.sqd_recovery_error_mha if r.sqd_recovery_energy != 0.0 else float('inf'),
             ) < 1.6
         )
         fci_count = sum(1 for r in all_results if r.energy_type == "FCI")

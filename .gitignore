@@ -20,9 +20,8 @@ wheels/
 .installed.cfg
 *.egg
 
-# Local testing (not for GitHub)
+# Local testing
 run_test.py
-tests/
 
 # Virtual environments
 venv/
@@ -72,5 +71,4 @@ Thumbs.db
 
 papers/
 
-CLAUDE.md
 SCALING.md

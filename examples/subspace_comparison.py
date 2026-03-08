@@ -1,23 +1,26 @@
 """
-Subspace Method A/B Comparison: SKQD vs SQD.
+Subspace Method Comparison: SKQD vs SQD-Clean vs SQD-Recovery.
 
-Runs both subspace construction modes on the same molecular systems
+Runs all three subspace construction modes on the same molecular systems
 and prints a side-by-side comparison table.
 
 Approach 1 (SKQD - Krylov-based):
     NF-NQS generates initial configs, Krylov time evolution
     U^k = e^{-iHdt} expands subspace iteratively, union and diagonalize.
 
-Approach 2 (SQD - Sampling-based):
-    Following the IBM "Chemistry Beyond Exact Diagonalization" paper.
-    NF-NQS replaces the quantum circuit as the sampler, then apply
-    SQD's configuration recovery + batch diagonalization +
-    self-consistent orbital occupancy loop.
+Approach 2 (SQD-Clean - Sampling-based, no noise):
+    Particle-conserving NF-NQS samples → batch diagonalization +
+    energy-variance extrapolation. No configuration recovery.
+
+Approach 3 (SQD-Recovery - Sampling-based, with noise injection):
+    Particle-conserving NF-NQS samples + depolarizing noise injection →
+    S-CORE self-consistent configuration recovery → batch diagonalization.
+    Emulates the full IBM "Chemistry Beyond Exact Diagonalization" workflow.
 
 Usage:
     docker-compose run --rm flow-krylov-gpu python examples/subspace_comparison.py
     docker-compose run --rm flow-krylov-gpu python examples/subspace_comparison.py --systems h2o beh2
-    docker-compose run --rm flow-krylov-gpu python examples/subspace_comparison.py --systems h2 lih h2o beh2 nh3
+    docker-compose run --rm flow-krylov-gpu python examples/subspace_comparison.py --noise-rate 0.15
 """
 
 import sys
@@ -45,18 +48,20 @@ from pipeline import FlowGuidedKrylovPipeline, PipelineConfig
 
 @dataclass
 class ComparisonResult:
-    """Result from comparing SKQD vs SQD on one system."""
+    """Result from comparing three subspace modes on one system."""
     system: str
     n_qubits: int
     n_configs: int
     fci_energy: float
-    nf_energy: float
     skqd_energy: float
-    sqd_energy: float
+    sqd_clean_energy: float
+    sqd_recovery_energy: float
     skqd_error_mha: float
-    sqd_error_mha: float
+    sqd_clean_error_mha: float
+    sqd_recovery_error_mha: float
     skqd_time: float
-    sqd_time: float
+    sqd_clean_time: float
+    sqd_recovery_time: float
 
 
 SYSTEMS = {
@@ -69,8 +74,21 @@ SYSTEMS = {
 }
 
 
-def run_comparison(system_key: str, verbose: bool = True) -> ComparisonResult:
-    """Run both SKQD and SQD on a single system and compare."""
+def _get_energy(results):
+    """Extract final energy from pipeline results."""
+    return results.get(
+        'combined_energy',
+        results.get('skqd_energy',
+        results.get('sqd_energy', float('inf')))
+    )
+
+
+def run_comparison(
+    system_key: str,
+    noise_rate: float = 0.1,
+    verbose: bool = True,
+) -> ComparisonResult:
+    """Run SKQD, SQD-Clean, and SQD-Recovery on a single system."""
     name, create_fn, bond_length = SYSTEMS[system_key]
 
     print(f"\n{'='*70}")
@@ -94,7 +112,7 @@ def run_comparison(system_key: str, verbose: bool = True) -> ComparisonResult:
     print(f"  Qubits: {n_qubits}, Configs: {n_configs}, FCI: {E_fci:.8f} Ha")
 
     # --- SKQD Mode ---
-    print(f"\n  Running SKQD (Krylov time evolution)...")
+    print(f"\n  [1/3] Running SKQD (Krylov time evolution)...")
     t0 = time.time()
 
     config_skqd = PipelineConfig(
@@ -104,63 +122,74 @@ def run_comparison(system_key: str, verbose: bool = True) -> ComparisonResult:
     )
     config_skqd.adapt_to_system_size(n_configs)
 
-    pipeline_skqd = FlowGuidedKrylovPipeline(H, config=config_skqd, exact_energy=E_fci)
-    results_skqd = pipeline_skqd.run(progress=verbose)
-
-    skqd_energy = results_skqd.get(
-        'combined_energy',
-        results_skqd.get('skqd_energy',
-        results_skqd.get('sqd_energy', float('inf')))
-    )
+    pipeline = FlowGuidedKrylovPipeline(H, config=config_skqd, exact_energy=E_fci)
+    results_skqd = pipeline.run(progress=verbose)
+    skqd_energy = _get_energy(results_skqd)
     skqd_time = time.time() - t0
-    nf_energy = results_skqd.get('nf_nqs_energy', 0.0)
-
     skqd_error = abs(skqd_energy - E_fci) * 1000
     print(f"  SKQD: {skqd_energy:.8f} Ha (error: {skqd_error:.4f} mHa, time: {skqd_time:.1f}s)")
 
-    # --- SQD Mode ---
-    print(f"\n  Running SQD (sampling-based batch diag)...")
+    # --- SQD-Clean Mode ---
+    print(f"\n  [2/3] Running SQD-Clean (batch diag, no noise)...")
     t0 = time.time()
 
-    config_sqd = PipelineConfig(
+    config_sqd_clean = PipelineConfig(
         subspace_mode="sqd",
         skip_nf_training=True,
         sqd_num_batches=5,
         sqd_self_consistent_iters=3,
+        sqd_noise_rate=0.0,
         device=device,
     )
-    config_sqd.adapt_to_system_size(n_configs)
+    config_sqd_clean.adapt_to_system_size(n_configs)
 
-    pipeline_sqd = FlowGuidedKrylovPipeline(H, config=config_sqd, exact_energy=E_fci)
-    results_sqd = pipeline_sqd.run(progress=verbose)
+    pipeline = FlowGuidedKrylovPipeline(H, config=config_sqd_clean, exact_energy=E_fci)
+    results_sqd_clean = pipeline.run(progress=verbose)
+    sqd_clean_energy = _get_energy(results_sqd_clean)
+    sqd_clean_time = time.time() - t0
+    sqd_clean_error = abs(sqd_clean_energy - E_fci) * 1000
+    print(f"  SQD-Clean: {sqd_clean_energy:.8f} Ha (error: {sqd_clean_error:.4f} mHa, time: {sqd_clean_time:.1f}s)")
 
-    sqd_energy = results_sqd.get(
-        'combined_energy',
-        results_sqd.get('sqd_energy',
-        results_sqd.get('skqd_energy', float('inf')))
+    # --- SQD-Recovery Mode ---
+    print(f"\n  [3/3] Running SQD-Recovery (noise={noise_rate}, S-CORE recovery)...")
+    t0 = time.time()
+
+    config_sqd_recovery = PipelineConfig(
+        subspace_mode="sqd",
+        skip_nf_training=True,
+        sqd_num_batches=5,
+        sqd_self_consistent_iters=5,
+        sqd_noise_rate=noise_rate,
+        device=device,
     )
-    sqd_time = time.time() - t0
+    config_sqd_recovery.adapt_to_system_size(n_configs)
 
-    sqd_error = abs(sqd_energy - E_fci) * 1000
-    print(f"  SQD:  {sqd_energy:.8f} Ha (error: {sqd_error:.4f} mHa, time: {sqd_time:.1f}s)")
+    pipeline = FlowGuidedKrylovPipeline(H, config=config_sqd_recovery, exact_energy=E_fci)
+    results_sqd_recovery = pipeline.run(progress=verbose)
+    sqd_recovery_energy = _get_energy(results_sqd_recovery)
+    sqd_recovery_time = time.time() - t0
+    sqd_recovery_error = abs(sqd_recovery_energy - E_fci) * 1000
+    print(f"  SQD-Recovery: {sqd_recovery_energy:.8f} Ha (error: {sqd_recovery_error:.4f} mHa, time: {sqd_recovery_time:.1f}s)")
 
     return ComparisonResult(
         system=name,
         n_qubits=n_qubits,
         n_configs=n_configs,
         fci_energy=E_fci,
-        nf_energy=nf_energy,
         skqd_energy=skqd_energy,
-        sqd_energy=sqd_energy,
+        sqd_clean_energy=sqd_clean_energy,
+        sqd_recovery_energy=sqd_recovery_energy,
         skqd_error_mha=skqd_error,
-        sqd_error_mha=sqd_error,
+        sqd_clean_error_mha=sqd_clean_error,
+        sqd_recovery_error_mha=sqd_recovery_error,
         skqd_time=skqd_time,
-        sqd_time=sqd_time,
+        sqd_clean_time=sqd_clean_time,
+        sqd_recovery_time=sqd_recovery_time,
     )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SKQD vs SQD Subspace Comparison")
+    parser = argparse.ArgumentParser(description="SKQD vs SQD-Clean vs SQD-Recovery Comparison")
     parser.add_argument(
         "--systems",
         nargs="+",
@@ -168,20 +197,27 @@ def main():
         choices=list(SYSTEMS.keys()),
         help="Systems to compare (default: h2 lih h2o beh2)",
     )
+    parser.add_argument(
+        "--noise-rate",
+        type=float,
+        default=0.1,
+        help="Depolarizing noise rate for SQD-Recovery mode (default: 0.1)",
+    )
     parser.add_argument("--quiet", action="store_true", help="Reduce verbosity")
     args = parser.parse_args()
 
-    print("=" * 90)
-    print("SUBSPACE METHOD COMPARISON: SKQD vs SQD")
-    print("=" * 90)
-    print("SKQD: Krylov time evolution (U^k = e^{-iHdt})")
-    print("SQD:  Sampling-based batch diagonalization (IBM paper)")
-    print("=" * 90)
+    print("=" * 130)
+    print("SUBSPACE METHOD COMPARISON: SKQD vs SQD-Clean vs SQD-Recovery")
+    print("=" * 130)
+    print("SKQD:         Krylov time evolution (U^k = e^{-iHdt})")
+    print("SQD-Clean:    Batch diagonalization + energy-variance extrapolation (no noise)")
+    print(f"SQD-Recovery: Noise injection (rate={args.noise_rate}) + S-CORE recovery + batch diag")
+    print("=" * 130)
 
     results = []
     for key in args.systems:
         try:
-            r = run_comparison(key, verbose=not args.quiet)
+            r = run_comparison(key, noise_rate=args.noise_rate, verbose=not args.quiet)
             results.append(r)
         except Exception as e:
             print(f"\nERROR on {key}: {e}")
@@ -189,46 +225,58 @@ def main():
             traceback.print_exc()
 
     # Print comparison table
-    print("\n" + "=" * 110)
+    print("\n" + "=" * 140)
     print("COMPARISON TABLE")
-    print("=" * 110)
+    print("=" * 140)
     print(f"{'System':<18} {'Qubits':>6} {'Configs':>8} {'FCI Energy':>14} "
-          f"{'SKQD err':>10} {'SQD err':>10} {'SKQD t':>8} {'SQD t':>8} {'Better':>8}")
-    print("-" * 110)
+          f"{'SKQD err':>10} {'Clean err':>10} {'Recov err':>10} "
+          f"{'SKQD t':>8} {'Clean t':>8} {'Recov t':>8} {'Best':>10}")
+    print("-" * 140)
 
     for r in results:
-        better = "SKQD" if r.skqd_error_mha <= r.sqd_error_mha else "SQD"
+        errors = {
+            "SKQD": r.skqd_error_mha,
+            "Clean": r.sqd_clean_error_mha,
+            "Recovery": r.sqd_recovery_error_mha,
+        }
+        best = min(errors, key=errors.get)
         print(f"{r.system:<18} {r.n_qubits:>6} {r.n_configs:>8} {r.fci_energy:>14.8f} "
-              f"{r.skqd_error_mha:>10.4f} {r.sqd_error_mha:>10.4f} "
-              f"{r.skqd_time:>7.1f}s {r.sqd_time:>7.1f}s {better:>8}")
+              f"{r.skqd_error_mha:>10.4f} {r.sqd_clean_error_mha:>10.4f} {r.sqd_recovery_error_mha:>10.4f} "
+              f"{r.skqd_time:>7.1f}s {r.sqd_clean_time:>7.1f}s {r.sqd_recovery_time:>7.1f}s {best:>10}")
 
-    print("-" * 110)
+    print("-" * 140)
 
     # Chemical accuracy check
     chem_acc_threshold = 1.6  # mHa
-    skqd_pass = sum(1 for r in results if r.skqd_error_mha < chem_acc_threshold)
-    sqd_pass = sum(1 for r in results if r.sqd_error_mha < chem_acc_threshold)
     total = len(results)
+    skqd_pass = sum(1 for r in results if r.skqd_error_mha < chem_acc_threshold)
+    clean_pass = sum(1 for r in results if r.sqd_clean_error_mha < chem_acc_threshold)
+    recov_pass = sum(1 for r in results if r.sqd_recovery_error_mha < chem_acc_threshold)
 
     print(f"\nChemical accuracy (<{chem_acc_threshold} mHa):")
-    print(f"  SKQD: {skqd_pass}/{total} systems")
-    print(f"  SQD:  {sqd_pass}/{total} systems")
+    print(f"  SKQD:         {skqd_pass}/{total} systems")
+    print(f"  SQD-Clean:    {clean_pass}/{total} systems")
+    print(f"  SQD-Recovery: {recov_pass}/{total} systems")
 
     # Average errors
     if results:
         avg_skqd = np.mean([r.skqd_error_mha for r in results])
-        avg_sqd = np.mean([r.sqd_error_mha for r in results])
+        avg_clean = np.mean([r.sqd_clean_error_mha for r in results])
+        avg_recov = np.mean([r.sqd_recovery_error_mha for r in results])
         print(f"\nAverage error:")
-        print(f"  SKQD: {avg_skqd:.4f} mHa")
-        print(f"  SQD:  {avg_sqd:.4f} mHa")
+        print(f"  SKQD:         {avg_skqd:.4f} mHa")
+        print(f"  SQD-Clean:    {avg_clean:.4f} mHa")
+        print(f"  SQD-Recovery: {avg_recov:.4f} mHa")
 
         avg_skqd_t = np.mean([r.skqd_time for r in results])
-        avg_sqd_t = np.mean([r.sqd_time for r in results])
+        avg_clean_t = np.mean([r.sqd_clean_time for r in results])
+        avg_recov_t = np.mean([r.sqd_recovery_time for r in results])
         print(f"\nAverage time:")
-        print(f"  SKQD: {avg_skqd_t:.1f}s")
-        print(f"  SQD:  {avg_sqd_t:.1f}s")
+        print(f"  SKQD:         {avg_skqd_t:.1f}s")
+        print(f"  SQD-Clean:    {avg_clean_t:.1f}s")
+        print(f"  SQD-Recovery: {avg_recov_t:.1f}s")
 
-    print("=" * 110)
+    print("=" * 140)
 
 
 if __name__ == "__main__":

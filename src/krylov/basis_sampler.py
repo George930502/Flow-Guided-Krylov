@@ -18,6 +18,7 @@ class CUDAQConfig:
     """Configuration for CUDA-Q execution."""
 
     target: str = "nvidia"  # CUDA-Q target
+    target_option: str = "fp64"  # Precision: "fp64" for chemistry, "fp32" for speed
     seed: int = 42
     shots: int = 100000
     num_trotter_steps: int = 8
@@ -57,6 +58,7 @@ class KrylovBasisSampler:
         self.config = config or CUDAQConfig()
 
         self._cudaq_available = self._check_cudaq()
+        self._cudaq_initialized = False
 
     def _check_cudaq(self) -> bool:
         """Check if CUDA-Q is available."""
@@ -65,6 +67,17 @@ class KrylovBasisSampler:
             return True
         except ImportError:
             return False
+
+    def _init_cudaq(self) -> None:
+        """Initialize CUDA-Q target ONCE (not per-sample call)."""
+        if self._cudaq_initialized:
+            return
+        import cudaq
+        if self.config.target_option:
+            cudaq.set_target(self.config.target, option=self.config.target_option)
+        else:
+            cudaq.set_target(self.config.target)
+        self._cudaq_initialized = True
 
     def sample_krylov_state(
         self,
@@ -99,7 +112,7 @@ class KrylovBasisSampler:
         """
         import cudaq
 
-        cudaq.set_target(self.config.target)
+        self._init_cudaq()
         cudaq.set_random_seed(self.config.seed)
 
         # Convert Pauli words to cudaq format
@@ -302,30 +315,3 @@ class KrylovBasisSampler:
         return samples
 
 
-def create_cudaq_sampler(
-    hamiltonian: "Hamiltonian",
-    config: Optional[CUDAQConfig] = None,
-) -> KrylovBasisSampler:
-    """
-    Factory function to create CUDA-Q sampler from Hamiltonian.
-
-    Args:
-        hamiltonian: System Hamiltonian
-        config: CUDA-Q configuration
-
-    Returns:
-        KrylovBasisSampler instance
-    """
-    try:
-        from ..hamiltonians.spin import extract_coeffs_and_paulis
-    except ImportError:
-        from hamiltonians.spin import extract_coeffs_and_paulis
-
-    coeffs, paulis = extract_coeffs_and_paulis(hamiltonian)
-
-    return KrylovBasisSampler(
-        pauli_coefficients=coeffs,
-        pauli_words=paulis,
-        num_qubits=hamiltonian.num_sites,
-        config=config,
-    )

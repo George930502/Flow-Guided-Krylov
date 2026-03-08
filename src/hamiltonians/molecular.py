@@ -1120,27 +1120,30 @@ class MolecularHamiltonian(Hamiltonian):
         all_connected, all_elements, batch_indices = self.get_connections_vectorized_batch(configs)
 
         if len(all_connected) > 0:
-            # Encode connected configs on GPU
+            # Encode connected configs on GPU and match via searchsorted
             connected_ints = (all_connected.long() * self._powers_gpu).sum(dim=1)
-            connected_ints_cpu = connected_ints.cpu().tolist()  # Single transfer
+            sorted_config_ints, sort_order = config_ints.sort()
 
-            # Track processed pairs to ensure Hermiticity
-            processed_pairs = set()
+            # Find which connected configs exist in the basis
+            search_pos = torch.searchsorted(sorted_config_ints, connected_ints)
+            search_pos_clamped = search_pos.clamp(max=n_configs - 1)
+            match_mask = sorted_config_ints[search_pos_clamped] == connected_ints
 
-            # Map connections to matrix indices and populate
-            for k in range(len(all_connected)):
-                conn_int = connected_ints_cpu[k]
-                if conn_int in config_hash:
-                    i = config_hash[conn_int]
-                    j = batch_indices[k].item()
-                    if i != j:
-                        # Use canonical pair ordering (smaller index first)
-                        pair = (min(i, j), max(i, j))
-                        if pair not in processed_pairs:
-                            processed_pairs.add(pair)
-                            # Set both H[i,j] and H[j,i] to the same value
-                            H[i, j] = all_elements[k]
-                            H[j, i] = all_elements[k]
+            if match_mask.any():
+                valid_k = match_mask.nonzero(as_tuple=True)[0]
+                rows = sort_order[search_pos_clamped[valid_k]]
+                cols = batch_indices[valid_k]
+                vals = all_elements[valid_k]
+
+                # Filter out diagonal entries (already set above)
+                off_diag = rows != cols
+                rows = rows[off_diag]
+                cols = cols[off_diag]
+                vals = vals[off_diag]
+
+                # Assign both triangles for Hermitian symmetry
+                H[rows, cols] = vals
+                H[cols, rows] = vals
 
         return H
 
@@ -1275,13 +1278,14 @@ class MolecularHamiltonian(Hamiltonian):
         Compute matrix of elements H_ij = <x_i|H|x_j>.
 
         Uses fast path when bra == ket.
+        General path uses vectorized batch connections + integer hash lookup.
         """
         # Fast path for same bra/ket
         if (configs_bra.shape == configs_ket.shape and
             torch.all(configs_bra == configs_ket)):
             return self.matrix_elements_fast(configs_bra)
 
-        # General case
+        # General case — vectorized with integer encoding + searchsorted
         configs_bra = configs_bra.to(self.device)
         configs_ket = configs_ket.to(self.device)
         n_bra = configs_bra.shape[0]
@@ -1289,27 +1293,38 @@ class MolecularHamiltonian(Hamiltonian):
 
         H = torch.zeros(n_bra, n_ket, device=self.device)
 
-        # Build bra hash
-        bra_hash = {tuple(configs_bra[i].cpu().tolist()): i
-                    for i in range(n_bra)}
+        # Integer-encode bra configs for O(log n) lookup via searchsorted
+        bra_ints = (configs_bra.long() * self._powers_gpu).sum(dim=1)
+        sorted_bra_ints, bra_sort_order = bra_ints.sort()
 
-        for j in range(n_ket):
-            config_j = configs_ket[j]
-            key_j = tuple(config_j.cpu().tolist())
+        # Diagonal: find ket configs that also appear in bra
+        ket_ints = (configs_ket.long() * self._powers_gpu).sum(dim=1)
+        diag_pos = torch.searchsorted(sorted_bra_ints, ket_ints)
+        diag_pos_clamped = diag_pos.clamp(max=n_bra - 1)
+        diag_match = sorted_bra_ints[diag_pos_clamped] == ket_ints
+        if diag_match.any():
+            match_j = diag_match.nonzero(as_tuple=True)[0]
+            match_i = bra_sort_order[diag_pos_clamped[match_j]]
+            diag_vals = self.diagonal_elements_batch(configs_ket[match_j])
+            H[match_i, match_j] = diag_vals
 
-            # Diagonal
-            if key_j in bra_hash:
-                i = bra_hash[key_j]
-                H[i, j] = self.diagonal_elements_batch(config_j.unsqueeze(0))[0]
+        # Off-diagonal: get ALL connections for ALL ket configs at once
+        all_connected, all_elements, ket_indices = \
+            self.get_connections_vectorized_batch(configs_ket)
 
-            # Off-diagonal
-            connected, elements = self.get_connections(config_j)
-            if len(connected) > 0:
-                for k in range(len(connected)):
-                    key = tuple(connected[k].cpu().tolist())
-                    if key in bra_hash:
-                        i = bra_hash[key]
-                        H[i, j] = elements[k]
+        if len(all_connected) > 0:
+            # Integer-encode connected configs and match against bra
+            conn_ints = (all_connected.long() * self._powers_gpu).sum(dim=1)
+            conn_pos = torch.searchsorted(sorted_bra_ints, conn_ints)
+            conn_pos_clamped = conn_pos.clamp(max=n_bra - 1)
+            conn_match = sorted_bra_ints[conn_pos_clamped] == conn_ints
+
+            if conn_match.any():
+                valid_k = conn_match.nonzero(as_tuple=True)[0]
+                row_i = bra_sort_order[conn_pos_clamped[valid_k]]
+                col_j = ket_indices[valid_k]
+                vals = all_elements[valid_k]
+                H[row_i, col_j] = vals
 
         return H
 

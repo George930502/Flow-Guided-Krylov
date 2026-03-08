@@ -41,10 +41,10 @@ except ImportError:
 # Support both package imports and direct script execution
 try:
     from ..hamiltonians.base import Hamiltonian
-    from ..utils.gpu_linalg import gpu_eigh, gpu_expm_multiply
+    from ..utils.gpu_linalg import gpu_eigh, gpu_eigsh, gpu_expm_multiply
 except ImportError:
     from hamiltonians.base import Hamiltonian
-    from utils.gpu_linalg import gpu_eigh, gpu_expm_multiply
+    from utils.gpu_linalg import gpu_eigh, gpu_eigsh, gpu_expm_multiply
 
 
 @dataclass
@@ -52,12 +52,12 @@ class SKQDConfig:
     """Configuration for SKQD algorithm."""
 
     # Krylov parameters
-    max_krylov_dim: int = 12
-    time_step: float = 0.1  # Δt
-    total_evolution_time: Optional[float] = None  # If set, overrides max_k
+    max_krylov_dim: int = 15  # Paper: d=15 (Ising simulation, Fig. 1)
+    time_step: float = 0.1  # Δt (pipeline overrides with spectral-range dt when auto_time_step=True)
 
-    # Trotter parameters
-    num_trotter_steps: int = 8
+    # Reproducibility
+    seed: int = 42
+    total_evolution_time: Optional[float] = None  # If set, overrides max_k
 
     # Sampling parameters
     shots_per_krylov: int = 100000
@@ -104,7 +104,7 @@ class SampleBasedKrylovDiagonalization:
     Args:
         hamiltonian: System Hamiltonian
         config: SKQD configuration
-        initial_state: Optional initial state (default: Néel state)
+        initial_state: Optional initial state (default: HF state)
     """
 
     def __init__(
@@ -131,19 +131,10 @@ class SampleBasedKrylovDiagonalization:
         if initial_state is not None:
             self.initial_state = initial_state
         else:
-            # Default: HF state for molecules, Néel state for spin systems
-            if self._is_molecular:
-                self.initial_state = self.hamiltonian.get_hf_state()
-            else:
-                self.initial_state = self._create_neel_state()
+            self.initial_state = self.hamiltonian.get_hf_state()
 
-        # Compute time step based on spectral range if not specified
-        if self.config.total_evolution_time is not None:
-            self.time_step = (
-                self.config.total_evolution_time / self.config.num_trotter_steps
-            )
-        else:
-            self.time_step = self.config.time_step
+        # Time step for Krylov evolution
+        self.time_step = self.config.time_step
 
         # Storage for results
         self.krylov_samples: List[Dict[str, int]] = []
@@ -201,12 +192,6 @@ class SampleBasedKrylovDiagonalization:
             return torch.device(self.hamiltonian.device)
         return torch.device('cpu')
 
-    def _create_neel_state(self) -> torch.Tensor:
-        """Create Néel state |010101...⟩."""
-        state = torch.zeros(self.num_sites, dtype=torch.long, device=self.device)
-        state[::2] = 1  # Odd sites = 1
-        return state
-
     def _time_evolution_operator(
         self,
         state_vector: torch.Tensor,
@@ -215,10 +200,8 @@ class SampleBasedKrylovDiagonalization:
         """
         Apply time evolution U^num_steps = (e^{-iHΔt})^num_steps.
 
-        For molecular systems with particle conservation, uses subspace evolution
+        Uses particle-conserving subspace evolution for molecular systems,
         which is MUCH faster (e.g., 3K x 3K instead of 65K x 65K for NH3).
-
-        For spin systems, uses sparse matrix exponential or Trotter decomposition.
 
         Args:
             state_vector: Full state vector in Hilbert space
@@ -231,30 +214,7 @@ class SampleBasedKrylovDiagonalization:
         device = self.device
         state_vector = state_vector.to(device)
 
-        # For molecular systems, ALWAYS use particle-conserving subspace evolution
-        # This is the key optimization: work in much smaller subspace
-        if self._is_molecular and self._subspace_basis is not None:
-            return self._sparse_time_evolution(state_vector, num_steps)
-
-        # For very small systems (<=6 qubits), dense is faster due to less overhead
-        if self.num_sites <= 6:
-            # Get dense Hamiltonian on the same device
-            H = self.hamiltonian.to_dense(device=str(device))
-            # Ensure H is complex for matrix exponential
-            if not H.is_complex():
-                H = H.to(torch.complex64)
-            U = torch.linalg.matrix_exp(-1j * self.time_step * H)
-
-            for _ in range(num_steps):
-                state_vector = U @ state_vector
-
-            return state_vector
-        elif self.num_sites <= 16:
-            # For medium systems (7-16 qubits), use sparse matrix exponential
-            return self._sparse_time_evolution(state_vector, num_steps)
-        else:
-            # For larger spin systems, use Trotter decomposition
-            return self._trotter_evolution(state_vector, num_steps)
+        return self._sparse_time_evolution(state_vector, num_steps)
 
     def _sparse_time_evolution(
         self,
@@ -267,16 +227,16 @@ class SampleBasedKrylovDiagonalization:
         Uses Lanczos-based Krylov approximation for efficient GPU computation
         of e^{-iHt}|psi> without forming the full matrix exponential.
 
-        For molecular systems, works in particle-conserving subspace for
-        massive speedup (e.g., 3K x 3K instead of 65K x 65K for NH3).
+        Works in particle-conserving subspace for massive speedup
+        (e.g., 3K x 3K instead of 65K x 65K for NH3).
         """
-        # Build GPU Hamiltonian matrix (cached for reuse)
+        # For molecular systems, work in particle-conserving subspace
+        if self._subspace_basis is not None:
+            return self._sparse_time_evolution_subspace(state_vector, num_steps)
+
+        # Fallback: build GPU Hamiltonian matrix (cached for reuse)
         if not hasattr(self, '_H_gpu') or self._H_gpu is None:
             self._H_gpu = self._build_gpu_hamiltonian()
-
-        # For molecular systems, work in subspace
-        if self._is_molecular and self._subspace_basis is not None:
-            return self._sparse_time_evolution_subspace(state_vector, num_steps)
 
         # GPU-accelerated time evolution
         device = state_vector.device
@@ -383,27 +343,16 @@ class SampleBasedKrylovDiagonalization:
         """
         Build dense Hamiltonian matrix on GPU.
 
-        For molecular systems, builds in particle-conserving subspace
-        which is MUCH smaller than the full Hilbert space.
+        Builds in particle-conserving subspace which is MUCH smaller
+        than the full Hilbert space.
         """
-        # For molecular systems, build in particle-conserving subspace
-        if self._is_molecular and self._subspace_basis is not None:
+        if self._subspace_basis is not None:
             return self._build_gpu_subspace_hamiltonian()
 
-        # For non-molecular systems, use full Hilbert space
-        device = self.device if hasattr(self, 'device') else 'cuda' if torch.cuda.is_available() else 'cpu'
-        n = self.hamiltonian.hilbert_dim
-
-        print(f"Building GPU Hamiltonian ({n} x {n})...")
-
-        # Generate all basis states
-        basis = self.hamiltonian._generate_all_configs(device)
-
-        # Build matrix using Hamiltonian's matrix_elements method
-        H = self.hamiltonian.matrix_elements(basis, basis)
-
-        # Convert to complex128 for time evolution
-        return H.to(torch.complex128)
+        raise ValueError(
+            "No particle-conserving subspace available. "
+            "SKQD requires a molecular Hamiltonian with particle conservation."
+        )
 
     def _build_gpu_subspace_hamiltonian(self) -> torch.Tensor:
         """
@@ -429,53 +378,16 @@ class SampleBasedKrylovDiagonalization:
 
     def _build_sparse_hamiltonian(self):
         """
-        Build sparse CSR Hamiltonian matrix.
+        Build sparse CSR Hamiltonian matrix in particle-conserving subspace.
 
-        For molecular Hamiltonians, builds in particle-conserving subspace
-        which is MUCH smaller than the full Hilbert space.
+        Much smaller than the full Hilbert space (e.g., 3K vs 65K for NH3).
         """
-        from scipy.sparse import csr_matrix
-
-        # For molecular systems, build in particle-conserving subspace
-        if self._is_molecular and self._subspace_basis is not None:
+        if self._subspace_basis is not None:
             return self._build_subspace_hamiltonian()
 
-        # For non-molecular systems, use full Hilbert space
-        if hasattr(self.hamiltonian, 'to_sparse'):
-            print(f"Building sparse Hamiltonian ({self.hamiltonian.hilbert_dim} x {self.hamiltonian.hilbert_dim})...")
-            return self.hamiltonian.to_sparse("cpu")
-
-        # Fallback: build manually
-        n = self.hamiltonian.hilbert_dim
-        rows, cols, data = [], [], []
-
-        # Generate all basis states
-        basis = self.hamiltonian._generate_all_configs("cpu")
-
-        print(f"Building sparse Hamiltonian manually ({n} x {n})...")
-        for j in range(n):
-            config_j = basis[j]
-
-            # Diagonal element
-            diag = self.hamiltonian.diagonal_element(config_j).item()
-            rows.append(j)
-            cols.append(j)
-            data.append(diag)
-
-            # Off-diagonal connections
-            connected, elements = self.hamiltonian.get_connections(config_j)
-            if len(connected) > 0:
-                for conn, elem in zip(connected, elements):
-                    # Find index of connected config
-                    i = self.hamiltonian._config_to_index(conn)
-                    rows.append(i)
-                    cols.append(j)
-                    data.append(elem.item() if hasattr(elem, 'item') else elem)
-
-        return csr_matrix(
-            (data, (rows, cols)),
-            shape=(n, n),
-            dtype=np.complex128
+        raise ValueError(
+            "No particle-conserving subspace available. "
+            "SKQD requires a molecular Hamiltonian with particle conservation."
         )
 
     def _build_subspace_hamiltonian(self):
@@ -524,123 +436,6 @@ class SampleBasedKrylovDiagonalization:
 
         print(f"Subspace Hamiltonian built: {H_subspace.nnz:,} non-zero elements")
         return H_subspace
-
-    def _trotter_evolution(
-        self,
-        state_vector: torch.Tensor,
-        num_steps: int,
-    ) -> torch.Tensor:
-        """
-        Apply Trotterized time evolution using second-order Trotter-Suzuki.
-
-        Decomposes H into terms and applies:
-        U ≈ Π_j e^{-iH_j Δt/2} Π_j e^{-iH_j Δt/2}  (reversed order)
-
-        For Pauli Hamiltonians, each term e^{-iθP} can be efficiently computed.
-        """
-        dt = self.time_step / self.config.num_trotter_steps
-
-        # Get Hamiltonian terms (Pauli decomposition)
-        if hasattr(self.hamiltonian, 'pauli_terms'):
-            # Use Pauli decomposition for true Trotter
-            return self._trotter_pauli(state_vector, num_steps, dt)
-        else:
-            # Fallback: decompose into diagonal and off-diagonal parts
-            return self._trotter_split(state_vector, num_steps, dt)
-
-    def _trotter_pauli(
-        self,
-        state_vector: torch.Tensor,
-        num_steps: int,
-        dt: float,
-    ) -> torch.Tensor:
-        """
-        Trotter evolution using Pauli term decomposition.
-
-        Each Pauli term P with coefficient c contributes e^{-icPΔt}.
-        """
-        pauli_terms = self.hamiltonian.pauli_terms  # List of (coeff, pauli_string)
-
-        for _ in range(num_steps):
-            for _ in range(self.config.num_trotter_steps):
-                # Forward sweep (half step)
-                for coeff, pauli in pauli_terms:
-                    state_vector = self._apply_pauli_exp(
-                        state_vector, coeff * dt / 2, pauli
-                    )
-                # Backward sweep (half step)
-                for coeff, pauli in reversed(pauli_terms):
-                    state_vector = self._apply_pauli_exp(
-                        state_vector, coeff * dt / 2, pauli
-                    )
-
-        return state_vector
-
-    def _trotter_split(
-        self,
-        state_vector: torch.Tensor,
-        num_steps: int,
-        dt: float,
-    ) -> torch.Tensor:
-        """
-        Trotter evolution by splitting H into diagonal and off-diagonal parts.
-
-        H = H_diag + H_off
-        U ≈ e^{-iH_diag Δt/2} e^{-iH_off Δt} e^{-iH_diag Δt/2}
-        """
-        H = self.hamiltonian.to_dense()
-        H_diag = torch.diag(torch.diag(H))
-        H_off = H - H_diag
-
-        # Precompute exponentials for efficiency
-        U_diag_half = torch.diag(torch.exp(-1j * dt / 2 * torch.diag(H)))
-        U_off = torch.linalg.matrix_exp(-1j * dt * H_off)
-
-        for _ in range(num_steps):
-            for _ in range(self.config.num_trotter_steps):
-                # Second-order Trotter: e^{-iH_d dt/2} e^{-iH_o dt} e^{-iH_d dt/2}
-                state_vector = U_diag_half @ state_vector
-                state_vector = U_off @ state_vector
-                state_vector = U_diag_half @ state_vector
-
-        return state_vector
-
-    def _apply_pauli_exp(
-        self,
-        state_vector: torch.Tensor,
-        angle: float,
-        pauli_string: str,
-    ) -> torch.Tensor:
-        """
-        Apply e^{-i*angle*P} where P is a Pauli string.
-
-        For a Pauli string P, e^{-iθP} = cos(θ)I - i*sin(θ)P
-        """
-        # Build Pauli matrix
-        P = self._pauli_string_to_matrix(pauli_string)
-
-        # e^{-iθP} = cos(θ)I - i*sin(θ)P
-        cos_theta = np.cos(angle)
-        sin_theta = np.sin(angle)
-
-        result = cos_theta * state_vector - 1j * sin_theta * (P @ state_vector)
-        return result
-
-    def _pauli_string_to_matrix(self, pauli_string: str) -> torch.Tensor:
-        """Convert Pauli string to matrix via tensor product."""
-        # Single-qubit Pauli matrices
-        I = torch.eye(2, dtype=torch.complex64)
-        X = torch.tensor([[0, 1], [1, 0]], dtype=torch.complex64)
-        Y = torch.tensor([[0, -1j], [1j, 0]], dtype=torch.complex64)
-        Z = torch.tensor([[1, 0], [0, -1]], dtype=torch.complex64)
-
-        pauli_map = {"I": I, "X": X, "Y": Y, "Z": Z}
-
-        result = torch.tensor([[1.0]], dtype=torch.complex64)
-        for p in pauli_string:
-            result = torch.kron(result, pauli_map[p])
-
-        return result
 
     def _sample_from_state(
         self,
@@ -755,43 +550,15 @@ class SampleBasedKrylovDiagonalization:
 
         self.krylov_samples = []
 
-        # For molecular systems with particle conservation, work entirely in subspace
+        # Work entirely in particle-conserving subspace
         # This avoids memory issues and PyTorch multinomial's 2^24 category limit
-        if self._is_molecular and self._subspace_basis is not None:
+        if self._subspace_basis is not None:
             return self._generate_krylov_samples_subspace(max_krylov_dim, progress)
 
-        # For non-molecular systems, use full Hilbert space
-        # Create initial state vector in Hilbert space on the correct device
-        # |ψ_0⟩ = |bitstring⟩
-        device = self.device
-        initial_index = int(
-            "".join(str(b.item()) for b in self.initial_state.cpu()), 2
+        raise ValueError(
+            "No particle-conserving subspace available. "
+            "SKQD requires a molecular Hamiltonian with particle conservation."
         )
-        state_vector = torch.zeros(
-            self.hamiltonian.hilbert_dim, dtype=torch.complex64, device=device
-        )
-        state_vector[initial_index] = 1.0
-
-        iterator = range(max_krylov_dim)
-        if progress:
-            iterator = tqdm(iterator, desc="Generating Krylov states")
-
-        current_state = state_vector.clone()
-
-        for k in iterator:
-            # Sample from current state
-            samples = self._sample_from_state(
-                current_state, self.config.shots_per_krylov
-            )
-            self.krylov_samples.append(samples)
-
-            # Evolve state: |ψ_{k+1}⟩ = U |ψ_k⟩
-            if k < max_krylov_dim - 1:
-                current_state = self._time_evolution_operator(
-                    current_state, num_steps=1
-                )
-
-        return self.krylov_samples
 
     def _generate_krylov_samples_subspace(
         self,
@@ -815,11 +582,15 @@ class SampleBasedKrylovDiagonalization:
         Returns:
             List of sample dictionaries for each Krylov state
         """
-        from scipy.sparse.linalg import expm_multiply
-
         # Build sparse Hamiltonian in subspace (cached for reuse)
         if not hasattr(self, '_sparse_H'):
             self._sparse_H = self._build_sparse_hamiltonian()
+
+        # Build GPU dense version for gpu_expm_multiply
+        if not hasattr(self, '_dense_H_gpu') or self._dense_H_gpu is None:
+            gpu_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            H_dense = self._sparse_H.toarray()
+            self._dense_H_gpu = torch.from_numpy(H_dense).to(torch.complex128).to(gpu_device)
 
         n_subspace = len(self._subspace_basis)
 
@@ -833,8 +604,9 @@ class SampleBasedKrylovDiagonalization:
             )
         initial_subspace_idx = self._subspace_index_map[initial_key]
 
-        # Create initial state in subspace
-        psi_subspace = np.zeros(n_subspace, dtype=np.complex128)
+        # Create initial state on GPU
+        gpu_device = self._dense_H_gpu.device
+        psi_subspace = torch.zeros(n_subspace, dtype=torch.complex128, device=gpu_device)
         psi_subspace[initial_subspace_idx] = 1.0
 
         iterator = range(max_krylov_dim)
@@ -842,65 +614,93 @@ class SampleBasedKrylovDiagonalization:
             iterator = tqdm(iterator, desc="Generating Krylov states")
 
         for k in iterator:
-            # Sample from current subspace state
-            samples = self._sample_from_subspace(psi_subspace)
+            # Sample from current subspace state (pass GPU tensor directly)
+            samples = self._sample_from_subspace(psi_subspace, krylov_step=k)
             self.krylov_samples.append(samples)
 
-            # Evolve state in subspace: |ψ_{k+1}⟩ = U |ψ_k⟩
+            # GPU time evolution: |ψ_{k+1}⟩ = exp(-iHΔt) |ψ_k⟩
             if k < max_krylov_dim - 1:
-                t = -1j * self.time_step
-                psi_subspace = expm_multiply(t * self._sparse_H, psi_subspace)
+                psi_subspace = gpu_expm_multiply(
+                    self._dense_H_gpu, psi_subspace, t=-1j * self.time_step
+                )
 
         return self.krylov_samples
 
     def _sample_from_subspace(
         self,
-        psi_subspace: np.ndarray,
+        psi_subspace,
+        krylov_step: int = 0,
     ) -> Dict[str, int]:
         """
         Sample bitstrings from a quantum state in subspace representation.
 
         This method is much more memory-efficient than full-space sampling:
         - Only needs to store probabilities for valid configurations
-        - Uses numpy sampling (no CUDA category limit)
+        - Uses GPU sampling when possible (torch.multinomial)
         - Converts subspace indices to bitstrings via _subspace_basis
 
         Args:
-            psi_subspace: State vector in subspace representation
+            psi_subspace: State vector in subspace representation (numpy or torch tensor)
+            krylov_step: Krylov iteration index (used for deterministic seeding)
 
         Returns:
             Dictionary mapping bitstrings to counts
         """
         num_samples = self.config.shots_per_krylov
-        n_subspace = len(psi_subspace)
+        seed = self.config.seed + krylov_step + 1000
 
-        # Compute probabilities in subspace
-        probs = np.abs(psi_subspace) ** 2
-        probs = probs / probs.sum()  # Normalize
+        # Accept both numpy and torch tensors
+        if isinstance(psi_subspace, torch.Tensor):
+            psi_gpu = psi_subspace
+            n_subspace = psi_gpu.shape[0]
+        else:
+            n_subspace = len(psi_subspace)
+            psi_gpu = None
 
         # Check if we can use CUDA multinomial (faster for moderate sizes)
         max_multinomial_categories = 2**24
         if n_subspace <= max_multinomial_categories and torch.cuda.is_available():
-            # Use CUDA for sampling (faster)
-            probs_torch = torch.from_numpy(probs).float().cuda()
+            # Stay on GPU — compute probs and sample without CPU roundtrip
+            if psi_gpu is not None and psi_gpu.is_cuda:
+                probs_torch = torch.abs(psi_gpu).float() ** 2
+            else:
+                if psi_gpu is not None:
+                    probs_np = np.abs(psi_gpu.cpu().numpy()) ** 2
+                else:
+                    probs_np = np.abs(psi_subspace) ** 2
+                probs_torch = torch.from_numpy(probs_np).float().cuda()
+            probs_torch = probs_torch / probs_torch.sum()
+            gen = torch.Generator(device='cuda').manual_seed(seed)
             indices = torch.multinomial(
-                probs_torch, num_samples, replacement=True
+                probs_torch, num_samples, replacement=True, generator=gen
             ).cpu().numpy()
         else:
-            # Use numpy for very large subspaces
-            indices = np.random.choice(
+            # Use numpy with seeded RNG for reproducibility
+            if psi_gpu is not None:
+                psi_np = psi_gpu.cpu().numpy()
+            else:
+                psi_np = psi_subspace
+            probs = np.abs(psi_np) ** 2
+            probs = probs / probs.sum()
+            rng = np.random.default_rng(seed)
+            indices = rng.choice(
                 n_subspace, size=num_samples, replace=True, p=probs.astype(np.float64)
             )
 
         # Count occurrences
         unique, counts = np.unique(indices, return_counts=True)
 
+        # Pre-cache bitstrings for subspace basis (avoid per-call str conversion)
+        if not hasattr(self, '_subspace_bitstrings'):
+            self._subspace_bitstrings = [
+                "".join(str(b.item()) for b in config)
+                for config in self._subspace_basis
+            ]
+
         # Convert subspace indices to bitstrings
         results = {}
         for subspace_idx, count in zip(unique, counts):
-            config = self._subspace_basis[subspace_idx]
-            bitstring = "".join(str(b.item()) for b in config)
-            results[bitstring] = int(count)
+            results[self._subspace_bitstrings[subspace_idx]] = int(count)
 
         return results
 
@@ -1024,22 +824,25 @@ class SampleBasedKrylovDiagonalization:
             if cond > 1e12:
                 print(f"WARNING: Ill-conditioned Hamiltonian (cond={cond:.2e})")
                 print("Using SVD-based solver for numerical stability")
-                H_np = H.cpu().numpy()
-                return self._svd_ground_state(H_np, return_eigenvector)
+                return self._svd_ground_state(H, return_eigenvector)
         except Exception:
             print("WARNING: Could not compute condition number, using SVD")
-            H_np = H.cpu().numpy()
-            return self._svd_ground_state(H_np, return_eigenvector)
+            return self._svd_ground_state(H, return_eigenvector)
 
-        # GPU-accelerated dense eigensolver (works for all matrix sizes)
-        # torch.linalg.eigh is highly optimized on GPU
+        # GPU-accelerated eigensolver — stays entirely on GPU
+        # gpu_eigsh uses dense torch.linalg.eigh for n <= 10000, CuPy sparse for larger
         try:
-            eigenvalues, eigenvectors = gpu_eigh(H, use_gpu=True)
-            E0 = float(eigenvalues[0].cpu())
-            v0 = eigenvectors[:, 0] if return_eigenvector else None
+            if n >= 2:
+                k_eig = min(2, n - 1)
+                eigenvalues, eigenvectors = gpu_eigsh(H, k=k_eig, which='SA', use_gpu=True)
+                E0 = float(eigenvalues[0].cpu())
+                v0 = eigenvectors[:, 0] if return_eigenvector else None
+            else:
+                eigenvalues, eigenvectors = gpu_eigh(H, use_gpu=True)
+                E0 = float(eigenvalues[0].cpu())
+                v0 = eigenvectors[:, 0] if return_eigenvector else None
         except Exception as e:
-            print(f"GPU eigensolver failed: {e}")
-            print("Falling back to CPU solver")
+            print(f"GPU eigensolver failed: {e}, falling back to CPU solver")
             H_np = H.cpu().numpy()
             eigenvalues, eigenvectors = np.linalg.eigh(H_np)
             E0 = float(eigenvalues[0])
@@ -1052,37 +855,52 @@ class SampleBasedKrylovDiagonalization:
 
     def _svd_ground_state(
         self,
-        H_np: np.ndarray,
+        H_input,
         return_eigenvector: bool = False,
     ) -> Tuple[float, Optional[torch.Tensor]]:
         """
-        Compute ground state using SVD-based approach for numerical stability.
+        Compute ground state using eigendecomposition with regularization.
 
-        Uses eigendecomposition after projecting out small singular values
-        that cause numerical instability.
+        GPU-accelerated: uses torch.linalg.eigh on GPU.
+        Projects out near-zero eigenvalue modes for numerical stability,
+        preserving sign (unlike SVD which maps negative eigenvalues to positive).
+        Accepts either numpy array or torch tensor.
         """
-        # SVD to identify and handle near-null space
-        U, s, Vh = np.linalg.svd(H_np, hermitian=True)
+        # Convert to torch if needed
+        if isinstance(H_input, np.ndarray):
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            H_t = torch.from_numpy(H_input).double().to(device)
+        else:
+            H_t = H_input.double()
+            device = H_t.device
 
-        # Filter out very small singular values
-        threshold = 1e-10 * s.max()
-        valid_mask = s > threshold
-        n_valid = valid_mask.sum()
+        # GPU eigendecomposition to identify near-null modes
+        eigenvalues_raw, eigenvectors_raw = torch.linalg.eigh(H_t)
 
-        if n_valid < len(s):
-            print(f"  SVD: Projecting out {len(s) - n_valid} near-null modes")
+        # Filter out near-zero eigenvalue modes (regularize)
+        threshold = 1e-10 * eigenvalues_raw.abs().max().item()
+        n_small = (eigenvalues_raw.abs() < threshold).sum().item()
 
-        # Reconstruct regularized Hamiltonian
-        s_reg = np.where(s > threshold, s, threshold)
-        H_reg = U @ np.diag(s_reg) @ Vh
+        if n_small > 0:
+            print(f"  Regularization: {n_small} near-null eigenvalue modes")
+            # Regularize: clamp small |eigenvalues| but preserve sign
+            eig_reg = torch.where(
+                eigenvalues_raw.abs() > threshold,
+                eigenvalues_raw,
+                torch.sign(eigenvalues_raw) * threshold
+            )
+            # Reconstruct H with regularized eigenvalues (preserves sign)
+            H_reg = eigenvectors_raw @ torch.diag(eig_reg) @ eigenvectors_raw.T
+            eigenvalues, eigenvectors = torch.linalg.eigh(H_reg)
+        else:
+            eigenvalues = eigenvalues_raw
+            eigenvectors = eigenvectors_raw
 
-        # Now diagonalize the regularized matrix
-        eigenvalues, eigenvectors = np.linalg.eigh(H_reg)
-        E0 = float(eigenvalues[0])
+        E0 = float(eigenvalues[0].cpu())
         v0 = eigenvectors[:, 0]
 
         if return_eigenvector:
-            return E0, torch.from_numpy(v0)
+            return E0, v0
         else:
             return E0, None
 
@@ -1256,9 +1074,6 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         Returns:
             List of sample dictionaries for each Krylov step
         """
-        from scipy.sparse import csr_matrix
-        from scipy.sparse.linalg import expm_multiply
-
         device = self.hamiltonian.device if hasattr(self.hamiltonian, 'device') else 'cpu'
 
         # Start with NF basis as the subspace
@@ -1275,9 +1090,9 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         else:
             print(f"NF-guided Krylov: Starting with {n_initial} NF configs")
 
-        # Initialize state: uniform superposition over NF basis
+        # Initialize state: uniform superposition over NF basis (GPU tensor)
         n_subspace = len(current_basis)
-        psi = np.ones(n_subspace, dtype=np.complex128) / np.sqrt(n_subspace)
+        psi = torch.ones(n_subspace, dtype=torch.complex128, device=device) / np.sqrt(n_subspace)
 
         self.krylov_samples = []
         self._nf_guided_psi = None  # For importance-weighted exploration
@@ -1288,11 +1103,11 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             iterator = tqdm(iterator, desc="NF-guided Krylov")
 
         for k in iterator:
-            # Store psi for importance-weighted exploration
-            self._nf_guided_psi = psi
+            # Store psi as numpy for compatibility with sampling/exploration
+            self._nf_guided_psi = psi.cpu().numpy()
 
-            # Sample from current state
-            samples = self._sample_from_subspace_basis(psi, current_basis)
+            # Sample from current state (needs numpy psi)
+            samples = self._sample_from_subspace_basis(self._nf_guided_psi, current_basis, krylov_step=k)
             self.krylov_samples.append(samples)
 
             if k < max_krylov_dim - 1:
@@ -1300,10 +1115,10 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                 if max_expansion > 0 and len(current_basis) >= max_expansion:
                     # Basis is frozen — reuse cached H to avoid expensive rebuild
                     if H_subspace_cached is None:
-                        H_subspace_cached = self._build_hamiltonian_in_basis(current_basis)
-                    t = -1j * self.time_step
-                    psi = expm_multiply(t * H_subspace_cached, psi)
-                    psi = psi / np.linalg.norm(psi)
+                        H_subspace_cached = self._build_hamiltonian_in_basis_gpu(current_basis)
+                    # GPU time evolution via gpu_expm_multiply
+                    psi = gpu_expm_multiply(H_subspace_cached, psi, t=-1j * self.time_step)
+                    psi = psi / torch.linalg.norm(psi)
                     continue
 
                 # Expand subspace by finding connected configurations
@@ -1323,19 +1138,18 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                     for c in new_configs:
                         basis_set.add(tuple(c.cpu().tolist()))
 
-                    # Expand state vector (new configs start with zero amplitude)
+                    # Expand state vector on GPU (new configs start with zero amplitude)
                     n_new = len(new_configs)
-                    psi = np.concatenate([psi, np.zeros(n_new, dtype=np.complex128)])
+                    psi = torch.cat([psi, torch.zeros(n_new, dtype=torch.complex128, device=device)])
 
-                # Build Hamiltonian in current subspace
-                H_subspace = self._build_hamiltonian_in_basis(current_basis)
+                # Build Hamiltonian in current subspace (GPU dense tensor)
+                H_subspace = self._build_hamiltonian_in_basis_gpu(current_basis)
 
-                # Time evolution in subspace
-                t = -1j * self.time_step
-                psi = expm_multiply(t * H_subspace, psi)
+                # GPU time evolution
+                psi = gpu_expm_multiply(H_subspace, psi, t=-1j * self.time_step)
 
-                # Normalize
-                psi = psi / np.linalg.norm(psi)
+                # Normalize on GPU
+                psi = psi / torch.linalg.norm(psi)
 
         n_final = len(current_basis)
         print(f"NF-guided Krylov: Expanded to {n_final} configs (+{n_final - n_initial} new)")
@@ -1381,30 +1195,35 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
         # Use importance-weighted sampling if we have state amplitudes
         # Prefer exploring connections of high-amplitude basis states
+        rng = np.random.default_rng(self.config.seed + 2000)
         if hasattr(self, '_nf_guided_psi') and self._nf_guided_psi is not None:
             psi = self._nf_guided_psi
             probs = np.abs(psi[:len(basis)]) ** 2
             probs = probs / probs.sum()
-            indices_np = np.random.choice(
+            indices_np = rng.choice(
                 len(basis), size=n_sample, replace=False, p=probs
             )
             indices = torch.from_numpy(indices_np)
         else:
-            indices = torch.randperm(len(basis))[:n_sample]
+            gen = torch.Generator().manual_seed(self.config.seed + 2000)
+            indices = torch.randperm(len(basis), generator=gen)[:n_sample]
 
-        # Collect all connected configs in batches for GPU-efficient processing
-        all_connected = []
-        for idx in indices:
-            config = basis[idx]
-            connected, elements = self.hamiltonian.get_connections(config)
-            if len(connected) > 0:
-                all_connected.append(connected)
+        # B4: Use vectorized batch method if available (avoids per-config Python loop)
+        sampled_basis = basis[indices]
+        if hasattr(self.hamiltonian, 'get_connections_vectorized_batch'):
+            all_connected, _, _ = self.hamiltonian.get_connections_vectorized_batch(sampled_basis)
+        else:
+            all_connected_list = []
+            for idx in indices:
+                connected, elements = self.hamiltonian.get_connections(basis[idx])
+                if len(connected) > 0:
+                    all_connected_list.append(connected)
+            if not all_connected_list:
+                return torch.empty(0, n_sites, device=device)
+            all_connected = torch.cat(all_connected_list, dim=0)
 
-        if not all_connected:
+        if len(all_connected) == 0:
             return torch.empty(0, n_sites, device=device)
-
-        # Stack all connected configs
-        all_connected = torch.cat(all_connected, dim=0)
 
         # GPU-based integer encoding (single operation)
         connected_ints = (all_connected.long() * powers).sum(dim=1)
@@ -1427,9 +1246,29 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
         return all_connected[new_indices]
 
+    def _build_hamiltonian_in_basis_gpu(self, basis: torch.Tensor) -> torch.Tensor:
+        """
+        Build dense Hamiltonian matrix in given basis, entirely on GPU.
+
+        Uses hamiltonian.matrix_elements() which returns a GPU torch tensor.
+        This avoids the scipy sparse CPU path entirely.
+
+        Returns:
+            Dense Hamiltonian matrix (n, n) as complex128 torch tensor on device.
+        """
+        H = self.hamiltonian.matrix_elements(basis, basis)
+        # Ensure complex128 for time evolution compatibility
+        H = H.to(torch.complex128)
+        # Symmetrize on GPU
+        H = 0.5 * (H + H.conj().T)
+        return H
+
     def _build_hamiltonian_in_basis(self, basis: torch.Tensor):
         """
-        Build sparse Hamiltonian matrix in given basis.
+        Build sparse Hamiltonian matrix in given basis (scipy sparse, CPU).
+
+        Legacy method kept for compatibility with non-GPU code paths.
+        For GPU code paths, use _build_hamiltonian_in_basis_gpu() instead.
 
         OPTIMIZED: Uses batch diagonal computation and GPU-based integer
         encoding for efficient membership checking.
@@ -1449,13 +1288,13 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
         rows, cols, data = [], [], []
 
-        # OPTIMIZED: Batch diagonal computation
+        # OPTIMIZED: Batch diagonal computation (single CPU transfer)
         if hasattr(self.hamiltonian, 'diagonal_elements_batch'):
             diag_elements = self.hamiltonian.diagonal_elements_batch(basis)
-            for j in range(n):
-                rows.append(j)
-                cols.append(j)
-                data.append(diag_elements[j].item())
+            diag_cpu = diag_elements.cpu().numpy().tolist()
+            rows.extend(range(n))
+            cols.extend(range(n))
+            data.extend(diag_cpu)
         else:
             # Fallback for Hamiltonians without batch method
             for j in range(n):
@@ -1464,23 +1303,33 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                 cols.append(j)
                 data.append(diag)
 
-        # Off-diagonal elements - batch process connections
-        for j in range(n):
-            connected, elements = self.hamiltonian.get_connections(basis[j])
-
-            if len(connected) == 0:
-                continue
-
-            # GPU-based integer encoding for connected configs
-            connected_ints = (connected.long() * powers).sum(dim=1).cpu().tolist()
-
-            for k, config_int in enumerate(connected_ints):
-                if config_int in basis_map:
-                    i = basis_map[config_int]
-                    elem = elements[k]
-                    rows.append(i)
-                    cols.append(j)
-                    data.append(elem.item() if hasattr(elem, 'item') else elem)
+        # B4: Off-diagonal — use vectorized batch if available
+        if hasattr(self.hamiltonian, 'get_connections_vectorized_batch'):
+            all_connected, all_elements, batch_idx = self.hamiltonian.get_connections_vectorized_batch(basis)
+            if len(all_connected) > 0:
+                connected_ints = (all_connected.long() * powers).sum(dim=1).cpu().tolist()
+                batch_idx_cpu = batch_idx.cpu().tolist()
+                all_elem_cpu = all_elements.cpu().tolist() if hasattr(all_elements, 'cpu') else list(all_elements)
+                for k_idx, config_int in enumerate(connected_ints):
+                    if config_int in basis_map:
+                        i = basis_map[config_int]
+                        j = batch_idx_cpu[k_idx]
+                        rows.append(i)
+                        cols.append(j)
+                        data.append(all_elem_cpu[k_idx])
+        else:
+            for j in range(n):
+                connected, elements = self.hamiltonian.get_connections(basis[j])
+                if len(connected) == 0:
+                    continue
+                connected_ints = (connected.long() * powers).sum(dim=1).cpu().tolist()
+                for k, config_int in enumerate(connected_ints):
+                    if config_int in basis_map:
+                        i = basis_map[config_int]
+                        elem = elements[k]
+                        rows.append(i)
+                        cols.append(j)
+                        data.append(elem.item() if hasattr(elem, 'item') else elem)
 
         return csr_matrix(
             (data, (rows, cols)),
@@ -1492,20 +1341,35 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         self,
         psi: np.ndarray,
         basis: torch.Tensor,
+        krylov_step: int = 0,
     ) -> Dict[str, int]:
         """Sample bitstrings from state in given basis."""
         num_samples = self.config.shots_per_krylov
+        seed = self.config.seed + krylov_step + 1000
+        n = len(psi)
 
         probs = np.abs(psi) ** 2
         probs = probs / probs.sum()
 
-        indices = np.random.choice(len(probs), size=num_samples, replace=True, p=probs)
+        # Use GPU sampling when possible (faster for moderate sizes)
+        max_multinomial_categories = 2**24
+        if n <= max_multinomial_categories and torch.cuda.is_available():
+            gen = torch.Generator(device='cuda').manual_seed(seed)
+            probs_torch = torch.from_numpy(probs).float().cuda()
+            indices = torch.multinomial(
+                probs_torch, num_samples, replacement=True, generator=gen
+            ).cpu().numpy()
+        else:
+            rng = np.random.default_rng(seed)
+            indices = rng.choice(n, size=num_samples, replace=True, p=probs.astype(np.float64))
+
         unique, counts = np.unique(indices, return_counts=True)
 
+        # Batch convert basis configs to bitstrings (single GPU→CPU transfer)
+        unique_configs = basis[unique].cpu().numpy()
         results = {}
-        for idx, count in zip(unique, counts):
-            config = basis[idx]
-            bitstring = "".join(str(b.item()) for b in config)
+        for i, count in enumerate(counts):
+            bitstring = "".join(str(b) for b in unique_configs[i])
             results[bitstring] = int(count)
 
         return results
@@ -1595,13 +1459,9 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             best_basis_size = len(combined_basis)
         else:
             # Standard path for smaller systems: compute energy at each Krylov dimension
+            # B5: Only compute combined energy (not krylov-only) to halve eigsh calls
             for k in range(1, max_krylov_dim):
-                # Krylov only
                 krylov_basis = self.get_basis_states(k, cumulative=True)
-                E_krylov, _ = self.compute_ground_state_energy(
-                    krylov_basis,
-                    regularization=self.config.regularization
-                )
 
                 # Combined: NF basis + Krylov-discovered configs
                 combined_basis = self.get_combined_basis(k, include_nf=True)
@@ -1609,6 +1469,8 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                     combined_basis,
                     regularization=self.config.regularization
                 )
+                # Use combined energy as krylov estimate too (avoids second eigsh call)
+                E_krylov = E_combined
 
                 # VARIATIONAL CHECK: Energy should decrease or stay same as basis grows
                 # If energy increases, likely numerical instability

@@ -108,16 +108,23 @@ def gpu_eigsh(
     # For very large matrices, try CuPy sparse
     if use_gpu and CUPY_AVAILABLE and torch.cuda.is_available():
         try:
-            H_np = H.cpu().numpy() if H.is_cuda else H.numpy()
-            H_gpu = cp.asarray(H_np)
+            # Zero-copy GPU→CuPy via DLPack when tensor is already on CUDA
+            if H.is_cuda:
+                H_gpu = cp.from_dlpack(H.detach().contiguous())
+            else:
+                H_gpu = cp.asarray(H.numpy())
             H_sparse = cupy_csr(H_gpu)
 
             eigenvalues_cp, eigenvectors_cp = cupy_eigsh(
                 H_sparse, k=k, which=which
             )
 
-            eigenvalues = torch.from_numpy(cp.asnumpy(eigenvalues_cp)).cuda()
-            eigenvectors = torch.from_numpy(cp.asnumpy(eigenvectors_cp)).cuda()
+            try:
+                eigenvalues = torch.from_dlpack(eigenvalues_cp)
+                eigenvectors = torch.from_dlpack(eigenvectors_cp)
+            except Exception:
+                eigenvalues = torch.from_numpy(cp.asnumpy(eigenvalues_cp)).cuda()
+                eigenvectors = torch.from_numpy(cp.asnumpy(eigenvectors_cp)).cuda()
 
             return eigenvalues, eigenvectors
         except Exception as e:

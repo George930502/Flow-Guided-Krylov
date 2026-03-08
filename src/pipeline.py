@@ -36,8 +36,6 @@ try:
         PhysicsGuidedFlowTrainer,
         PhysicsGuidedConfig,
     )
-    from .flows.discrete_flow import DiscreteFlowSampler
-    from .flows.training import FlowNQSTrainer, TrainingConfig
 except ImportError:
     from flows.particle_conserving_flow import (
         ParticleConservingFlowSampler,
@@ -47,8 +45,6 @@ except ImportError:
         PhysicsGuidedFlowTrainer,
         PhysicsGuidedConfig,
     )
-    from flows.discrete_flow import DiscreteFlowSampler
-    from flows.training import FlowNQSTrainer, TrainingConfig
 
 # NQS components
 try:
@@ -94,6 +90,7 @@ try:
         SKQDConfig,
     )
     from .krylov.sqd import SQDSolver, SQDConfig
+    from .krylov.quantum_skqd import QuantumCircuitSKQD, QuantumSKQDConfig
 except ImportError:
     from krylov.skqd import (
         SampleBasedKrylovDiagonalization,
@@ -101,6 +98,7 @@ except ImportError:
         SKQDConfig,
     )
     from krylov.sqd import SQDSolver, SQDConfig
+    from krylov.quantum_skqd import QuantumCircuitSKQD, QuantumSKQDConfig
 
 
 @dataclass
@@ -108,8 +106,7 @@ class PipelineConfig:
     """
     Configuration for the Flow-Guided Krylov pipeline.
 
-    This configuration supports both molecular systems (with particle conservation)
-    and general spin systems.
+    This configuration supports molecular systems with particle conservation.
     """
 
     # Flow type
@@ -145,20 +142,36 @@ class PipelineConfig:
     rank_2_fraction: float = 0.50  # Emphasize double excitations
 
     # Subspace diagonalization mode
-    subspace_mode: str = "skqd"  # "skqd" (Krylov time evolution) or "sqd" (SQD sampling-based)
+    # "skqd" = classical exact time evolution (no Trotter error)
+    # "skqd_quantum" = quantum circuit Trotterized evolution (NVIDIA CUDA-Q tutorial)
+    # "sqd" = IBM SQD sampling-based batch diagonalization
+    subspace_mode: str = "skqd"
 
     # SQD-specific parameters (used when subspace_mode="sqd")
     sqd_num_batches: int = 5           # K batches for independent diagonalization
     sqd_batch_size: int = 0            # d configs per batch (0 = auto from NF samples)
     sqd_self_consistent_iters: int = 3 # Self-consistent config recovery iterations
     sqd_spin_penalty: float = 0.0      # Lambda for S^2 penalty (0 = disabled)
+    sqd_noise_rate: float = 0.0        # Depolarizing noise rate for SQD recovery mode (0 = clean SQD)
+    sqd_use_spin_symmetry: bool = True # Spin-up/down recombination in SQD batches
 
-    # SKQD parameters (used when subspace_mode="skqd")
-    max_krylov_dim: int = 8
-    time_step: float = 0.1
-    shots_per_krylov: int = 50000
+    # SKQD parameters (used when subspace_mode="skqd" or "skqd_quantum")
+    max_krylov_dim: int = 15  # Paper: d=15 (Ising simulation, Fig. 1)
+    time_step: float = 0.1  # Fallback Δt (overridden by spectral-range dt when auto_time_step=True)
+    shots_per_krylov: int = 100_000  # Paper: 10^5 shots per Krylov state (Section V)
     skqd_regularization: float = 1e-8  # Regularization for numerical stability
     skip_skqd: bool = False  # Skip Krylov refinement (for NF-only mode comparison)
+
+    # Automatic time step: compute dt = pi / spectral_range (Theorem 3.1, Epperly et al.)
+    # When True, overrides time_step and quantum_total_evolution_time with spectral-range dt
+    auto_time_step: bool = True
+
+    # Quantum circuit SKQD parameters (used when subspace_mode="skqd_quantum")
+    quantum_num_trotter_steps: int = 1       # Paper: single S₂(Δt) per evolution
+    quantum_total_evolution_time: float = 3.14159  # Fallback (overridden by auto_time_step)
+    quantum_shots: int = 100_000             # Paper: 10^5 shots per Krylov state
+    quantum_cudaq_target: str = "nvidia"     # CUDA-Q target backend
+    quantum_cudaq_option: str = "fp64"       # CUDA-Q precision (fp64 for chemistry)
 
     # Training mode
     use_local_energy: bool = True  # Use VMC local energy (proper variational estimator)
@@ -239,6 +252,8 @@ class PipelineConfig:
             # SQD: more batches for better statistics
             if self.subspace_mode == "sqd":
                 self.sqd_num_batches = max(self.sqd_num_batches, 8)
+                if self.sqd_noise_rate > 0:
+                    self.sqd_noise_rate = max(self.sqd_noise_rate, 0.05)
 
         elif tier == "large":
             # Large systems: aggressive basis collection
@@ -252,6 +267,8 @@ class PipelineConfig:
             # SQD: more batches
             if self.subspace_mode == "sqd":
                 self.sqd_num_batches = max(self.sqd_num_batches, 10)
+                if self.sqd_noise_rate > 0:
+                    self.sqd_noise_rate = max(self.sqd_noise_rate, 0.10)
 
         else:  # very_large
             # Very large systems (>20K valid configs, e.g. C2H4 with 9M)
@@ -278,6 +295,8 @@ class PipelineConfig:
             # SQD: more batches for large systems
             if self.subspace_mode == "sqd":
                 self.sqd_num_batches = max(self.sqd_num_batches, 10)
+                if self.sqd_noise_rate > 0:
+                    self.sqd_noise_rate = max(self.sqd_noise_rate, 0.15)
 
         # Compute coverage statistics
         coverage_accumulated = min(1.0, self.max_accumulated_basis / n_valid_configs)
@@ -348,21 +367,23 @@ class FlowGuidedKrylovPipeline:
         self.num_sites = hamiltonian.num_sites
         self.device = self.config.device
 
-        # Check if molecular Hamiltonian (for particle conservation)
-        self.is_molecular = isinstance(hamiltonian, MolecularHamiltonian)
+        # Verify molecular Hamiltonian (particle conservation required)
+        if not isinstance(hamiltonian, MolecularHamiltonian):
+            raise TypeError(
+                "FlowGuidedKrylovPipeline requires a MolecularHamiltonian. "
+                "Use create_*_hamiltonian() factory functions from src.hamiltonians.molecular."
+            )
+        self.is_molecular = True
 
-        # Compute valid configuration space size for molecules
-        if self.is_molecular:
-            n_orb = hamiltonian.n_orbitals
-            n_alpha = hamiltonian.n_alpha
-            n_beta = hamiltonian.n_beta
-            self.n_valid_configs = comb(n_orb, n_alpha) * comb(n_orb, n_beta)
+        # Compute valid configuration space size
+        n_orb = hamiltonian.n_orbitals
+        n_alpha = hamiltonian.n_alpha
+        n_beta = hamiltonian.n_beta
+        self.n_valid_configs = comb(n_orb, n_alpha) * comb(n_orb, n_beta)
 
-            # Automatically adapt configuration to system size
-            if auto_adapt:
-                self.config.adapt_to_system_size(self.n_valid_configs)
-        else:
-            self.n_valid_configs = self.hamiltonian.hilbert_dim
+        # Automatically adapt configuration to system size
+        if auto_adapt:
+            self.config.adapt_to_system_size(self.n_valid_configs)
 
         # Initialize components
         self._init_components()
@@ -374,27 +395,18 @@ class FlowGuidedKrylovPipeline:
         """Initialize flow, NQS, and auxiliary components."""
         cfg = self.config
 
-        # Determine flow type
-        if cfg.use_particle_conserving_flow and self.is_molecular:
-            # Use particle-conserving flow for molecules
-            n_alpha = self.hamiltonian.n_alpha
-            n_beta = self.hamiltonian.n_beta
+        # Initialize particle-conserving flow for molecules
+        n_alpha = self.hamiltonian.n_alpha
+        n_beta = self.hamiltonian.n_beta
 
-            self.flow = ParticleConservingFlowSampler(
-                num_sites=self.num_sites,
-                n_alpha=n_alpha,
-                n_beta=n_beta,
-                hidden_dims=cfg.nf_hidden_dims,
-            ).to(self.device)
+        self.flow = ParticleConservingFlowSampler(
+            num_sites=self.num_sites,
+            n_alpha=n_alpha,
+            n_beta=n_beta,
+            hidden_dims=cfg.nf_hidden_dims,
+        ).to(self.device)
 
-            print(f"Using particle-conserving flow: {n_alpha}α + {n_beta}β electrons")
-        else:
-            # Use standard discrete flow
-            self.flow = DiscreteFlowSampler(
-                num_sites=self.num_sites,
-                num_coupling_layers=4,
-                hidden_dims=cfg.nf_hidden_dims,
-            ).to(self.device)
+        print(f"Using particle-conserving flow: {n_alpha}α + {n_beta}β electrons")
 
         # Neural Quantum State
         self.nqs = DenseNQS(
@@ -402,11 +414,8 @@ class FlowGuidedKrylovPipeline:
             hidden_dims=cfg.nqs_hidden_dims,
         ).to(self.device)
 
-        # Get reference state (HF for molecules)
-        if self.is_molecular:
-            self.reference_state = self.hamiltonian.get_hf_state()
-        else:
-            self.reference_state = torch.zeros(self.num_sites, device=self.device)
+        # Get reference state (HF state)
+        self.reference_state = self.hamiltonian.get_hf_state()
 
     def _generate_essential_configs(self) -> torch.Tensor:
         """
@@ -657,22 +666,32 @@ class FlowGuidedKrylovPipeline:
 
     def run_subspace_diag(self, progress: bool = True) -> Dict[str, Any]:
         """
-        Stage 3: Subspace diagonalization via SKQD or SQD.
+        Stage 3: Subspace diagonalization via SKQD, SKQD-Quantum, or SQD.
 
-        Mode "skqd": Krylov time evolution expands the NF basis, then diagonalizes.
-        Mode "sqd": SQD sampling-based batch diagonalization with self-consistent
-                    configuration recovery (following the IBM quantum-centric paper).
+        Mode "skqd": Classical exact time evolution (no Trotter error).
+        Mode "skqd_quantum": Quantum circuit Trotterized evolution (NVIDIA CUDA-Q tutorial).
+        Mode "sqd": SQD sampling-based batch diagonalization (IBM paper).
         """
         cfg = self.config
         nf_basis = self.nf_basis
 
         if cfg.subspace_mode == "sqd":
             return self._run_sqd(nf_basis, progress)
+        elif cfg.subspace_mode == "skqd_quantum":
+            return self._run_skqd_quantum(nf_basis, progress)
         else:
             return self._run_skqd(nf_basis, progress)
 
     def _run_skqd(self, nf_basis: torch.Tensor, progress: bool = True) -> Dict[str, Any]:
-        """Run SKQD (Krylov time evolution) subspace diagonalization."""
+        """
+        Run SKQD (Krylov time evolution) subspace diagonalization.
+
+        Note: Classical SKQD operates in the particle-conserving subspace, while
+        quantum SKQD (skqd_quantum) operates in the full 2^n Hilbert space. For
+        a fair ablation study comparing only the time evolution method, use the
+        comparison script (examples/quantum_vs_classical_krylov.py) which runs
+        all paths in the same Hilbert space.
+        """
         print("=" * 60)
         print("Stage 3: Sample-Based Krylov Quantum Diagonalization (SKQD)")
         print("=" * 60)
@@ -684,10 +703,21 @@ class FlowGuidedKrylovPipeline:
             print("SKQD disabled, computing direct diagonalization...")
             return self._direct_diagonalize(nf_basis)
 
+        # Compute spectral-range dt if auto_time_step enabled
+        time_step = cfg.time_step
+        if cfg.auto_time_step and hasattr(self.hamiltonian, 'n_orbitals'):
+            try:
+                from .krylov.spectral_utils import compute_optimal_dt
+            except ImportError:
+                from krylov.spectral_utils import compute_optimal_dt
+            optimal_dt, spectral_range = compute_optimal_dt(self.hamiltonian)
+            time_step = optimal_dt
+            print(f"  Auto time step: dt = π/ΔE = {optimal_dt:.6f} (spectral range: {spectral_range:.4f} Ha)")
+
         # Configure SKQD
         skqd_config = SKQDConfig(
             max_krylov_dim=cfg.max_krylov_dim,
-            time_step=cfg.time_step,
+            time_step=time_step,
             shots_per_krylov=cfg.shots_per_krylov,
             use_gpu=(self.device == "cuda"),
             regularization=getattr(cfg, 'skqd_regularization', 1e-8),
@@ -716,19 +746,81 @@ class FlowGuidedKrylovPipeline:
         self.results["combined_energy"] = skqd_energy
         return results
 
-    def _run_sqd(self, nf_basis: torch.Tensor, progress: bool = True) -> Dict[str, Any]:
-        """Run SQD (sampling-based) subspace diagonalization."""
+    def _run_skqd_quantum(self, nf_basis: torch.Tensor, progress: bool = True) -> Dict[str, Any]:
+        """
+        Run quantum circuit SKQD (Trotterized evolution) following NVIDIA CUDA-Q tutorial.
+
+        Uses Jordan-Wigner transformation to convert the molecular Hamiltonian
+        to Pauli form, then generates Krylov states via Trotterized exp_pauli
+        circuits (or classical Trotterized fallback if CUDA-Q unavailable).
+        """
         print("=" * 60)
-        print("Stage 3: Sample-Based Quantum Diagonalization (SQD)")
+        print("Stage 3: Quantum Circuit SKQD (Trotterized Evolution)")
         print("=" * 60)
 
         cfg = self.config
+
+        # Compute spectral-range dt if auto_time_step enabled
+        evolution_time = cfg.quantum_total_evolution_time
+        if cfg.auto_time_step and hasattr(self.hamiltonian, 'n_orbitals'):
+            try:
+                from .krylov.spectral_utils import compute_optimal_dt
+            except ImportError:
+                from krylov.spectral_utils import compute_optimal_dt
+            optimal_dt, spectral_range = compute_optimal_dt(self.hamiltonian)
+            evolution_time = optimal_dt
+            print(f"  Auto time step: dt = π/ΔE = {optimal_dt:.6f} (spectral range: {spectral_range:.4f} Ha)")
+
+        quantum_config = QuantumSKQDConfig(
+            max_krylov_dim=cfg.max_krylov_dim,
+            total_evolution_time=evolution_time,
+            num_trotter_steps=cfg.quantum_num_trotter_steps,
+            shots=cfg.quantum_shots,
+            cudaq_target=cfg.quantum_cudaq_target,
+            cudaq_option=cfg.quantum_cudaq_option,
+            initial_state="hf",
+        )
+
+        solver = QuantumCircuitSKQD.from_molecular_hamiltonian(
+            self.hamiltonian, config=quantum_config
+        )
+
+        results = solver.run(progress=progress)
+
+        quantum_energy = results["best_energy"]
+
+        self.results["quantum_skqd_results"] = results
+        self.results["quantum_skqd_energy"] = quantum_energy
+
+        # Variational consistency check
+        if self.exact_energy is not None and quantum_energy < self.exact_energy - 0.001:
+            print(f"WARNING: Quantum SKQD energy ({quantum_energy:.6f}) below exact ({self.exact_energy:.6f})!")
+            print("Possible Trotter error or numerical instability.")
+
+        self.results["combined_energy"] = quantum_energy
+        return results
+
+    def _run_sqd(self, nf_basis: torch.Tensor, progress: bool = True) -> Dict[str, Any]:
+        """Run SQD (sampling-based) subspace diagonalization."""
+        cfg = self.config
+
+        # Enable config recovery when noise injection is active
+        # (emulating quantum hardware depolarizing noise for SQD-Recovery mode)
+        enable_recovery = cfg.sqd_noise_rate > 0
+
+        print("=" * 60)
+        sqd_mode = "Recovery" if enable_recovery else "Clean"
+        print(f"Stage 3: Sample-Based Quantum Diagonalization (SQD-{sqd_mode})")
+        print("=" * 60)
 
         sqd_config = SQDConfig(
             num_batches=cfg.sqd_num_batches,
             batch_size=cfg.sqd_batch_size,
             self_consistent_iters=cfg.sqd_self_consistent_iters,
             spin_penalty=cfg.sqd_spin_penalty,
+            noise_rate=cfg.sqd_noise_rate,
+            enable_config_recovery=enable_recovery,
+            use_spin_symmetry_enhancement=cfg.sqd_use_spin_symmetry,
         )
 
         solver = SQDSolver(
@@ -808,7 +900,13 @@ class FlowGuidedKrylovPipeline:
         if self.results.get("skip_nf_training"):
             print(f"Mode:              Direct-CI (NF training skipped)")
 
-        print(f"Subspace mode:     {self.config.subspace_mode.upper()}")
+        mode_label = self.config.subspace_mode.upper()
+        if self.config.subspace_mode == "sqd":
+            if self.config.sqd_noise_rate > 0:
+                mode_label += f" (Recovery, noise={self.config.sqd_noise_rate:.2f})"
+            else:
+                mode_label += " (Clean)"
+        print(f"Subspace mode:     {mode_label}")
 
         if "nf_nqs_energy" in self.results and self.results["nf_nqs_energy"] is not None:
             print(f"NF-NQS Energy:     {self.results['nf_nqs_energy']:.8f}")
@@ -895,9 +993,3 @@ def run_molecular_benchmark(
     results = pipeline.run(progress=verbose)
 
     return results
-
-
-# Backward compatibility aliases
-EnhancedPipelineConfig = PipelineConfig
-EnhancedFlowKrylovPipeline = FlowGuidedKrylovPipeline
-run_enhanced_molecular_benchmark = run_molecular_benchmark

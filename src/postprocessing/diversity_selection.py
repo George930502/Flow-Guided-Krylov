@@ -113,9 +113,14 @@ class ExcitationBucketer:
 
     def add_configs(self, configs: torch.Tensor):
         """Add configurations to appropriate buckets."""
-        for i in range(len(configs)):
-            rank = compute_excitation_rank(configs[i], self.reference)
-            self.buckets[rank].append(configs[i])
+        if len(configs) == 0:
+            return
+        # Vectorized excitation rank: count differing positions then halve
+        diffs = (configs != self.reference.unsqueeze(0)).sum(dim=1) // 2  # (n_configs,)
+        for rank in diffs.unique().tolist():
+            rank = int(rank)
+            mask = diffs == rank
+            self.buckets[rank].extend(configs[mask].unbind(0))
 
     def get_bucket(self, rank: int) -> List[torch.Tensor]:
         """Get configurations at a specific excitation rank."""
@@ -313,13 +318,17 @@ class DiversitySelector:
         subset_configs: torch.Tensor,
     ) -> torch.Tensor:
         """Find indices of subset_configs in all_configs."""
-        indices = []
-        for i in range(len(subset_configs)):
-            matches = (all_configs == subset_configs[i]).all(dim=1)
-            idx = torch.where(matches)[0]
-            if len(idx) > 0:
-                indices.append(idx[0].item())
-        return torch.tensor(indices, device=all_configs.device)
+        device = all_configs.device
+        n_bits = all_configs.shape[1]
+        # Integer-encode configs using positional bit weights
+        powers = (2 ** torch.arange(n_bits, device=device)).flip(0).long()
+        all_ints = (all_configs.long() * powers).sum(dim=1)
+        subset_ints = (subset_configs.long() * powers).sum(dim=1)
+        # Sort all_ints for searchsorted-based lookup
+        sorted_ints, sort_order = all_ints.sort()
+        positions = torch.searchsorted(sorted_ints, subset_ints)
+        positions = positions.clamp(max=len(all_ints) - 1)
+        return sort_order[positions]
 
     def _weighted_select(
         self,
@@ -357,44 +366,45 @@ class DiversitySelector:
         distances = compute_hamming_distance_matrix(configs).float()
 
         # Greedy selection
-        selected = []
-        remaining = set(range(n))
+        selected_list = []
+        min_hamming = self.config.min_hamming_distance
+        scale = self.config.dpp_kernel_scale
 
         # Start with highest weight
         first = weights.argmax().item()
-        selected.append(first)
-        remaining.remove(first)
+        selected_list.append(first)
 
-        while len(selected) < n_select and remaining:
-            best_score = -float('inf')
-            best_idx = None
+        # Track remaining indices with a boolean mask over [0, n)
+        remaining_mask = torch.ones(n, dtype=torch.bool, device=device)
+        remaining_mask[first] = False
+        remaining_idx = torch.where(remaining_mask)[0]  # 1-D index tensor
 
-            for idx in remaining:
-                # Minimum distance to already selected
-                min_dist = distances[idx, selected].min().item()
+        while len(selected_list) < n_select and len(remaining_idx) > 0:
+            # Min distance from each remaining config to ALL selected (vectorized)
+            # distances[remaining_idx][:, selected_list] — shape (n_remaining, n_selected)
+            min_dists = distances[remaining_idx][:, selected_list].min(dim=1).values  # (n_remaining,)
 
-                # Skip if too close
-                if min_dist < self.config.min_hamming_distance:
-                    continue
+            # Score = weight * dist^scale
+            scores = weights[remaining_idx] * (min_dists ** scale)  # (n_remaining,)
 
-                # Score = weight * distance^scale
-                score = weights[idx].item() * (min_dist ** self.config.dpp_kernel_scale)
+            # Zero out scores for configs that are too close
+            too_close = min_dists < min_hamming
+            if too_close.all():
+                # Fallback: all remaining are too close — pick by weight alone
+                best_local = weights[remaining_idx].argmax().item()
+            else:
+                scores[too_close] = -float('inf')
+                best_local = scores.argmax().item()
 
-                if score > best_score:
-                    best_score = score
-                    best_idx = idx
+            best_idx = remaining_idx[best_local].item()
+            selected_list.append(best_idx)
 
-            if best_idx is None:
-                # All remaining are too close, pick by weight
-                remaining_list = list(remaining)
-                remaining_weights = weights[remaining_list]
-                best_local = remaining_weights.argmax().item()
-                best_idx = remaining_list[best_local]
+            # Remove best_idx from remaining_idx
+            keep = torch.ones(len(remaining_idx), dtype=torch.bool, device=device)
+            keep[best_local] = False
+            remaining_idx = remaining_idx[keep]
 
-            selected.append(best_idx)
-            remaining.remove(best_idx)
-
-        return torch.tensor(selected, device=device)
+        return torch.tensor(selected_list, device=device)
 
 
 def select_diverse_basis(
@@ -439,15 +449,12 @@ def analyze_basis_diversity(
     n = len(configs)
     device = configs.device
 
-    # Excitation rank distribution
-    ranks = []
-    for i in range(n):
-        rank = compute_excitation_rank(configs[i], reference.to(device))
-        ranks.append(rank)
-
+    # Vectorized excitation rank distribution
+    diffs = (configs != reference.to(device).unsqueeze(0)).sum(dim=1) // 2
     rank_counts = {}
-    for r in set(ranks):
-        rank_counts[f'rank_{r}'] = ranks.count(r)
+    for r in diffs.unique().tolist():
+        r = int(r)
+        rank_counts[f'rank_{r}'] = int((diffs == r).sum().item())
 
     # Distance statistics
     if n > 1:

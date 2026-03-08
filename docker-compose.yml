@@ -11,7 +11,7 @@ services:
       - .:/app
       - ./outputs:/app/outputs
     working_dir: /app
-    command: python examples/ising_example.py
+    command: python examples/validate_small_systems.py
 
   # GPU version (requires nvidia-docker)
   flow-krylov-gpu:
@@ -30,7 +30,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    command: python examples/ising_example.py
+    command: python examples/validate_small_systems.py
 
   # Interactive shell
   shell:
