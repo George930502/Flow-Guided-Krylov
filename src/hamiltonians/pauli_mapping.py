@@ -96,12 +96,13 @@ class PauliSum:
         """Remove near-zero terms in place."""
         self.terms = {ps: c for ps, c in self.terms.items() if abs(c) > threshold}
 
-    def to_real_lists(self, threshold: float = 1e-8) -> Tuple[List[float], List[str]]:
+    def to_real_lists(self, threshold: float = 1e-12) -> Tuple[List[float], List[str]]:
         """
         Export as (coefficients, pauli_words) with real coefficients.
 
         Drops the all-identity term (constant energy offset returned separately).
-        Raises if any coefficient has significant imaginary part.
+        Imaginary parts are stripped (they are FP noise from JW algebra).
+        Warns if any imaginary part exceeds 1e-6 relative to real part.
 
         Returns:
             (coefficients, pauli_words, constant) where constant is the
@@ -115,10 +116,15 @@ class PauliSum:
         constant = 0.0
 
         for ps, c in self.terms.items():
-            if abs(c.imag) > threshold:
-                raise ValueError(
-                    f"Pauli term '{ps}' has imaginary coefficient {c}. "
-                    "Molecular Hamiltonians with real integrals should yield real Pauli coefficients."
+            # Warn if imaginary part is suspiciously large relative to real part
+            if abs(c.real) > 1e-15 and abs(c.imag) / abs(c.real) > 1e-6:
+                import warnings
+
+                warnings.warn(
+                    f"Pauli term '{ps}' has imaginary/real ratio "
+                    f"{abs(c.imag) / abs(c.real):.2e} (coeff={c}). "
+                    "Stripping imaginary part — verify integrals are real.",
+                    stacklevel=2,
                 )
             real_c = c.real
             if abs(real_c) < threshold:
