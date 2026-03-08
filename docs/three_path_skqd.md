@@ -96,7 +96,7 @@ $$H_{\text{eff}}[i,j] = \langle s_i \rvert H \lvert s_j \rangle$$
 | **取樣方式** | 確定性列舉 | `torch.multinomial` | `torch.multinomial` | `cudaq.sample` |
 | **RNG seed** | 不適用（無隨機性） | `seed + k + 1000` | `seed + k + 1000` | `seed + k`（CUDA-Q 內部） |
 | **實作位置** | `pipeline.py:_generate_essential_configs` + `projected_hamiltonian.py` | `quantum_skqd.py:_sample_exact` | `quantum_skqd.py:_sample_classical_trotterized` | `quantum_skqd.py:_sample_cudaq` |
-| **系統規模限制** | 組合爆炸（doubles 數量 $\propto n^4$） | 記憶體（Lanczos 向量） | phase_table（$`n_{\text{terms}} \times 2^n`$）；$2^n \leq 100{,}000$ | CUDA-Q 電路深度 |
+| **系統規模限制** | 組合爆炸（doubles 數量 $\propto n^4$） | 記憶體（Lanczos 向量） | `phase_table`（n\_terms × 2^n）；2^n ≤ 100,000 | CUDA-Q 電路深度 |
 | **依賴** | PySCF + SciPy | PyTorch | PyTorch | CUDA-Q（`cuda-quantum-cu12`） |
 
 **Path A/B/C 的唯一變因**：三條 Krylov 路徑之間 **只有時間演化方法不同**，所有其他變因完全一致。
@@ -163,10 +163,10 @@ k=2: {bitstrings from |ψ₀⟩} ∪ {bitstrings from |ψ₁⟩} ∪ {bitstrings
 | 參數 | 數值 | 來源 |
 |------|------|------|
 | `max_krylov_dim` | 15 | 論文 Fig. 1（Ising 模擬） |
-| `num_trotter_steps` | 1 | 論文：single $`S_2(\Delta t)`$ per evolution |
+| `num_trotter_steps` | 1 | 論文：single S₂(Δt) per evolution |
 | `trotter_order` | 2 | 論文 Section IV |
 | `shots` | 100,000 | 論文 Section V |
-| `dt` | $`\pi / \text{spectral\_range}`$ | Theorem 3.1 (Epperly) |
+| `dt` | π / spectral\_range | Theorem 3.1 (Epperly) |
 | `seed` | 42 | 可重現性 |
 
 ---
@@ -352,9 +352,9 @@ Path C 的 Lanczos 需要反覆計算 $H\lvert \psi\rangle$。使用 **輕量級
 - 僅儲存 $`O(n_{\text{terms}})`$ 的整數遮罩（flip mask、YZ mask），不儲存 $`O(n_{\text{terms}} \times 2^n)`$ 的 phase table
 - 每個 Pauli term 的相位透過 **bit parity** 即時計算：
   $$\text{phase}(x) = i^{n_Y} \cdot (-1)^{\text{popcount}(x \wedge \text{yz\_mask})}$$
-- 分塊處理（chunk_size 根據維度自適應）以控制 GPU 記憶體
+- 分塊處理（`chunk_size` 根據維度自適應）以控制 GPU 記憶體
 
-這使得 Path C 能處理 $\geq 18$ qubit 的系統（$2^{18} = 262{,}144$ 維），而不像 Path B 那樣被 phase_table 的記憶體限制。
+這使得 Path C 能處理 $\geq 18$ qubit 的系統（$2^{18} = 262{,}144$ 維），而不像 Path B 那樣被 `phase_table` 的記憶體限制。
 
 ### 5.4 特點
 
@@ -404,7 +404,7 @@ $$P_k\lvert x\rangle = \text{phase}(x) \cdot \lvert x \oplus \text{flip\_mask}_k
 │ _precompute_pauli_actions():                      │
 │   flip_masks:   (n_terms,) int64 ── 每個 term 的  │
 │                    bit flip 遮罩                   │
-│   phase_tables: (n_terms, 2^n) complex128 ── 每個 │
+│   `phase_table`s: (n_terms, 2^n) complex128 ── 每個 │
 │                    (term, state) 的複數相位        │
 └──────────────────────────────────────────────────┘
      │
@@ -567,7 +567,7 @@ else:
 
 - **最接近真實量子硬體**：電路結構完全匹配硬體執行
 - **CUDA-Q 內部 RNG**：使用 `cudaq.set_random_seed`，與 Path B/C 的 `torch.Generator` 不同
-- **無 phase_table 記憶體限制**：CUDA-Q 模擬器內部管理狀態向量
+- **無 `phase_table` 記憶體限制**：CUDA-Q 模擬器內部管理狀態向量
 - **依賴 CUDA-Q 安裝**：需要 `cuda-quantum-cu12` 套件，僅 Linux + NVIDIA GPU
 
 ---
@@ -585,7 +585,7 @@ else:
 | Hamiltonian | 相同 | 同一個 `MolecularHamiltonian` 實例 |
 | Pauli 分解 | 相同 | 同一次 Jordan-Wigner 轉換結果 |
 | 初始態 | 相同 | 都是 HF 態 |
-| 時間步長 $\Delta t$ | 相同 | 都用 $`\pi / \text{spectral\_range}`$ |
+| 時間步長 $\Delta t$ | 相同 | 都用 π / spectral\_range |
 | Krylov 維度 | 相同 | 都是 15 |
 | Trotter 階數 | 相同 | 都是二階（Path C 雖不使用 Trotter，但設定一致） |
 | Shots 數 | 相同 | 都是 100,000 |
@@ -713,7 +713,7 @@ $$\text{error} < 1.594 \text{ mHa} \approx 1 \text{ kcal/mol}$$
 | N2   | 20     | 1.1427       | skip         | 1.1003       | ---               |
 
 - 所有 7 個系統在所有可用路徑上均通過化學精度 (< 1.594 mHa)
-- CH4/N2 的 Path B 因 phase_table 記憶體限制（$2^n > 100{,}000$）而跳過
+- CH4/N2 的 Path B 因 `phase_table` 記憶體限制（$2^n > 100{,}000$）而跳過
 - Trotter 效應（B-C 差異）隨系統大小增加，但仍在 0.1 mHa 量級
 
 ### 10.2 觀察
