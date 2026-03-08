@@ -22,12 +22,12 @@
 
 SKQD 來自 Yu et al. (arXiv:2501.09702) 的演算法。其核心思想是：
 
-1. 從一個參考態 $\lvert \psi_0\rangle$（通常是 Hartree-Fock 態）出發
+1. 從一個參考態 $`\lvert \psi_0\rangle`$（通常是 Hartree-Fock 態）出發
 2. 透過時間演化算子 $U = e^{-iH\Delta t}$ 反覆作用，生成 **Krylov 態序列**：
    $$\lvert \psi_k\rangle = U^k \lvert \psi_0\rangle = e^{-ikH\Delta t} \lvert \psi_0\rangle, \quad k = 0, 1, \dots, d-1$$
-3. 對每個 Krylov 態 $\lvert \psi_k\rangle$ 進行計算基底（computational basis）量測取樣
+3. 對每個 Krylov 態 $`\lvert \psi_k\rangle`$ 進行計算基底（computational basis）量測取樣
 4. 收集所有取樣到的 bitstring，累積形成一個 **子空間基底**（subspace basis）
-5. 在此基底上投影 Hamiltonian：$H_{\text{eff}}[i,j] = \langle s_i \rvert H \lvert s_j \rangle$
+5. 在此基底上投影 Hamiltonian：$`H_{\text{eff}}[i,j] = \langle s_i \rvert H \lvert s_j \rangle`$
 6. 對投影後的有效 Hamiltonian 進行對角化，取最小特徵值作為基態能量估計
 
 ### 1.2 最佳時間步長（Theorem 3.1, Epperly et al.）
@@ -36,7 +36,7 @@ SKQD 來自 Yu et al. (arXiv:2501.09702) 的演算法。其核心思想是：
 
 $$\Delta t_{\text{optimal}} = \frac{\pi}{E_{\max} - E_{\min}}$$
 
-其中 $E_{\max}$ 和 $E_{\min}$ 是 Hamiltonian 在粒子數守恆子空間中的最大和最小特徵值（即 **光譜範圍 spectral range**）。
+其中 $`E_{\max}`$ 和 $`E_{\min}`$ 是 Hamiltonian 在粒子數守恆子空間中的最大和最小特徵值（即 **光譜範圍 spectral range**）。
 
 此步長確保 Krylov 態之間有最大的正交性，從而讓子空間能最有效地覆蓋基態波函數。
 
@@ -46,9 +46,9 @@ $$\Delta t_{\text{optimal}} = \frac{\pi}{E_{\max} - E_{\min}}$$
 
 量子電路需要 Pauli 表示的 Hamiltonian。**Jordan-Wigner 變換** 將二次量化的費米子算子轉換為 qubit 算子：
 
-- **數目算子**：$a_p^\dagger a_p \rightarrow \frac{1}{2}(I - Z_p)$
-- **跳躍算子** ($p < q$)：$a_p^\dagger a_q \rightarrow \frac{1}{4}(XX + YY + iXY - iYX) \cdot Z_{\text{chain}}$
-  - 其中 $Z_{\text{chain}} = Z_{p+1} \cdots Z_{q-1}$ 是 Jordan-Wigner 弦（string）
+- **數目算子**：$`a_p^\dagger a_p \rightarrow \frac{1}{2}(I - Z_p)`$
+- **跳躍算子** ($p < q$)：$`a_p^\dagger a_q \rightarrow \frac{1}{4}(XX + YY + iXY - iYX) \cdot Z_{\text{chain}}`$
+  - 其中 $`Z_{\text{chain}} = Z_{p+1} \cdots Z_{q-1}`$ 是 Jordan-Wigner 弦（string）
 
 雙體算子透過單體算子的乘積組合而成：
 
@@ -58,7 +58,7 @@ $$a_p^\dagger a_r^\dagger a_s a_q = (a_p^\dagger a_q)(a_r^\dagger a_s) - \delta_
 
 ### 1.4 Suzuki-Trotter 分解
 
-量子電路無法直接實現 $e^{-iH\Delta t}$（因為 $H = \sum_k c_k P_k$ 中各 Pauli 項不對易）。Trotter 分解提供了近似：
+量子電路無法直接實現 $e^{-iH\Delta t}$（因為 $`H = \sum_k c_k P_k`$ 中各 Pauli 項不對易）。Trotter 分解提供了近似：
 
 **一階 Trotter：**
 $$e^{-iH\Delta t} \approx \prod_k e^{-ic_k \Delta t \cdot P_k}$$
@@ -70,7 +70,7 @@ $$S_2(\Delta t) = \prod_{k=1}^{L} e^{-ic_k \frac{\Delta t}{2} P_k} \cdot \prod_{
 
 ### 1.5 投影對角化
 
-給定一組取樣到的 computational basis 態 $\{\lvert s_i\rangle\}_{i=1}^{N}$，投影 Hamiltonian 矩陣為：
+給定一組取樣到的 computational basis 態 $`\{\lvert s_i\rangle\}_{i=1}^{N}`$，投影 Hamiltonian 矩陣為：
 
 $$H_{\text{eff}}[i,j] = \langle s_i \rvert H \lvert s_j \rangle$$
 
@@ -96,7 +96,7 @@ $$H_{\text{eff}}[i,j] = \langle s_i \rvert H \lvert s_j \rangle$$
 | **取樣方式** | 確定性列舉 | `torch.multinomial` | `torch.multinomial` | `cudaq.sample` |
 | **RNG seed** | 不適用（無隨機性） | `seed + k + 1000` | `seed + k + 1000` | `seed + k`（CUDA-Q 內部） |
 | **實作位置** | `pipeline.py:_generate_essential_configs` + `projected_hamiltonian.py` | `quantum_skqd.py:_sample_exact` | `quantum_skqd.py:_sample_classical_trotterized` | `quantum_skqd.py:_sample_cudaq` |
-| **系統規模限制** | 組合爆炸（doubles 數量 $\propto n^4$） | 記憶體（Lanczos 向量） | phase_table（$n_{\text{terms}} \times 2^n$）；$2^n \leq 100{,}000$ | CUDA-Q 電路深度 |
+| **系統規模限制** | 組合爆炸（doubles 數量 $\propto n^4$） | 記憶體（Lanczos 向量） | phase_table（$`n_{\text{terms}} \times 2^n`$）；$2^n \leq 100{,}000$ | CUDA-Q 電路深度 |
 | **依賴** | PySCF + SciPy | PyTorch | PyTorch | CUDA-Q（`cuda-quantum-cu12`） |
 
 **Path A/B/C 的唯一變因**：三條 Krylov 路徑之間 **只有時間演化方法不同**，所有其他變因完全一致。
@@ -139,10 +139,10 @@ psi[idx] = 1.0                         # |HF⟩ 在 computational basis 中
 取樣完成後，所有路徑使用相同的對角化流程：
 
 1. 將 bitstring 轉為 basis tensor（`_basis_from_samples()`）
-2. 建構投影 Hamiltonian $H_{\text{eff}}$
+2. 建構投影 Hamiltonian $`H_{\text{eff}}`$
    - 若有分子 Hamiltonian 物件：使用 **Slater-Condon 規則**（`_diagonalize_slater_condon()`）
    - 否則（純 Pauli）：使用 **向量化 Pauli 矩陣元素計算**（`_diagonalize_pauli_gpu()`）
-3. 對稱化：$H_{\text{eff}} \leftarrow \frac{1}{2}(H_{\text{eff}} + H_{\text{eff}}^T)$
+3. 對稱化：$`H_{\text{eff}} \leftarrow \frac{1}{2}(H_{\text{eff}} + H_{\text{eff}}^T)`$
 4. `torch.linalg.eigh()` 取最小特徵值
 
 ### 3.4 累積基底策略（共享）
@@ -163,10 +163,10 @@ k=2: {bitstrings from |ψ₀⟩} ∪ {bitstrings from |ψ₁⟩} ∪ {bitstrings
 | 參數 | 數值 | 來源 |
 |------|------|------|
 | `max_krylov_dim` | 15 | 論文 Fig. 1（Ising 模擬） |
-| `num_trotter_steps` | 1 | 論文：single $S_2(\Delta t)$ per evolution |
+| `num_trotter_steps` | 1 | 論文：single $`S_2(\Delta t)`$ per evolution |
 | `trotter_order` | 2 | 論文 Section IV |
 | `shots` | 100,000 | 論文 Section V |
-| `dt` | $\pi / \text{spectral\_range}$ | Theorem 3.1 (Epperly) |
+| `dt` | $`\pi / \text{spectral\_range}`$ | Theorem 3.1 (Epperly) |
 | `seed` | 42 | 可重現性 |
 
 ---
@@ -315,10 +315,10 @@ Path C 在完整的 $2^n$ Hilbert 空間中計算 **精確的** $e^{-iHt}\lvert 
 
 Lanczos 演算法將矩陣指數投影到一個小的 Krylov 子空間上：
 
-1. 建構 Lanczos 基底 $\{v_0, v_1, \dots, v_{m-1}\}$，其中 $v_0 = \lvert \psi\rangle / \lVert \lvert \psi\rangle\rVert $
+1. 建構 Lanczos 基底 $`\{v_0, v_1, \dots, v_{m-1}\}`$，其中 $`v_0 = \lvert \psi\rangle / \lVert \lvert \psi\rangle\rVert `$
 2. 在 Lanczos 基底中，$H$ 的投影為三對角矩陣 $T$（$m \times m$，$m \ll 2^n$）
 3. 計算小矩陣 $e^{-itT}$（$m$ 通常 $\leq 30$，可 dense 對角化）
-4. 投影回原空間：$e^{-iHt}\lvert \psi\rangle \approx \lVert \lvert \psi\rangle\rVert \cdot V \cdot e^{-itT} \cdot e_0$
+4. 投影回原空間：$`e^{-iHt}\lvert \psi\rangle \approx \lVert \lvert \psi\rangle\rVert \cdot V \cdot e^{-itT} \cdot e_0`$
 
 ### 5.2 實作流程
 
@@ -349,7 +349,7 @@ Lanczos 演算法將矩陣指數投影到一個小的 Krylov 子空間上：
 
 Path C 的 Lanczos 需要反覆計算 $H\lvert \psi\rangle$。使用 **輕量級 Pauli mask**（`_precompute_pauli_masks_lightweight()`）：
 
-- 僅儲存 $O(n_{\text{terms}})$ 的整數遮罩（flip mask、YZ mask），不儲存 $O(n_{\text{terms}} \times 2^n)$ 的 phase table
+- 僅儲存 $`O(n_{\text{terms}})`$ 的整數遮罩（flip mask、YZ mask），不儲存 $`O(n_{\text{terms}} \times 2^n)`$ 的 phase table
 - 每個 Pauli term 的相位透過 **bit parity** 即時計算：
   $$\text{phase}(x) = i^{n_Y} \cdot (-1)^{\text{popcount}(x \wedge \text{yz\_mask})}$$
 - 分塊處理（chunk_size 根據維度自適應）以控制 GPU 記憶體
@@ -370,7 +370,7 @@ Path C 的 Lanczos 需要反覆計算 $H\lvert \psi\rangle$。使用 **輕量級
 
 Path B 在 GPU 上使用 **state-vector 模擬** 實現 Trotterized 時間演化。這是量子電路（Path A）的 **精確經典模擬**——兩者具有完全相同的 Trotter 分解結構，但 Path B 用數值計算取代量子閘操作。
 
-每個 Pauli 旋轉 $e^{-i\theta P_k}$ 利用 $P^2 = I$ 的性質解析求解：
+每個 Pauli 旋轉 $`e^{-i\theta P_k}`$ 利用 $P^2 = I$ 的性質解析求解：
 
 $$e^{-i\theta P}\lvert \psi\rangle = \cos(\theta)\lvert \psi\rangle - i\sin(\theta) P\lvert \psi\rangle$$
 
@@ -380,12 +380,12 @@ $$e^{-i\theta P}\lvert \psi\rangle = \cos(\theta)\lvert \psi\rangle - i\sin(\the
 
 在首次呼叫時，`_precompute_pauli_actions()` 建構：
 
-**Flip mask**（$n_{\text{terms}}$ 個整數）：
+**Flip mask**（$`n_{\text{terms}}`$ 個整數）：
 
 每個 Pauli term 的 flip mask 記錄了 X 和 Y 算子的位置。對 basis state $\lvert x\rangle$：
 $$P_k\lvert x\rangle = \text{phase}(x) \cdot \lvert x \oplus \text{flip\_mask}_k\rangle$$
 
-**Phase table**（$n_{\text{terms}} \times 2^n$ complex128 張量）：
+**Phase table**（$`n_{\text{terms}} \times 2^n`$ complex128 張量）：
 
 對每個 (term, state) 對，記錄複數相位。相位由 Z 和 Y 算子的貢獻決定：
 - Z 在 bit=1 的位置：因子 $-1$（即 $i^2$）
@@ -441,7 +441,7 @@ $$\text{每個 } k: 630 \times 2 \times 4{,}096 \approx 5.2\text{M 浮點運算}
 
 ### 6.5 記憶體限制
 
-Phase table 的大小為 $n_{\text{terms}} \times 2^n \times 16$ bytes（complex128）。這限制了 Path B 的最大系統大小：
+Phase table 的大小為 $`n_{\text{terms}} \times 2^n \times 16`$ bytes（complex128）。這限制了 Path B 的最大系統大小：
 
 | 系統 | Qubits | $2^n$ | Pauli terms | Phase table 大小 |
 |------|--------|-------|-------------|-----------------|
@@ -474,7 +474,7 @@ Path A 使用 NVIDIA CUDA-Q 框架，在 GPU 加速的量子模擬器上執行 *
 |0⟩^⊗n ──[X gates: prepare |HF⟩]──[S₂(Δt)]^k──[Measure all]
 ```
 
-其中 $[S_2(\Delta t)]$ 是二階 Suzuki-Trotter 電路，由一系列 `exp_pauli` 閘組成。
+其中 $`[S_2(\Delta t)]`$ 是二階 Suzuki-Trotter 電路，由一系列 `exp_pauli` 閘組成。
 
 ### 7.2 CUDA-Q Kernel 設計
 
@@ -585,7 +585,7 @@ else:
 | Hamiltonian | 相同 | 同一個 `MolecularHamiltonian` 實例 |
 | Pauli 分解 | 相同 | 同一次 Jordan-Wigner 轉換結果 |
 | 初始態 | 相同 | 都是 HF 態 |
-| 時間步長 $\Delta t$ | 相同 | 都用 $\pi / \text{spectral\_range}$ |
+| 時間步長 $\Delta t$ | 相同 | 都用 $`\pi / \text{spectral\_range}`$ |
 | Krylov 維度 | 相同 | 都是 15 |
 | Trotter 階數 | 相同 | 都是二階（Path C 雖不使用 Trotter，但設定一致） |
 | Shots 數 | 相同 | 都是 100,000 |
@@ -718,7 +718,7 @@ $$\text{error} < 1.594 \text{ mHa} \approx 1 \text{ kcal/mol}$$
 
 ### 10.2 觀察
 
-1. **Trotter 誤差極小**：二階 Suzuki-Trotter 在 $\Delta t = \pi / \text{spectral\_range}$ 下引入的額外誤差約 0.01-0.1 mHa，遠低於化學精度門檻
+1. **Trotter 誤差極小**：二階 Suzuki-Trotter 在 $`\Delta t = \pi / \text{spectral\_range}`$ 下引入的額外誤差約 0.01-0.1 mHa，遠低於化學精度門檻
 2. **電路效應可忽略**：Path A vs Path B（或 Path C）的差異在 0.01 mHa 量級
 3. **主要誤差來源是子空間截斷**：Path C 的誤差隨系統大小增長（0.0000 → 1.1427 mHa），說明有限 shots 下的子空間覆蓋率才是精度瓶頸
 
