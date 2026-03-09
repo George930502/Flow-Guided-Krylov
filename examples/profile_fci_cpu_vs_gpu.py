@@ -2,6 +2,9 @@
 """
 Profile CPU FCI vs GPU FCI across all molecular systems.
 
+Tests GPU FCI via compute_gpu_fci(geometry, basis) which builds fresh float64
+integrals from PySCF — the reliable GPU path (no float32 roundtrip issues).
+
 Finds the crossover point where GPU FCI becomes faster than CPU FCI,
 then verifies both give the same energy (within tolerance).
 
@@ -95,32 +98,52 @@ def cpu_fci_energy(H) -> tuple[float, float]:
     return energy, elapsed
 
 
-def gpu_fci_energy(H) -> tuple[float, float]:
-    """Compute FCI on GPU via CuPy CUDA kernels + PySCF Davidson. Returns (energy, time)."""
-    from utils.gpu_fci import compute_gpu_fci_from_integrals, GPU_FCI_AVAILABLE
+def gpu_fci_from_geometry(geometry, basis) -> tuple[float, float]:
+    """Compute FCI on GPU from geometry (fresh float64 integrals). Returns (energy, time)."""
+    from utils.gpu_fci import compute_gpu_fci, GPU_FCI_AVAILABLE
 
     if not GPU_FCI_AVAILABLE:
         raise RuntimeError("GPU FCI not available (CuPy not installed)")
 
-    h1e = H.h1e.cpu().numpy() if hasattr(H.h1e, 'cpu') else H.h1e
-    h2e = H.h2e.cpu().numpy() if hasattr(H.h2e, 'cpu') else H.h2e
-
     t0 = time.time()
-    energy = compute_gpu_fci_from_integrals(
-        h1e=h1e,
-        h2e=h2e,
-        n_orbitals=H.n_orbitals,
-        n_alpha=H.n_alpha,
-        n_beta=H.n_beta,
-        nuclear_repulsion=H.nuclear_repulsion,
-        conv_tol=1e-10,
-        max_cycle=300,
-    )
+    energy = compute_gpu_fci(geometry, basis, conv_tol=1e-10, max_cycle=300)
     elapsed = time.time() - t0
     return energy, elapsed
 
 
-def profile_system(name, H, n_qubits) -> FCIProfile:
+def _get_geometry(name, **kwargs):
+    """Get geometry + basis for a system (matches factory function params)."""
+    if name == "H2":
+        bl = kwargs.get("bond_length", 0.74)
+        return [("H", (0., 0., 0.)), ("H", (0., 0., bl))], "sto-3g"
+    elif name == "LiH":
+        bl = kwargs.get("bond_length", 1.6)
+        return [("Li", (0., 0., 0.)), ("H", (0., 0., bl))], "sto-3g"
+    elif name == "H2O":
+        oh, ang = 0.96, np.radians(104.5)
+        return [("O", (0., 0., 0.)), ("H", (oh, 0., 0.)),
+                ("H", (oh*np.cos(ang), oh*np.sin(ang), 0.))], "sto-3g"
+    elif name == "BeH2":
+        bl = 1.33
+        return [("Be", (0., 0., 0.)), ("H", (0., 0., bl)), ("H", (0., 0., -bl))], "sto-3g"
+    elif name == "NH3":
+        nh, ang = 1.01, np.radians(107.8)
+        h = nh * np.cos(np.arcsin(np.sin(ang/2) / np.sin(np.radians(60))))
+        r = np.sqrt(nh**2 - h**2)
+        return [("N", (0., 0., h)), ("H", (r, 0., 0.)),
+                ("H", (r*np.cos(np.radians(120)), r*np.sin(np.radians(120)), 0.)),
+                ("H", (r*np.cos(np.radians(240)), r*np.sin(np.radians(240)), 0.))], "sto-3g"
+    elif name == "CH4":
+        a = 1.09 / np.sqrt(3)
+        return [("C", (0., 0., 0.)), ("H", (a, a, a)), ("H", (a, -a, -a)),
+                ("H", (-a, a, -a)), ("H", (-a, -a, a))], "sto-3g"
+    elif name == "N2":
+        bl = kwargs.get("bond_length", 1.10)
+        return [("N", (0., 0., 0.)), ("N", (0., 0., bl))], "sto-3g"
+    return None, None
+
+
+def profile_system(name, H, n_qubits, geometry, basis) -> FCIProfile:
     """Profile CPU vs GPU FCI for a single system."""
     n_configs = comb(H.n_orbitals, H.n_alpha) * comb(H.n_orbitals, H.n_beta)
     print(f"\n{'='*60}")
@@ -136,19 +159,20 @@ def profile_system(name, H, n_qubits) -> FCIProfile:
     except Exception as e:
         print(f"FAILED: {e}")
 
-    # --- GPU FCI ---
+    # --- GPU FCI (from geometry — fresh float64 integrals) ---
     gpu_energy_val, gpu_time = None, None
-    try:
-        # Warmup run (JIT compilation of CUDA kernels on first call)
-        print(f"  GPU FCI warmup... ", end="", flush=True)
-        _, warmup_t = gpu_fci_energy(H)
-        print(f"{warmup_t:.3f}s")
+    if geometry is not None:
+        try:
+            # Warmup run (JIT compilation of CUDA kernels on first call)
+            print(f"  GPU FCI warmup... ", end="", flush=True)
+            _, warmup_t = gpu_fci_from_geometry(geometry, basis)
+            print(f"{warmup_t:.3f}s")
 
-        print(f"  GPU FCI (CuPy Davidson)... ", end="", flush=True)
-        gpu_energy_val, gpu_time = gpu_fci_energy(H)
-        print(f"{gpu_time:.3f}s  E = {gpu_energy_val:.8f} Ha")
-    except Exception as e:
-        print(f"FAILED: {e}")
+            print(f"  GPU FCI (geometry→Davidson)... ", end="", flush=True)
+            gpu_energy_val, gpu_time = gpu_fci_from_geometry(geometry, basis)
+            print(f"{gpu_time:.3f}s  E = {gpu_energy_val:.8f} Ha")
+        except Exception as e:
+            print(f"FAILED: {e}")
 
     # --- Compare ---
     energy_diff = None
@@ -173,7 +197,7 @@ def profile_system(name, H, n_qubits) -> FCIProfile:
 
 def main():
     print("=" * 60)
-    print("  FCI Profiling: CPU (matrix diag) vs GPU (CuPy Davidson)")
+    print("  FCI Profiling: CPU (matrix diag) vs GPU (geometry→Davidson)")
     print("=" * 60)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -191,40 +215,52 @@ def main():
         print(f"  GPU FCI available: False")
 
     # --- Systems ordered by size ---
+    # Each: (name, n_qubits, hamiltonian_factory, geometry, basis)
     systems = [
-        ("H2",   4,  lambda: create_h2_hamiltonian(device=device)),
-        ("LiH",  12, lambda: create_lih_hamiltonian(device=device)),
-        ("H2O",  14, lambda: create_h2o_hamiltonian(device=device)),
-        ("BeH2", 14, lambda: create_beh2_hamiltonian(device=device)),
-        ("NH3",  16, lambda: create_nh3_hamiltonian(device=device)),
-        ("N2",   20, lambda: create_n2_hamiltonian(device=device)),
-        ("CH4",  18, lambda: create_ch4_hamiltonian(device=device)),
+        ("H2",   4,  lambda: create_h2_hamiltonian(device=device),  *_get_geometry("H2")),
+        ("LiH",  12, lambda: create_lih_hamiltonian(device=device), *_get_geometry("LiH")),
+        ("H2O",  14, lambda: create_h2o_hamiltonian(device=device), *_get_geometry("H2O")),
+        ("BeH2", 14, lambda: create_beh2_hamiltonian(device=device), *_get_geometry("BeH2")),
+        ("NH3",  16, lambda: create_nh3_hamiltonian(device=device), *_get_geometry("NH3")),
+        ("CH4",  18, lambda: create_ch4_hamiltonian(device=device), *_get_geometry("CH4")),
+        ("N2",   20, lambda: create_n2_hamiltonian(device=device),  *_get_geometry("N2")),
     ]
 
-    # Add medium-tier systems (need mol_data factory)
-    medium_systems = [
-        ("CO",   20, lambda: create_co_molecule(device=device).hamiltonian),
-        ("HCN",  22, lambda: create_hcn_molecule(device=device).hamiltonian),
-        ("C2H2", 24, lambda: create_c2h2_molecule(device=device).hamiltonian),
+    # Medium-tier systems (geometry comes from MoleculeData)
+    medium_factories = [
+        ("CO",   20, lambda: create_co_molecule(device=device)),
+        ("HCN",  22, lambda: create_hcn_molecule(device=device)),
+        ("C2H2", 24, lambda: create_c2h2_molecule(device=device)),
     ]
 
     results = []
 
-    for name, n_qubits, factory in systems + medium_systems:
+    for name, n_qubits, factory, geometry, basis in systems:
         try:
             H = factory()
-            result = profile_system(name, H, n_qubits)
+            result = profile_system(name, H, n_qubits, geometry, basis)
             results.append(result)
         except Exception as e:
             print(f"\n  {name}: SKIPPED ({e})")
 
-        # Free GPU memory between systems
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    for name, n_qubits, mol_factory in medium_factories:
+        try:
+            mol_data = mol_factory()
+            H = mol_data.hamiltonian
+            result = profile_system(name, H, n_qubits, mol_data.geometry, mol_data.basis)
+            results.append(result)
+        except Exception as e:
+            print(f"\n  {name}: SKIPPED ({e})")
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     # --- Summary table ---
     print("\n\n" + "=" * 90)
-    print("  SUMMARY: CPU vs GPU FCI Profiling")
+    print("  SUMMARY: CPU (matrix diag) vs GPU (geometry→Davidson)")
     print("=" * 90)
     print(f"  {'System':<8} {'Qubits':>6} {'Configs':>10} "
           f"{'CPU (s)':>10} {'GPU (s)':>10} {'Speedup':>10} {'dE (mHa)':>10} {'Winner':>8}")

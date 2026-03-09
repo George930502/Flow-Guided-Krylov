@@ -62,6 +62,49 @@ TIER_SMALL = ["h2", "lih", "h2o", "beh2", "nh3", "ch4", "n2"]
 TIER_MEDIUM = ["co", "hcn", "c2h2"]
 TIER_LARGE = ["h2o_631g", "h2s", "c2h4", "nh3_631g"]
 
+def _small_geometry(name, **kwargs):
+    """Compute geometry for small-tier systems (same as factory functions use)."""
+    if name == "h2":
+        bl = kwargs.get("bond_length", 0.74)
+        return [("H", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, bl))], "sto-3g"
+    elif name == "lih":
+        bl = kwargs.get("bond_length", 1.6)
+        return [("Li", (0.0, 0.0, 0.0)), ("H", (0.0, 0.0, bl))], "sto-3g"
+    elif name == "h2o":
+        oh = 0.96
+        ang = np.radians(104.5)
+        return [("O", (0.0, 0.0, 0.0)),
+                ("H", (oh, 0.0, 0.0)),
+                ("H", (oh * np.cos(ang), oh * np.sin(ang), 0.0))], "sto-3g"
+    elif name == "beh2":
+        bl = 1.33
+        return [("Be", (0.0, 0.0, 0.0)),
+                ("H", (0.0, 0.0, bl)),
+                ("H", (0.0, 0.0, -bl))], "sto-3g"
+    elif name == "nh3":
+        nh = 1.01
+        ang = np.radians(107.8)
+        h = nh * np.cos(np.arcsin(np.sin(ang / 2) / np.sin(np.radians(60))))
+        r = np.sqrt(nh**2 - h**2)
+        return [("N", (0.0, 0.0, h)),
+                ("H", (r, 0.0, 0.0)),
+                ("H", (r * np.cos(np.radians(120)), r * np.sin(np.radians(120)), 0.0)),
+                ("H", (r * np.cos(np.radians(240)), r * np.sin(np.radians(240)), 0.0))], "sto-3g"
+    elif name == "ch4":
+        a = 1.09 / np.sqrt(3)
+        return [("C", (0.0, 0.0, 0.0)),
+                ("H", (a, a, a)), ("H", (a, -a, -a)),
+                ("H", (-a, a, -a)), ("H", (-a, -a, a))], "sto-3g"
+    elif name == "n2":
+        bl = kwargs.get("bond_length", 1.10)
+        return [("N", (0.0, 0.0, 0.0)), ("N", (0.0, 0.0, bl))], "sto-3g"
+    return None, None
+
+
+# GPU FCI threshold: profiling shows GPU faster at ≥14K configs (~18 qubits)
+# CPU is faster for <5K configs due to GPU overhead (kernel launch, data transfer)
+GPU_FCI_CONFIGS_THRESHOLD = 5000
+
 SYSTEMS = {
     # --- Small tier (4-20 qubits, factory functions in hamiltonians.molecular) ---
     "h2": {
@@ -362,57 +405,81 @@ def run_comparison(
     ref_type = "FCI"
     ref_energy = None
     ccsd_t_energy = None
+    geometry = None
+    basis = None
 
     if "factory" in info:
         # Small tier: direct factory
         H = info["factory"](**info["kwargs"])
+        geometry, basis = _small_geometry(system_key, **info["kwargs"])
     else:
         # Medium/Large tier: molecule data with CCSD(T) reference
         mol_data = _get_molecule_data(system_key)
         H = mol_data.hamiltonian
         ccsd_t_energy = mol_data.ccsd_t_energy
+        geometry = mol_data.geometry
+        basis = mol_data.basis
 
     n_qubits = H.num_sites
     n_orb = H.n_orbitals
     n_configs = comb(n_orb, H.n_alpha) * comb(n_orb, H.n_beta)
 
     # --- Reference energy hierarchy ---
-    if n_configs <= 100_000:
+    # Profiling: CPU faster for <5K configs, GPU faster for ≥5K.
+    # GPU FCI uses compute_gpu_fci(geometry, basis) which builds fresh float64
+    # integrals from PySCF — avoids the float32 precision loss in H.h2e.
+    #
+    # Tier 1: ≤5K configs → CPU matrix diag (fast, exact)
+    # Tier 2: >5K + GPU available + geometry → GPU FCI from geometry (5-8x faster)
+    # Tier 3: >5K + no GPU → CPU matrix diag (up to ~20K configs feasible)
+    # Tier 4: ≤15M configs + geometry → CPU PySCF Davidson
+    # Tier 5: CCSD(T) fallback (NOT variational)
+
+    if n_configs <= GPU_FCI_CONFIGS_THRESHOLD:
+        # Tier 1: CPU is faster for small systems
         try:
             ref_energy = H.fci_energy()
             ref_type = "FCI"
-            print(f"  FCI energy: {ref_energy:.8f} Ha")
+            print(f"  FCI energy (CPU): {ref_energy:.8f} Ha")
         except Exception as e:
-            print(f"  Matrix FCI failed: {e}")
+            print(f"  CPU FCI failed: {e}")
 
-    if ref_energy is None:
+    if ref_energy is None and geometry is not None:
+        # Tier 2: GPU FCI from geometry (fresh float64 integrals, no format issues)
         try:
-            from utils.gpu_fci import GPU4PYSCF_AVAILABLE, compute_gpu_fci
-            if GPU4PYSCF_AVAILABLE:
-                geometry = mol_data.geometry
-                basis = mol_data.basis
-                print(f"  Computing FCI via GPU4PySCF Davidson ({n_configs:,} configs)...")
+            from utils.gpu_fci import GPU_FCI_AVAILABLE, compute_gpu_fci
+            if GPU_FCI_AVAILABLE:
+                print(f"  Computing FCI via GPU Davidson ({n_configs:,} configs)...")
                 t0 = time.time()
                 ref_energy = compute_gpu_fci(geometry, basis)
                 ref_type = "FCI"
-                print(f"  GPU FCI energy: {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
+                print(f"  FCI energy (GPU): {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
         except Exception as e:
             print(f"  GPU FCI failed: {e}")
 
-    if ref_energy is None and n_configs <= 15_000_000:
+    if ref_energy is None and n_configs <= 100_000:
+        # Tier 3: CPU matrix diag for medium systems without GPU
+        try:
+            ref_energy = H.fci_energy()
+            ref_type = "FCI"
+            print(f"  FCI energy (CPU fallback): {ref_energy:.8f} Ha")
+        except Exception as e:
+            print(f"  CPU FCI failed: {e}")
+
+    if ref_energy is None and n_configs <= 15_000_000 and geometry is not None:
+        # Tier 4: CPU PySCF iterative Davidson
         try:
             from moderate_system_benchmark import compute_pyscf_fci
-            geometry = mol_data.geometry
-            basis = mol_data.basis
             print(f"  Computing FCI via PySCF CPU Davidson ({n_configs:,} configs)...")
             t0 = time.time()
             ref_energy = compute_pyscf_fci(geometry, basis)
             ref_type = "FCI"
-            print(f"  PySCF FCI energy: {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
+            print(f"  FCI energy (PySCF CPU): {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
         except Exception as e:
             print(f"  PySCF CPU FCI failed: {e}")
 
     if ref_energy is None:
+        # Tier 5: CCSD(T) fallback
         if ccsd_t_energy is not None:
             ref_energy = ccsd_t_energy
             ref_type = "CCSD(T)"
