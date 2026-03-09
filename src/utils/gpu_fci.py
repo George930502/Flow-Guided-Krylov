@@ -1,40 +1,220 @@
 """
-GPU-accelerated FCI via gpu4pyscf.
+GPU-accelerated FCI with embedded CUDA kernels.
 
-Wraps gpu4pyscf's CUDA-kernel-accelerated FCI solver (Davidson iteration
-with GPU contract_2e matvec) behind a clean interface. The key speedup
-comes from custom CUDA kernels (_build_t1, _gather) that tile the CI
-vector product in 32×32 blocks on GPU.
+Replaces PySCF's CPU contract_2e (the H×CI matvec bottleneck inside
+Davidson iteration) with custom CUDA kernels running via CuPy.
+No external gpu4pyscf package required — only CuPy + PySCF.
+
+The CUDA kernels (_build_t1, _gather) process determinant strings in
+32×32 tiles on GPU. The Davidson eigensolver loop stays in PySCF;
+only the matvec (which dominates compute) runs on GPU.
 
 Two entry points:
   - compute_gpu_fci(): from geometry + basis (builds mol/mf internally)
   - compute_gpu_fci_from_integrals(): from pre-computed MO integrals
 
-Falls back gracefully when gpu4pyscf or CuPy is not available.
+Falls back gracefully when CuPy is not available.
 
-Reference:
-    gpu4pyscf: https://github.com/pyscf/gpu4pyscf
+Based on gpu4pyscf (Apache 2.0 License):
+    https://github.com/pyscf/gpu4pyscf
 """
 
 import numpy as np
-from typing import Tuple, Optional
+from typing import Optional
 
-# Detect gpu4pyscf availability
-GPU4PYSCF_AVAILABLE = False
-_GPU4PYSCF_IMPORT_ERROR = None
+# ---------------------------------------------------------------------------
+# Availability detection
+# ---------------------------------------------------------------------------
+
+GPU_FCI_AVAILABLE = False
+_GPU_FCI_IMPORT_ERROR = None
 
 try:
     import cupy as cp
-    from pyscf import fci as pyscf_fci
-    from pyscf.fci import direct_spin1 as cpu_direct_spin1
-    # Try importing gpu4pyscf's FCI module
-    from gpu4pyscf.fci.direct_spin1 import FCI as GPU_FCI, contract_2e as gpu_contract_2e
-    GPU4PYSCF_AVAILABLE = True
-except ImportError as e:
-    _GPU4PYSCF_IMPORT_ERROR = str(e)
-except Exception as e:
-    _GPU4PYSCF_IMPORT_ERROR = str(e)
+    from pyscf.fci import direct_spin1 as _cpu_direct_spin1
 
+    # ---------------------------------------------------------------------------
+    # Embedded CUDA kernels for contract_2e (from gpu4pyscf/fci/direct_spin1.py)
+    # ---------------------------------------------------------------------------
+
+    _TILE = 32
+
+    _CUDA_CODE = r'''
+#define TILE 32
+extern "C" {
+__global__
+void _build_t1(double *ci0, double *t1,
+    long long strb0, long long na, long long nb, long long nnorb,
+    unsigned short *addra, unsigned short *addrb, char *signa, char *signb)
+{
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int stra0 = blockIdx.y * blockDim.y;
+    int strb = strb0 + tx;
+    int stra = stra0 + ty;
+
+    int nab = na * TILE;
+    int ab_id = stra * TILE + tx;
+    __shared__ unsigned short _addra[TILE*TILE];
+    __shared__ unsigned short _addrb[TILE*TILE];
+    __shared__ char _signa[TILE*TILE];
+    __shared__ char _signb[TILE*TILE];
+    int sign, str1, j0, j;
+    int dj = TILE;
+    double val;
+
+    for (j0 = 0; j0 < nnorb; j0+=TILE) {
+        _addra[ty*TILE+tx] = addra[(j0+ty)*na+stra0+tx];
+        _addrb[ty*TILE+tx] = addrb[(j0+ty)*nb+strb0+tx];
+        _signa[ty*TILE+tx] = signa[(j0+ty)*na+stra0+tx];
+        _signb[ty*TILE+tx] = signb[(j0+ty)*nb+strb0+tx];
+        if (j0 + TILE > nnorb) {
+            dj = nnorb - j0;
+        }
+        __syncthreads();
+        if (stra < na && strb < nb) {
+            for (j = 0; j < dj; j++) {
+                val = 0;
+                sign = _signa[j*TILE+ty];
+                str1 = _addra[j*TILE+ty];
+                if (sign != 0) {
+                    val = sign * ci0[str1*nb+strb];
+                }
+
+                sign = _signb[j*TILE+tx];
+                str1 = _addrb[j*TILE+tx];
+                if (sign != 0) {
+                    val += sign * ci0[stra*nb+str1];
+                }
+                t1[(j0+j)*nab + ab_id] = val;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__global__
+void _gather(double *out, double *t1,
+    long long strb0, long long na, long long nb, long long nnorb,
+    unsigned short *addra, unsigned short *addrb, char *signa, char *signb)
+{
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int stra0 = blockIdx.y * blockDim.y;
+    int strb = strb0 + tx;
+    int stra = stra0 + ty;
+    int nab = na * TILE;
+    int ab_id = stra * TILE + tx;
+    __shared__ unsigned short _addra[TILE*TILE];
+    __shared__ unsigned short _addrb[TILE*TILE];
+    __shared__ char _signa[TILE*TILE];
+    __shared__ char _signb[TILE*TILE];
+    int sign, str1, j0, j;
+    int dj = TILE;
+    double val = 0.;
+
+    for (j0 = 0; j0 < nnorb; j0+=TILE) {
+        _addra[ty*TILE+tx] = addra[(j0+ty)*na+stra0+tx];
+        _addrb[ty*TILE+tx] = addrb[(j0+ty)*nb+strb0+tx];
+        _signa[ty*TILE+tx] = signa[(j0+ty)*na+stra0+tx];
+        _signb[ty*TILE+tx] = signb[(j0+ty)*nb+strb0+tx];
+        if (j0 + TILE > nnorb) {
+            dj = nnorb - j0;
+        }
+        __syncthreads();
+        if (stra < na && strb < nb) {
+            for (j = 0; j < dj; j++) {
+                sign = _signa[j*TILE+ty];
+                str1 = _addra[j*TILE+ty];
+                if (sign != 0) {
+                    val += sign * t1[(j0+j)*nab + (str1*TILE+tx)];
+                }
+
+                sign = _signb[j*TILE+tx];
+                str1 = _addrb[j*TILE+tx];
+                if (sign != 0) {
+                    out[stra*nb+str1] += sign * t1[(j0+j)*nab + ab_id];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    out[stra*nb+strb] += val;
+}
+}'''
+
+    _cuda_module = cp.RawModule(code=_CUDA_CODE)
+    _kernel_build_t1 = _cuda_module.get_function('_build_t1')
+    _kernel_gather = _cuda_module.get_function('_gather')
+
+    def _link_index_to_addrs(link_index, nnorb):
+        """Convert PySCF link_index to GPU address/sign arrays."""
+        na = link_index.shape[0]
+        ia = link_index[:, :, 0].T
+        addr = np.zeros((nnorb, na), dtype=np.uint16)
+        sign = np.zeros((nnorb, na), dtype=np.int8)
+        idx = np.arange(na)
+        addr[ia, idx] = link_index[:, :, 2].T
+        sign[ia, idx] = link_index[:, :, 3].T
+        # Pad to avoid out-of-bounds in kernel
+        _addr = cp.empty((nnorb + _TILE - 1, na), dtype=np.uint16)[:nnorb]
+        _sign = cp.empty((nnorb + _TILE - 1, na), dtype=np.int8)[:nnorb]
+        _addr.set(addr)
+        _sign.set(sign)
+        return _addr, _sign
+
+    def _gpu_contract_2e(eri, ci0, norb, nelec, link_index):
+        """GPU-accelerated H×CI vector product using CUDA kernels."""
+        ci0 = cp.asarray(ci0)
+        original_shape = ci0.shape
+        link_indexa, link_indexb = link_index
+        na, nb = link_indexa.shape[0], link_indexb.shape[0]
+        ci0 = ci0.reshape(na, nb)
+        out = cp.zeros((na, nb), dtype=ci0.dtype)
+        nnorb = norb * (norb + 1) // 2
+        assert eri.shape == (nnorb, nnorb), (
+            f"ERI shape {eri.shape} != expected ({nnorb}, {nnorb})"
+        )
+        eri = cp.asarray(eri)
+
+        addra, signa = _link_index_to_addrs(link_indexa, nnorb)
+        if link_indexa is link_indexb:
+            addrb, signb = addra, signa
+        else:
+            addrb, signb = _link_index_to_addrs(link_indexb, nnorb)
+
+        threads = (_TILE, _TILE)
+        blocks = (1, (na + _TILE - 1) // _TILE)
+        rest_args = (na, nb, nnorb, addra, addrb, signa, signb)
+        t1 = cp.empty((nnorb, na * _TILE))
+        gt1 = cp.empty((nnorb, na * _TILE))
+
+        for strb0 in range(0, nb, _TILE):
+            _kernel_build_t1(blocks, threads, (ci0, t1, strb0) + rest_args)
+            eri.dot(t1, out=gt1)
+            _kernel_gather(blocks, threads, (out, gt1, strb0) + rest_args)
+
+        return out.reshape(original_shape).get()
+
+    class GPUFCISolver(_cpu_direct_spin1.FCI):
+        """FCI solver with GPU-accelerated contract_2e."""
+        contract_2e = staticmethod(_gpu_contract_2e)
+
+    GPU_FCI_AVAILABLE = True
+
+except ImportError as e:
+    _GPU_FCI_IMPORT_ERROR = str(e)
+except Exception as e:
+    _GPU_FCI_IMPORT_ERROR = str(e)
+
+
+# Keep backward-compatible alias
+GPU4PYSCF_AVAILABLE = GPU_FCI_AVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def compute_gpu_fci(
     geometry: list,
@@ -46,11 +226,10 @@ def compute_gpu_fci(
     max_cycle: int = 300,
 ) -> float:
     """
-    Compute FCI energy on GPU using gpu4pyscf's Davidson solver.
+    Compute FCI energy on GPU using CUDA-accelerated Davidson solver.
 
     Builds mol/mf from scratch, transforms integrals to MO basis,
-    then runs GPU-accelerated Davidson iteration where the H×CI
-    matvec uses CUDA kernels.
+    then runs Davidson iteration with GPU contract_2e matvec.
 
     Args:
         geometry: List of (atom, (x, y, z)) tuples
@@ -65,12 +244,12 @@ def compute_gpu_fci(
         FCI ground state energy in Hartree
 
     Raises:
-        RuntimeError: If gpu4pyscf is not available
+        RuntimeError: If CuPy or PySCF is not available
     """
-    if not GPU4PYSCF_AVAILABLE:
+    if not GPU_FCI_AVAILABLE:
         raise RuntimeError(
-            f"gpu4pyscf not available: {_GPU4PYSCF_IMPORT_ERROR}. "
-            "Install with: pip install gpu4pyscf"
+            f"GPU FCI not available: {_GPU_FCI_IMPORT_ERROR}. "
+            "Requires: cupy + pyscf"
         )
 
     from pyscf import gto, scf, ao2mo
@@ -89,15 +268,12 @@ def compute_gpu_fci(
         mf = scf.ROHF(mol)
     mf.kernel()
 
-    # Transform integrals to MO basis
     h1e = mf.mo_coeff.T @ mf.get_hcore() @ mf.mo_coeff
-    # ao2mo.kernel returns compressed 4-fold symmetric form by default
     eri = ao2mo.kernel(mol, mf.mo_coeff)
     norb = mf.mo_coeff.shape[1]
     nelec = mol.nelec
 
-    # Create GPU FCI solver
-    cisolver = GPU_FCI(mol)
+    cisolver = GPUFCISolver(mol)
     cisolver.max_memory = max_memory
     cisolver.conv_tol = conv_tol
     cisolver.max_cycle = max_cycle
@@ -122,9 +298,6 @@ def compute_gpu_fci_from_integrals(
     """
     Compute FCI energy on GPU from pre-computed MO integrals.
 
-    Takes the same integrals stored in MolecularIntegrals and runs
-    gpu4pyscf's GPU Davidson solver.
-
     Args:
         h1e: One-electron integrals in MO basis (n_orb, n_orb)
         h2e: Two-electron integrals (n_orb, n_orb, n_orb, n_orb) or compressed
@@ -140,12 +313,12 @@ def compute_gpu_fci_from_integrals(
         FCI ground state energy (including nuclear repulsion) in Hartree
 
     Raises:
-        RuntimeError: If gpu4pyscf is not available
+        RuntimeError: If CuPy or PySCF is not available
     """
-    if not GPU4PYSCF_AVAILABLE:
+    if not GPU_FCI_AVAILABLE:
         raise RuntimeError(
-            f"gpu4pyscf not available: {_GPU4PYSCF_IMPORT_ERROR}. "
-            "Install with: pip install gpu4pyscf"
+            f"GPU FCI not available: {_GPU_FCI_IMPORT_ERROR}. "
+            "Requires: cupy + pyscf"
         )
 
     from pyscf import ao2mo
@@ -156,25 +329,19 @@ def compute_gpu_fci_from_integrals(
     norb = n_orbitals
     nelec = (n_alpha, n_beta)
 
-    # Convert h2e to compressed 4-fold symmetric form if needed
-    # gpu4pyscf's contract_2e expects (nnorb, nnorb) where nnorb = norb*(norb+1)//2
+    # Convert h2e to compressed 4-fold symmetric form
+    # GPU contract_2e expects (nnorb, nnorb) where nnorb = norb*(norb+1)//2
     nnorb = norb * (norb + 1) // 2
     if h2e_np.ndim == 4:
-        # Full 4-index tensor -> compressed
         eri = ao2mo.restore(4, h2e_np.reshape(norb**2, norb**2), norb)
     elif h2e_np.ndim == 2 and h2e_np.shape == (nnorb, nnorb):
-        # Already compressed
         eri = h2e_np
     elif h2e_np.ndim == 2 and h2e_np.shape[0] == norb**2:
-        # norb^2 x norb^2 -> compressed
         eri = ao2mo.restore(4, h2e_np, norb)
     else:
-        # Try ao2mo.restore as-is
         eri = ao2mo.restore(4, h2e_np, norb)
 
-    # Create GPU FCI solver without mol object
-    # We need to construct a minimal solver manually
-    cisolver = GPU_FCI(mol=None)
+    cisolver = GPUFCISolver(mol=None)
     cisolver.max_memory = max_memory
     cisolver.conv_tol = conv_tol
     cisolver.max_cycle = max_cycle
