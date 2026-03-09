@@ -386,45 +386,21 @@ def run_benchmark(
     E_exact = mol_data.hf_energy
     energy_type = "HF"
 
-    # Tier 1: ≤5K configs → CPU matrix diag (fast, no overhead)
-    # Tier 2: >5K + GPU → GPU FCI from geometry (5-8x faster, fresh float64 integrals)
-    # Tier 3: ≤100K → CPU matrix diag fallback
-    # Tier 4: ≤15M → CPU PySCF Davidson
-    # Tier 5: CCSD(T)
-    gpu_fci_threshold = 5000
+    # Reference energy hierarchy:
+    # Tier 1: ≤5K configs → CPU matrix diag (fast)
+    # Tier 2: ≤15M → PySCF CPU Davidson (gold standard, correct for all sizes)
+    # Tier 3: CCSD(T) fallback (NOT variational)
+    # Note: GPU FCI CUDA kernels disabled — profiling showed wrong energies for
+    # several systems (H2O 2.6 Ha off, N2 15 mHa). PySCF CPU is the gold standard.
 
-    if n_valid <= gpu_fci_threshold:
+    if n_valid <= 5000:
         print("Computing FCI energy (CPU matrix diag)...")
         try:
             E_exact = H.fci_energy()
             energy_type = "FCI"
             print(f"  FCI Energy: {E_exact:.8f} Ha")
         except Exception as e:
-            print(f"  CPU FCI failed: {e}")
-
-    if energy_type != "FCI":
-        try:
-            from utils.gpu_fci import GPU_FCI_AVAILABLE, compute_gpu_fci
-            if GPU_FCI_AVAILABLE:
-                print(f"Computing FCI energy (GPU Davidson, {n_valid:,} determinants)...")
-                t0 = time.time()
-                E_fci = compute_gpu_fci(mol_data.geometry, mol_data.basis)
-                elapsed = time.time() - t0
-                E_exact = E_fci
-                energy_type = "FCI"
-                mol_data.fci_energy = E_fci
-                print(f"  GPU FCI Energy: {E_exact:.8f} Ha (computed in {elapsed:.1f}s)")
-        except Exception as e:
-            print(f"  GPU FCI failed: {e}")
-
-    if energy_type != "FCI" and n_valid <= 100_000:
-        print("Computing FCI energy (CPU matrix diag fallback)...")
-        try:
-            E_exact = H.fci_energy()
-            energy_type = "FCI"
-            print(f"  FCI Energy: {E_exact:.8f} Ha")
-        except Exception as e:
-            print(f"  CPU FCI fallback failed: {e}")
+            print(f"  CPU matrix FCI failed: {e}")
 
     if energy_type != "FCI" and n_valid <= 15_000_000:
         print(f"Computing FCI energy (PySCF CPU Davidson, {n_valid:,} determinants)...")

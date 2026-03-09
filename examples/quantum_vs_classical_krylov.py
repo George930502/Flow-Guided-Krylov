@@ -101,10 +101,6 @@ def _small_geometry(name, **kwargs):
     return None, None
 
 
-# GPU FCI threshold: profiling shows GPU faster at ≥14K configs (~18 qubits)
-# CPU is faster for <5K configs due to GPU overhead (kernel launch, data transfer)
-GPU_FCI_CONFIGS_THRESHOLD = 5000
-
 SYSTEMS = {
     # --- Small tier (4-20 qubits, factory functions in hamiltonians.molecular) ---
     "h2": {
@@ -425,61 +421,37 @@ def run_comparison(
     n_configs = comb(n_orb, H.n_alpha) * comb(n_orb, H.n_beta)
 
     # --- Reference energy hierarchy ---
-    # Profiling: CPU faster for <5K configs, GPU faster for ≥5K.
-    # GPU FCI uses compute_gpu_fci(geometry, basis) which builds fresh float64
-    # integrals from PySCF — avoids the float32 precision loss in H.h2e.
+    # Profiling showed GPU FCI CUDA kernels have bugs (H2O 2.6 Ha off, N2 15 mHa).
+    # PySCF's CPU FCI (iterative Davidson) is the gold standard — correct for all
+    # systems, handles up to ~15M configs. Use it as the primary path.
     #
-    # Tier 1: ≤5K configs → CPU matrix diag (fast, exact)
-    # Tier 2: >5K + GPU available + geometry → GPU FCI from geometry (5-8x faster)
-    # Tier 3: >5K + no GPU → CPU matrix diag (up to ~20K configs feasible)
-    # Tier 4: ≤15M configs + geometry → CPU PySCF Davidson
-    # Tier 5: CCSD(T) fallback (NOT variational)
+    # Tier 1: ≤5K configs → H.fci_energy() CPU matrix diag (fast, correct)
+    # Tier 2: ≤15M + geometry → PySCF CPU Davidson (correct, handles large systems)
+    # Tier 3: CCSD(T) fallback (NOT variational)
 
-    if n_configs <= GPU_FCI_CONFIGS_THRESHOLD:
-        # Tier 1: CPU is faster for small systems
+    if n_configs <= 5000:
+        # Tier 1: CPU matrix diag — fast for small systems
         try:
             ref_energy = H.fci_energy()
             ref_type = "FCI"
-            print(f"  FCI energy (CPU): {ref_energy:.8f} Ha")
+            print(f"  FCI energy: {ref_energy:.8f} Ha")
         except Exception as e:
-            print(f"  CPU FCI failed: {e}")
+            print(f"  CPU matrix FCI failed: {e}")
 
-    if ref_energy is None and geometry is not None:
-        # Tier 2: GPU FCI from geometry (fresh float64 integrals, no format issues)
-        try:
-            from utils.gpu_fci import GPU_FCI_AVAILABLE, compute_gpu_fci
-            if GPU_FCI_AVAILABLE:
-                print(f"  Computing FCI via GPU Davidson ({n_configs:,} configs)...")
-                t0 = time.time()
-                ref_energy = compute_gpu_fci(geometry, basis)
-                ref_type = "FCI"
-                print(f"  FCI energy (GPU): {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
-        except Exception as e:
-            print(f"  GPU FCI failed: {e}")
-
-    if ref_energy is None and n_configs <= 100_000:
-        # Tier 3: CPU matrix diag for medium systems without GPU
-        try:
-            ref_energy = H.fci_energy()
-            ref_type = "FCI"
-            print(f"  FCI energy (CPU fallback): {ref_energy:.8f} Ha")
-        except Exception as e:
-            print(f"  CPU FCI failed: {e}")
-
-    if ref_energy is None and n_configs <= 15_000_000 and geometry is not None:
-        # Tier 4: CPU PySCF iterative Davidson
+    if ref_energy is None and geometry is not None and n_configs <= 15_000_000:
+        # Tier 2: PySCF CPU iterative Davidson — gold standard for large FCI
         try:
             from moderate_system_benchmark import compute_pyscf_fci
-            print(f"  Computing FCI via PySCF CPU Davidson ({n_configs:,} configs)...")
+            print(f"  Computing FCI via PySCF Davidson ({n_configs:,} configs)...")
             t0 = time.time()
             ref_energy = compute_pyscf_fci(geometry, basis)
             ref_type = "FCI"
-            print(f"  FCI energy (PySCF CPU): {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
+            print(f"  FCI energy: {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
         except Exception as e:
-            print(f"  PySCF CPU FCI failed: {e}")
+            print(f"  PySCF FCI failed: {e}")
 
     if ref_energy is None:
-        # Tier 5: CCSD(T) fallback
+        # Tier 3: CCSD(T) fallback
         if ccsd_t_energy is not None:
             ref_energy = ccsd_t_energy
             ref_type = "CCSD(T)"
