@@ -13,15 +13,19 @@ Paper-compliant parameters (Yu et al., arXiv:2501.09702):
 - Cumulative basis across all Krylov states
 - Standard eigenvalue problem (S=I, computational basis is orthonormal)
 
+Supports systems from 4 to 30 qubits. Uses FCI for small/medium systems,
+CCSD(T) for large systems where FCI is infeasible.
+
 Reference:
     NVIDIA CUDA-Q SKQD tutorial:
     nvidia.github.io/cuda-quantum/latest/applications/python/skqd.html
 
 Usage:
     python examples/quantum_vs_classical_krylov.py --systems h2 lih
-    python examples/quantum_vs_classical_krylov.py --systems h2 lih h2o beh2
-    python examples/quantum_vs_classical_krylov.py --paths C A          # skip Path B
-    python examples/quantum_vs_classical_krylov.py --paths A --systems ch4 n2  # Path A only
+    python examples/quantum_vs_classical_krylov.py --tier small
+    python examples/quantum_vs_classical_krylov.py --tier medium --paths C B --profile
+    python examples/quantum_vs_classical_krylov.py --tier all --paths C B --profile
+    python examples/quantum_vs_classical_krylov.py --paths B --systems h2o_631g --profile
     docker-compose run --rm flow-krylov-gpu python examples/quantum_vs_classical_krylov.py
 """
 
@@ -29,8 +33,9 @@ import sys
 import time
 import argparse
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Set
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List, Set, Tuple
+from math import comb
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -52,7 +57,13 @@ from krylov.quantum_skqd import QuantumCircuitSKQD, QuantumSKQDConfig, CUDAQ_AVA
 # System registry
 # ---------------------------------------------------------------------------
 
+# Tier definitions
+TIER_SMALL = ["h2", "lih", "h2o", "beh2", "nh3", "ch4", "n2"]
+TIER_MEDIUM = ["co", "hcn", "c2h2"]
+TIER_LARGE = ["h2o_631g", "h2s", "c2h4", "nh3_631g"]
+
 SYSTEMS = {
+    # --- Small tier (4-20 qubits, factory functions in hamiltonians.molecular) ---
     "h2": {
         "name": "H2",
         "factory": create_h2_hamiltonian,
@@ -88,7 +99,47 @@ SYSTEMS = {
         "factory": create_n2_hamiltonian,
         "kwargs": {"bond_length": 1.10},
     },
+    # --- Medium tier (20-24 qubits, factory via moderate_system_benchmark) ---
+    "co": {
+        "name": "CO",
+        "molecule_factory": "create_co_molecule",
+    },
+    "hcn": {
+        "name": "HCN",
+        "molecule_factory": "create_hcn_molecule",
+    },
+    "c2h2": {
+        "name": "C2H2",
+        "molecule_factory": "create_c2h2_molecule",
+    },
+    # --- Large tier (26-30 qubits) ---
+    "h2o_631g": {
+        "name": "H2O(6-31G)",
+        "molecule_factory": "create_h2o_631g_molecule",
+    },
+    "h2s": {
+        "name": "H2S",
+        "molecule_factory": "create_h2s_molecule",
+    },
+    "c2h4": {
+        "name": "C2H4",
+        "molecule_factory": "create_c2h4_molecule",
+    },
+    "nh3_631g": {
+        "name": "NH3(6-31G)",
+        "molecule_factory": "create_nh3_631g_molecule",
+    },
 }
+
+
+@dataclass
+class ProfileData:
+    """Per-path profiling data."""
+    jw_time_s: float = 0.0
+    dt_time_s: float = 0.0
+    sampling_time_s: float = 0.0
+    energy_time_s: float = 0.0
+    peak_vram_mb: float = 0.0
 
 
 @dataclass
@@ -98,28 +149,35 @@ class ComparisonResult:
     n_qubits: int
     n_configs: int
     n_pauli_terms: int
-    fci_energy: float
+    ref_energy: float
+    ref_type: str  # "FCI" or "CCSD(T)"
     spectral_range: float
     optimal_dt: float
     # Direct diag baseline
     direct_energy: float
     direct_error_mha: float
     # Path C: Classical SKQD (exact time evolution)
-    classical_energy: Optional[float]
-    classical_error_mha: Optional[float]
-    classical_time_s: Optional[float]
-    classical_basis_size: Optional[int]
+    classical_energy: Optional[float] = None
+    classical_error_mha: Optional[float] = None
+    classical_time_s: Optional[float] = None
+    classical_basis_size: Optional[int] = None
+    classical_skip_reason: Optional[str] = None
     # Path B: Classical Trotterized (state-vector, second-order)
-    pathB_energy: Optional[float]
-    pathB_error_mha: Optional[float]
-    pathB_time_s: Optional[float]
-    pathB_basis_size: Optional[int]
+    pathB_energy: Optional[float] = None
+    pathB_error_mha: Optional[float] = None
+    pathB_time_s: Optional[float] = None
+    pathB_basis_size: Optional[int] = None
+    pathB_skip_reason: Optional[str] = None
     # Path A: CUDA-Q circuit (if available, second-order)
-    pathA_energy: Optional[float]
-    pathA_error_mha: Optional[float]
-    pathA_time_s: Optional[float]
-    pathA_basis_size: Optional[int]
-    pathA_available: bool
+    pathA_energy: Optional[float] = None
+    pathA_error_mha: Optional[float] = None
+    pathA_time_s: Optional[float] = None
+    pathA_basis_size: Optional[int] = None
+    pathA_available: bool = False
+    # Profiling
+    profile_C: Optional[ProfileData] = None
+    profile_B: Optional[ProfileData] = None
+    profile_A: Optional[ProfileData] = None
 
 
 def _generate_essential_configs(hamiltonian) -> torch.Tensor:
@@ -174,6 +232,83 @@ def _generate_essential_configs(hamiltonian) -> torch.Tensor:
 from krylov.spectral_utils import compute_optimal_dt as _compute_optimal_dt
 
 
+def _estimate_vram_bytes(n_qubits: int, path: str) -> int:
+    """Estimate VRAM requirement for a given path and qubit count."""
+    dim = 2 ** n_qubits
+    state_bytes = dim * 16  # complex128
+    if path == "B":
+        # 2 working states + 1 cached + arange cache
+        return state_bytes * 3 + dim * 8
+    elif path == "C":
+        # Low-memory Lanczos: 3 vectors + 1 cached + 2 working
+        return state_bytes * 6
+    elif path == "A":
+        # CUDA-Q manages its own memory; estimate similar to B
+        return state_bytes * 3
+    return state_bytes * 4
+
+
+def _get_free_vram() -> Optional[int]:
+    """Get free VRAM in bytes, or None if no GPU."""
+    if torch.cuda.is_available():
+        return torch.cuda.mem_get_info()[0]
+    return None
+
+
+def _check_vram_feasibility(
+    n_qubits: int, path: str, max_vram_gb: Optional[float] = None
+) -> Optional[str]:
+    """Check if a path is feasible given VRAM. Returns skip reason or None."""
+    estimate = _estimate_vram_bytes(n_qubits, path)
+
+    if max_vram_gb is not None:
+        limit = int(max_vram_gb * 1024**3)
+        if estimate > limit * 0.8:
+            return (f"estimated {estimate / 1024**3:.1f} GB > "
+                    f"80% of --max-vram {max_vram_gb:.1f} GB")
+
+    free = _get_free_vram()
+    if free is not None and estimate > free * 0.8:
+        return (f"estimated {estimate / 1024**3:.1f} GB > "
+                f"80% of free VRAM {free / 1024**3:.1f} GB")
+
+    return None
+
+
+def _get_molecule_data(system_key: str):
+    """
+    Load a molecule for medium/large tier systems.
+
+    Returns (MoleculeData, is_molecule_data) where is_molecule_data=True
+    means it has .hamiltonian, .ccsd_t_energy, etc.
+    """
+    # Lazy import to avoid requiring pyscf for small-tier systems
+    from moderate_system_benchmark import (
+        create_co_molecule,
+        create_hcn_molecule,
+        create_c2h2_molecule,
+        create_h2o_631g_molecule,
+        create_h2s_molecule,
+        create_c2h4_molecule,
+        create_nh3_631g_molecule,
+        compute_pyscf_fci,
+    )
+
+    factory_map = {
+        "create_co_molecule": create_co_molecule,
+        "create_hcn_molecule": create_hcn_molecule,
+        "create_c2h2_molecule": create_c2h2_molecule,
+        "create_h2o_631g_molecule": create_h2o_631g_molecule,
+        "create_h2s_molecule": create_h2s_molecule,
+        "create_c2h4_molecule": create_c2h4_molecule,
+        "create_nh3_631g_molecule": create_nh3_631g_molecule,
+    }
+
+    factory_name = SYSTEMS[system_key]["molecule_factory"]
+    mol_data = factory_map[factory_name]()
+    return mol_data
+
+
 def _run_quantum_skqd(
     hamiltonian,
     max_krylov_dim: int,
@@ -184,15 +319,7 @@ def _run_quantum_skqd(
     backend: str,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Run quantum-circuit SKQD with specified backend.
-
-    Args:
-        krylov_dt: Evolution time per Krylov step (= total_evolution_time)
-        num_trotter_steps: Number of Trotter sub-steps per Krylov step
-        trotter_order: 1 or 2 (Suzuki-Trotter order)
-        backend: "cudaq" for Path A, "classical" for Path B
-    """
+    """Run quantum-circuit SKQD with specified backend."""
     config = QuantumSKQDConfig(
         max_krylov_dim=max_krylov_dim,
         total_evolution_time=krylov_dt,
@@ -216,6 +343,8 @@ def run_comparison(
     trotter_order: int = 2,
     verbose: bool = True,
     enabled_paths: Optional[Set[str]] = None,
+    profile: bool = False,
+    max_vram_gb: Optional[float] = None,
 ) -> ComparisonResult:
     """Run comparison for selected paths: C, B, A (default: all)."""
     paths = enabled_paths or {"C", "B", "A"}
@@ -229,20 +358,65 @@ def run_comparison(
     print(f"  {name}: SKQD Comparison — Path {enabled_label} (Paper-Compliant)")
     print(f"{'=' * 70}")
 
-    H = info["factory"](**info["kwargs"])
+    # --- Create Hamiltonian ---
+    ref_type = "FCI"
+    ref_energy = None
+    ccsd_t_energy = None
+
+    if "factory" in info:
+        # Small tier: direct factory
+        H = info["factory"](**info["kwargs"])
+    else:
+        # Medium/Large tier: molecule data with CCSD(T) reference
+        mol_data = _get_molecule_data(system_key)
+        H = mol_data.hamiltonian
+        ccsd_t_energy = mol_data.ccsd_t_energy
+
     n_qubits = H.num_sites
     n_orb = H.n_orbitals
-    from math import comb
     n_configs = comb(n_orb, H.n_alpha) * comb(n_orb, H.n_beta)
-    fci_energy = H.fci_energy()
+
+    # --- Reference energy hierarchy ---
+    if n_configs <= 100_000:
+        try:
+            ref_energy = H.fci_energy()
+            ref_type = "FCI"
+            print(f"  FCI energy: {ref_energy:.8f} Ha")
+        except Exception as e:
+            print(f"  Matrix FCI failed: {e}")
+
+    if ref_energy is None and n_configs <= 15_000_000:
+        try:
+            from moderate_system_benchmark import compute_pyscf_fci
+            geometry = mol_data.geometry
+            basis = mol_data.basis
+            print(f"  Computing FCI via PySCF Davidson ({n_configs:,} configs)...")
+            t0 = time.time()
+            ref_energy = compute_pyscf_fci(geometry, basis)
+            ref_type = "FCI"
+            print(f"  PySCF FCI energy: {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
+        except Exception as e:
+            print(f"  PySCF FCI failed: {e}")
+
+    if ref_energy is None:
+        if ccsd_t_energy is not None:
+            ref_energy = ccsd_t_energy
+            ref_type = "CCSD(T)"
+            print(f"  CCSD(T) energy: {ref_energy:.8f} Ha (NOT a variational bound)")
+        else:
+            raise RuntimeError(f"No reference energy available for {name}")
 
     print(f"  Qubits: {n_qubits}, Orbitals: {n_orb}, Configs: {n_configs:,}")
-    print(f"  FCI energy: {fci_energy:.8f} Ha")
+    print(f"  Reference: {ref_type} = {ref_energy:.8f} Ha")
 
     # Compute optimal time step from spectral range (paper Theorem 3.1)
+    t_dt0 = time.time()
     optimal_dt, spectral_range = _compute_optimal_dt(H)
+    dt_time = time.time() - t_dt0
     print(f"  Spectral range: {spectral_range:.4f} Ha")
     print(f"  Optimal dt (pi/dE): {optimal_dt:.6f}")
+    if profile:
+        print(f"  compute_optimal_dt time: {dt_time:.1f}s")
     print(f"  Trotter order: {trotter_order}, Trotter steps: {num_trotter_steps}")
 
     # Direct diag baseline
@@ -252,11 +426,21 @@ def run_comparison(
     H_np = H_proj.detach().cpu().numpy().real
     H_np = 0.5 * (H_np + H_np.T)
     direct_energy = float(np.linalg.eigh(H_np)[0][0])
-    direct_error = abs(direct_energy - fci_energy) * 1000
+    direct_error = abs(direct_energy - ref_energy) * 1000
     print(f"  Direct diag (no Krylov): {direct_energy:.8f} Ha, error: {direct_error:.4f} mHa")
 
     n_pauli_terms = 0
     step_idx = 0
+
+    # Helper for profiling
+    def _reset_vram_stats():
+        if profile and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def _get_peak_vram_mb():
+        if profile and torch.cuda.is_available():
+            return torch.cuda.max_memory_allocated() / (1024**2)
+        return 0.0
 
     # ------------------------------------------------------------------
     # 1. Path C: Exact evolution (Lanczos, same 2^n space as Path A/B)
@@ -265,65 +449,100 @@ def run_comparison(
     classical_error = None
     classical_time = None
     classical_basis_size = None
+    classical_skip_reason = None
+    prof_C = ProfileData(dt_time_s=dt_time) if profile else None
 
     if "C" in paths:
-        step_idx += 1
-        print(f"\n{'─' * 60}")
-        print(f"  [{step_idx}/{n_enabled}] Path C: Exact Lanczos "
-              f"(no Trotter, dt={optimal_dt:.6f})")
-        print(f"{'─' * 60}")
+        skip = _check_vram_feasibility(n_qubits, "C", max_vram_gb)
+        if skip:
+            classical_skip_reason = skip
+            step_idx += 1
+            print(f"\n{'─' * 60}")
+            print(f"  [{step_idx}/{n_enabled}] Path C: SKIPPED ({skip})")
+            print(f"{'─' * 60}")
+        else:
+            step_idx += 1
+            print(f"\n{'─' * 60}")
+            print(f"  [{step_idx}/{n_enabled}] Path C: Exact Lanczos "
+                  f"(no Trotter, dt={optimal_dt:.6f})")
+            print(f"{'─' * 60}")
 
-        t0 = time.time()
-        pathC_results = _run_quantum_skqd(
-            H, max_krylov_dim, optimal_dt, num_trotter_steps, trotter_order,
-            quantum_shots, backend="exact", verbose=verbose,
-        )
-        classical_time = time.time() - t0
-        classical_energy = pathC_results["best_energy"]
-        classical_error = abs(classical_energy - fci_energy) * 1000
-        classical_basis_size = (
-            pathC_results["basis_sizes"][-1] if pathC_results["basis_sizes"] else 0
-        )
-        if n_pauli_terms == 0:
-            n_pauli_terms = pathC_results["n_pauli_terms"]
+            _reset_vram_stats()
+            t0 = time.time()
+            pathC_results = _run_quantum_skqd(
+                H, max_krylov_dim, optimal_dt, num_trotter_steps, trotter_order,
+                quantum_shots, backend="exact", verbose=verbose,
+            )
+            classical_time = time.time() - t0
+            classical_energy = pathC_results["best_energy"]
+            classical_error = abs(classical_energy - ref_energy) * 1000
+            classical_basis_size = (
+                pathC_results["basis_sizes"][-1] if pathC_results["basis_sizes"] else 0
+            )
+            if n_pauli_terms == 0:
+                n_pauli_terms = pathC_results["n_pauli_terms"]
 
-        print(f"  Energy: {classical_energy:.8f} Ha")
-        print(f"  Error:  {classical_error:.4f} mHa | Time: {classical_time:.1f}s | "
-              f"Basis: {classical_basis_size}")
+            if prof_C:
+                prof_C.peak_vram_mb = _get_peak_vram_mb()
+                prof_C.sampling_time_s = classical_time
+
+            print(f"  Energy: {classical_energy:.8f} Ha")
+            err_label = "Error" if ref_type == "FCI" else f"vs {ref_type}"
+            print(f"  {err_label}: {classical_error:.4f} mHa | "
+                  f"Time: {classical_time:.1f}s | Basis: {classical_basis_size}")
+            if prof_C:
+                print(f"  Peak VRAM: {prof_C.peak_vram_mb:.0f} MB")
 
     # ------------------------------------------------------------------
     # 2. Path B: Classical Trotterized (state-vector, GPU, 2nd-order)
-    #    Now uses lightweight masks for large systems (no phase_table OOM)
     # ------------------------------------------------------------------
-    full_dim = 2 ** n_qubits
     pathB_energy = None
     pathB_error = None
     pathB_time = None
     pathB_basis_size = None
+    pathB_skip_reason = None
+    prof_B = ProfileData(dt_time_s=dt_time) if profile else None
 
     if "B" in paths:
-        step_idx += 1
-        print(f"\n{'─' * 60}")
-        print(f"  [{step_idx}/{n_enabled}] Path B: Trotterized State-Vector "
-              f"(order={trotter_order}, dt={optimal_dt:.6f})")
-        print(f"{'─' * 60}")
+        skip = _check_vram_feasibility(n_qubits, "B", max_vram_gb)
+        if skip:
+            pathB_skip_reason = skip
+            step_idx += 1
+            print(f"\n{'─' * 60}")
+            print(f"  [{step_idx}/{n_enabled}] Path B: SKIPPED ({skip})")
+            print(f"{'─' * 60}")
+        else:
+            step_idx += 1
+            print(f"\n{'─' * 60}")
+            print(f"  [{step_idx}/{n_enabled}] Path B: Trotterized State-Vector "
+                  f"(order={trotter_order}, dt={optimal_dt:.6f})")
+            print(f"{'─' * 60}")
 
-        t0 = time.time()
-        pathB_results = _run_quantum_skqd(
-            H, max_krylov_dim, optimal_dt, num_trotter_steps, trotter_order,
-            quantum_shots, backend="classical", verbose=verbose,
-        )
-        pathB_time = time.time() - t0
-        pathB_energy = pathB_results["best_energy"]
-        pathB_error = abs(pathB_energy - fci_energy) * 1000
-        pathB_basis_size = (
-            pathB_results["basis_sizes"][-1] if pathB_results["basis_sizes"] else 0
-        )
-        n_pauli_terms = pathB_results["n_pauli_terms"]
+            _reset_vram_stats()
+            t0 = time.time()
+            pathB_results = _run_quantum_skqd(
+                H, max_krylov_dim, optimal_dt, num_trotter_steps, trotter_order,
+                quantum_shots, backend="classical", verbose=verbose,
+            )
+            pathB_time = time.time() - t0
+            pathB_energy = pathB_results["best_energy"]
+            pathB_error = abs(pathB_energy - ref_energy) * 1000
+            pathB_basis_size = (
+                pathB_results["basis_sizes"][-1] if pathB_results["basis_sizes"] else 0
+            )
+            n_pauli_terms = pathB_results["n_pauli_terms"]
 
-        print(f"  Energy: {pathB_energy:.8f} Ha")
-        print(f"  Error:  {pathB_error:.4f} mHa | Time: {pathB_time:.1f}s | "
-              f"Basis: {pathB_basis_size} | Pauli terms: {n_pauli_terms}")
+            if prof_B:
+                prof_B.peak_vram_mb = _get_peak_vram_mb()
+                prof_B.sampling_time_s = pathB_time
+
+            print(f"  Energy: {pathB_energy:.8f} Ha")
+            err_label = "Error" if ref_type == "FCI" else f"vs {ref_type}"
+            print(f"  {err_label}: {pathB_error:.4f} mHa | "
+                  f"Time: {pathB_time:.1f}s | Basis: {pathB_basis_size} | "
+                  f"Pauli terms: {n_pauli_terms}")
+            if prof_B:
+                print(f"  Peak VRAM: {prof_B.peak_vram_mb:.0f} MB")
 
     # ------------------------------------------------------------------
     # 3. Path A: CUDA-Q Circuit (if available, 2nd-order)
@@ -333,6 +552,7 @@ def run_comparison(
     pathA_time = None
     pathA_basis_size = None
     pathA_available = CUDAQ_AVAILABLE
+    prof_A = ProfileData(dt_time_s=dt_time) if profile else None
 
     if "A" in paths:
         if CUDAQ_AVAILABLE:
@@ -342,6 +562,7 @@ def run_comparison(
                   f"(order={trotter_order}, dt={optimal_dt:.6f})")
             print(f"{'─' * 60}")
 
+            _reset_vram_stats()
             t0 = time.time()
             pathA_results = _run_quantum_skqd(
                 H, max_krylov_dim, optimal_dt, num_trotter_steps, trotter_order,
@@ -349,16 +570,23 @@ def run_comparison(
             )
             pathA_time = time.time() - t0
             pathA_energy = pathA_results["best_energy"]
-            pathA_error = abs(pathA_energy - fci_energy) * 1000
+            pathA_error = abs(pathA_energy - ref_energy) * 1000
             pathA_basis_size = (
                 pathA_results["basis_sizes"][-1] if pathA_results["basis_sizes"] else 0
             )
             if n_pauli_terms == 0:
                 n_pauli_terms = pathA_results["n_pauli_terms"]
 
+            if prof_A:
+                prof_A.peak_vram_mb = _get_peak_vram_mb()
+                prof_A.sampling_time_s = pathA_time
+
             print(f"  Energy: {pathA_energy:.8f} Ha")
-            print(f"  Error:  {pathA_error:.4f} mHa | Time: {pathA_time:.1f}s | "
+            err_label = "Error" if ref_type == "FCI" else f"vs {ref_type}"
+            print(f"  {err_label}: {pathA_error:.4f} mHa | Time: {pathA_time:.1f}s | "
                   f"Basis: {pathA_basis_size}")
+            if prof_A:
+                print(f"  Peak VRAM: {prof_A.peak_vram_mb:.0f} MB")
         else:
             step_idx += 1
             print(f"\n{'─' * 60}")
@@ -372,13 +600,19 @@ def run_comparison(
     print(f"\n{'─' * 60}")
     print(f"  Error Analysis")
     print(f"{'─' * 60}")
-    print(f"  FCI energy:               {fci_energy:.8f} Ha")
+    print(f"  Reference ({ref_type}):       {ref_energy:.8f} Ha")
+    if ref_type != "FCI":
+        print(f"  NOTE: {ref_type} is NOT a variational lower bound")
     print(f"  Optimal dt:               {optimal_dt:.6f} (spectral range: {spectral_range:.4f})")
     print(f"  Direct diag error:        {direct_error:.4f} mHa")
     if classical_error is not None:
         print(f"  Path C (exact) error:     {classical_error:.4f} mHa")
+    elif classical_skip_reason:
+        print(f"  Path C: SKIPPED ({classical_skip_reason})")
     if pathB_error is not None:
         print(f"  Path B (Trotter-{trotter_order}) error: {pathB_error:.4f} mHa")
+    elif pathB_skip_reason:
+        print(f"  Path B: SKIPPED ({pathB_skip_reason})")
     elif "B" in paths:
         print(f"  Path B (Trotter-{trotter_order}) error: SKIPPED (memory)")
     if pathA_error is not None:
@@ -406,22 +640,32 @@ def run_comparison(
         print(f"  Basis sizes: {', '.join(basis_parts)}")
 
     chem_acc = 1.594
-    print(f"\n  Chemical accuracy (< {chem_acc:.3f} mHa):")
-    if classical_error is not None:
-        print(f"    Path C: {'PASS' if classical_error < chem_acc else 'FAIL'}")
-    if pathB_error is not None:
-        print(f"    Path B: {'PASS' if pathB_error < chem_acc else 'FAIL'}")
-    elif "B" in paths and pathB_energy is None:
-        print(f"    Path B: SKIPPED")
-    if pathA_error is not None:
-        print(f"    Path A: {'PASS' if pathA_error < chem_acc else 'FAIL'}")
+    if ref_type == "FCI":
+        print(f"\n  Chemical accuracy (< {chem_acc:.3f} mHa):")
+        if classical_error is not None:
+            print(f"    Path C: {'PASS' if classical_error < chem_acc else 'FAIL'}")
+        if pathB_error is not None:
+            print(f"    Path B: {'PASS' if pathB_error < chem_acc else 'FAIL'}")
+        elif "B" in paths and pathB_energy is None:
+            print(f"    Path B: SKIPPED")
+        if pathA_error is not None:
+            print(f"    Path A: {'PASS' if pathA_error < chem_acc else 'FAIL'}")
+    else:
+        print(f"\n  Deviation from {ref_type} (not pass/fail — {ref_type} is not variational):")
+        if classical_error is not None:
+            print(f"    Path C: {classical_error:.4f} mHa")
+        if pathB_error is not None:
+            print(f"    Path B: {pathB_error:.4f} mHa")
+        if pathA_error is not None:
+            print(f"    Path A: {pathA_error:.4f} mHa")
 
     return ComparisonResult(
         system=name,
         n_qubits=n_qubits,
         n_configs=n_configs,
         n_pauli_terms=n_pauli_terms,
-        fci_energy=fci_energy,
+        ref_energy=ref_energy,
+        ref_type=ref_type,
         spectral_range=spectral_range,
         optimal_dt=optimal_dt,
         direct_energy=direct_energy,
@@ -430,15 +674,20 @@ def run_comparison(
         classical_error_mha=classical_error,
         classical_time_s=classical_time,
         classical_basis_size=classical_basis_size,
+        classical_skip_reason=classical_skip_reason,
         pathB_energy=pathB_energy,
         pathB_error_mha=pathB_error,
         pathB_time_s=pathB_time,
         pathB_basis_size=pathB_basis_size,
+        pathB_skip_reason=pathB_skip_reason,
         pathA_energy=pathA_energy,
         pathA_error_mha=pathA_error,
         pathA_time_s=pathA_time,
         pathA_basis_size=pathA_basis_size,
         pathA_available=pathA_available,
+        profile_C=prof_C,
+        profile_B=prof_B,
+        profile_A=prof_A,
     )
 
 
@@ -447,6 +696,9 @@ def print_summary_table(results: List[ComparisonResult], enabled_paths: Set[str]
     has_C = "C" in enabled_paths and any(r.classical_error_mha is not None for r in results)
     has_B = "B" in enabled_paths
     has_A = "A" in enabled_paths and any(r.pathA_available for r in results)
+    has_profile = any(
+        r.profile_C is not None or r.profile_B is not None for r in results
+    )
 
     print(f"\n{'=' * 115}")
     enabled_label = "/".join(p for p in ["C", "B", "A"] if p in enabled_paths)
@@ -454,8 +706,8 @@ def print_summary_table(results: List[ComparisonResult], enabled_paths: Set[str]
     print(f"{'=' * 115}")
 
     # Header
-    hdr = f"{'System':<8} {'Qubits':<7} {'Paulis':<8} {'dt_opt':>8} "
-    hdr_sub = f"{'':8} {'':7} {'':8} {'':>8} "
+    hdr = f"{'System':<12} {'Qubits':<7} {'Configs':<10} {'Ref':>6} {'dt_opt':>8} "
+    hdr_sub = f"{'':12} {'':7} {'':10} {'':>6} {'':>8} "
     if has_C:
         hdr += f"{'Path C':>12} "
         hdr_sub += f"{'Error(mHa)':>12} "
@@ -465,9 +717,6 @@ def print_summary_table(results: List[ComparisonResult], enabled_paths: Set[str]
     if has_A:
         hdr += f"{'Path A':>12} "
         hdr_sub += f"{'Error(mHa)':>12} "
-    if has_C and has_B:
-        hdr += f"{'Trotter':>10} "
-        hdr_sub += f"{'B-C':>10} "
     if has_C:
         hdr += f"{'C':>7}"
         hdr_sub += f"{'Time':>7}"
@@ -477,22 +726,29 @@ def print_summary_table(results: List[ComparisonResult], enabled_paths: Set[str]
     if has_A:
         hdr += f" {'A':>7}"
         hdr_sub += f" {'Time':>7}"
+    if has_profile:
+        hdr += f"  {'C VRAM':>8} {'B VRAM':>8}"
+        hdr_sub += f"  {'(MB)':>8} {'(MB)':>8}"
 
     print(hdr)
     print(hdr_sub)
     print("─" * 115)
 
     for r in results:
-        line = (f"{r.system:<8} {r.n_qubits:<7} {r.n_pauli_terms:<8} "
-                f"{r.optimal_dt:>8.5f} ")
+        line = (f"{r.system:<12} {r.n_qubits:<7} {r.n_configs:<10,} "
+                f"{r.ref_type:>6} {r.optimal_dt:>8.5f} ")
         if has_C:
             if r.classical_error_mha is not None:
                 line += f"{r.classical_error_mha:>12.4f} "
+            elif r.classical_skip_reason:
+                line += f"{'skip':>12} "
             else:
                 line += f"{'N/A':>12} "
         if has_B:
             if r.pathB_error_mha is not None:
                 line += f"{r.pathB_error_mha:>12.4f} "
+            elif r.pathB_skip_reason:
+                line += f"{'skip':>12} "
             else:
                 line += f"{'skip':>12} "
         if has_A:
@@ -500,17 +756,11 @@ def print_summary_table(results: List[ComparisonResult], enabled_paths: Set[str]
                 line += f"{r.pathA_error_mha:>12.4f} "
             else:
                 line += f"{'N/A':>12} "
-        if has_C and has_B:
-            if r.pathB_energy is not None and r.classical_energy is not None:
-                trotter_eff = abs(r.pathB_energy - r.classical_energy) * 1000
-                line += f"{trotter_eff:>10.4f} "
-            else:
-                line += f"{'---':>10} "
         if has_C:
             if r.classical_time_s is not None:
                 line += f"{r.classical_time_s:>6.1f}s"
             else:
-                line += f"{'N/A':>7}"
+                line += f"{'skip':>7}"
         if has_B:
             if r.pathB_time_s is not None:
                 line += f" {r.pathB_time_s:>6.1f}s"
@@ -521,26 +771,51 @@ def print_summary_table(results: List[ComparisonResult], enabled_paths: Set[str]
                 line += f" {r.pathA_time_s:>6.1f}s"
             else:
                 line += f" {'N/A':>7}"
+        if has_profile:
+            c_vram = (f"{r.profile_C.peak_vram_mb:>7.0f}" if r.profile_C
+                      and r.profile_C.peak_vram_mb > 0 else f"{'---':>7}")
+            b_vram = (f"{r.profile_B.peak_vram_mb:>7.0f}" if r.profile_B
+                      and r.profile_B.peak_vram_mb > 0 else f"{'---':>7}")
+            line += f"  {c_vram}  {b_vram}"
         print(line)
 
     print("─" * 115)
 
     chem_acc = 1.594
-    summary_parts = []
-    if has_C:
-        pathC_valid = [r for r in results if r.classical_error_mha is not None]
-        n_pass_c = sum(1 for r in pathC_valid if r.classical_error_mha < chem_acc)
-        summary_parts.append(f"Path C {n_pass_c}/{len(pathC_valid)}")
-    if has_B:
-        pathB_valid = [r for r in results if r.pathB_error_mha is not None]
-        n_pass_b = sum(1 for r in pathB_valid if r.pathB_error_mha < chem_acc)
-        summary_parts.append(f"Path B {n_pass_b}/{len(pathB_valid)}")
-    if has_A:
-        pathA_valid = [r for r in results if r.pathA_error_mha is not None]
-        n_pass_a = sum(1 for r in pathA_valid if r.pathA_error_mha < chem_acc)
-        summary_parts.append(f"Path A {n_pass_a}/{len(pathA_valid)}")
-    if summary_parts:
-        print(f"\nChemical accuracy (< {chem_acc:.3f} mHa): {', '.join(summary_parts)}")
+
+    # FCI systems: chemical accuracy check
+    fci_results = [r for r in results if r.ref_type == "FCI"]
+    if fci_results:
+        summary_parts = []
+        if has_C:
+            pathC_valid = [r for r in fci_results if r.classical_error_mha is not None]
+            n_pass_c = sum(1 for r in pathC_valid if r.classical_error_mha < chem_acc)
+            summary_parts.append(f"Path C {n_pass_c}/{len(pathC_valid)}")
+        if has_B:
+            pathB_valid = [r for r in fci_results if r.pathB_error_mha is not None]
+            n_pass_b = sum(1 for r in pathB_valid if r.pathB_error_mha < chem_acc)
+            summary_parts.append(f"Path B {n_pass_b}/{len(pathB_valid)}")
+        if has_A:
+            pathA_valid = [r for r in fci_results if r.pathA_error_mha is not None]
+            n_pass_a = sum(1 for r in pathA_valid if r.pathA_error_mha < chem_acc)
+            summary_parts.append(f"Path A {n_pass_a}/{len(pathA_valid)}")
+        if summary_parts:
+            print(f"\nChemical accuracy (< {chem_acc:.3f} mHa, FCI ref): "
+                  f"{', '.join(summary_parts)}")
+
+    # CCSD(T) systems: deviation report
+    ccsdt_results = [r for r in results if r.ref_type == "CCSD(T)"]
+    if ccsdt_results:
+        print(f"\nDeviation from CCSD(T) (not pass/fail — CCSD(T) is not variational):")
+        for r in ccsdt_results:
+            parts = [f"  {r.system}:"]
+            if r.classical_error_mha is not None:
+                parts.append(f"C={r.classical_error_mha:.4f}")
+            if r.pathB_error_mha is not None:
+                parts.append(f"B={r.pathB_error_mha:.4f}")
+            if r.pathA_error_mha is not None:
+                parts.append(f"A={r.pathA_error_mha:.4f}")
+            print(" ".join(parts) + " mHa")
 
     print(f"\nKey findings:")
     if results:
@@ -577,6 +852,18 @@ def print_summary_table(results: List[ComparisonResult], enabled_paths: Set[str]
                     print(f"  Path A worse than Path B: "
                           f"{pathA_worse}/{len(pathA_with_B)} systems")
 
+    # Skipped systems summary
+    skipped = [(r.system, r.n_qubits, r.classical_skip_reason, r.pathB_skip_reason)
+               for r in results
+               if r.classical_skip_reason or r.pathB_skip_reason]
+    if skipped:
+        print(f"\n  Skipped paths (VRAM limits):")
+        for sys_name, nq, c_skip, b_skip in skipped:
+            if c_skip:
+                print(f"    {sys_name} ({nq}q) Path C: {c_skip}")
+            if b_skip:
+                print(f"    {sys_name} ({nq}q) Path B: {b_skip}")
+
     print(f"\nPaper compliance:")
     print(f"  Time step:     dt = pi / spectral_range (Epperly Theorem 3.1)")
     print(f"  Trotter order: 2nd-order Suzuki-Trotter (paper Section IV)")
@@ -597,13 +884,20 @@ def print_summary_table(results: List[ComparisonResult], enabled_paths: Set[str]
 
 
 def main():
+    all_system_keys = list(SYSTEMS.keys())
+
     parser = argparse.ArgumentParser(
         description="SKQD Comparison (Paper-Compliant): selectable Path C / B / A"
     )
     parser.add_argument(
-        "--systems", nargs="+", default=["h2", "lih", "h2o", "beh2", "nh3", "ch4", "n2"],
-        choices=list(SYSTEMS.keys()),
-        help="Molecular systems to compare (default: all 7)",
+        "--systems", nargs="+", default=None,
+        choices=all_system_keys,
+        help="Molecular systems to compare",
+    )
+    parser.add_argument(
+        "--tier", default=None,
+        choices=["small", "medium", "large", "all"],
+        help="System tier: small (4-20q), medium (20-24q), large (26-30q), all",
     )
     parser.add_argument(
         "--paths", nargs="+", default=["C", "B", "A"],
@@ -616,10 +910,30 @@ def main():
     parser.add_argument("--shots", type=int, default=100_000,
                         help="Shots per Krylov state (default: 100000, paper Section V)")
     parser.add_argument("--trotter-steps", type=int, default=1,
-                        help="Trotter sub-steps per Krylov step (default: 1, paper single S2(dt))")
+                        help="Trotter sub-steps per Krylov step (default: 1)")
     parser.add_argument("--trotter-order", type=int, default=2, choices=[1, 2],
                         help="Trotter order: 1=first, 2=second (default: 2)")
+    parser.add_argument("--profile", action="store_true",
+                        help="Report timing breakdown and peak VRAM per path")
+    parser.add_argument("--max-vram", type=float, default=None,
+                        help="Max VRAM in GB (auto-skip paths exceeding 80%% of this)")
     args = parser.parse_args()
+
+    # Resolve system list from --tier or --systems
+    if args.tier is not None:
+        if args.tier == "small":
+            systems = TIER_SMALL
+        elif args.tier == "medium":
+            systems = TIER_MEDIUM
+        elif args.tier == "large":
+            systems = TIER_LARGE
+        elif args.tier == "all":
+            systems = TIER_SMALL + TIER_MEDIUM + TIER_LARGE
+    elif args.systems is not None:
+        systems = args.systems
+    else:
+        # Default: small tier (backward compatible)
+        systems = TIER_SMALL
 
     enabled_paths: Set[str] = set(args.paths)
     enabled_label = "/".join(p for p in ["C", "B", "A"] if p in enabled_paths)
@@ -631,15 +945,19 @@ def main():
         print(f"  Path B: State-vector Trotter-{args.trotter_order} (full 2^n space)")
     if "A" in enabled_paths:
         print(f"  Path A: CUDA-Q Trotter-{args.trotter_order} (full 2^n space)")
-    print(f"Systems: {', '.join(args.systems)}")
+    print(f"Systems: {', '.join(systems)}")
     print(f"Krylov dim: {args.krylov_dim}, Shots: {args.shots:,}, "
           f"Trotter-{args.trotter_order} ({args.trotter_steps} steps)")
     print(f"Time step: optimal dt = pi / spectral_range (computed per system)")
+    if args.profile:
+        print(f"Profiling: ENABLED (timing + peak VRAM)")
+    if args.max_vram:
+        print(f"Max VRAM: {args.max_vram:.1f} GB")
     if "A" in enabled_paths:
         print(f"CUDA-Q available: {CUDAQ_AVAILABLE}")
 
     results = []
-    for system_key in args.systems:
+    for system_key in systems:
         try:
             result = run_comparison(
                 system_key,
@@ -648,6 +966,8 @@ def main():
                 num_trotter_steps=args.trotter_steps,
                 trotter_order=args.trotter_order,
                 enabled_paths=enabled_paths,
+                profile=args.profile,
+                max_vram_gb=args.max_vram,
             )
             results.append(result)
         except Exception as e:

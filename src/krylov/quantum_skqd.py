@@ -824,6 +824,10 @@ class QuantumCircuitSKQD:
         psi = psi / torch.linalg.norm(psi)
         self._cached_trotter_states[krylov_power] = psi.clone()
 
+        # Evict previous state to free VRAM (only state k-1 is ever needed)
+        if krylov_power > 0 and (krylov_power - 1) in self._cached_trotter_states:
+            del self._cached_trotter_states[krylov_power - 1]
+
         return self._sample_from_state(psi, krylov_power)
 
     def _precompute_trotter_trig(self) -> None:
@@ -1250,6 +1254,99 @@ class QuantumCircuitSKQD:
 
         return result
 
+    def _lanczos_exact_evolution_lowmem(
+        self, psi: torch.Tensor, t: float, krylov_dim: int = 30
+    ) -> torch.Tensor:
+        """
+        Low-memory Lanczos: compute e^{-iHt}|ψ⟩ storing only 3 vectors at a time.
+
+        Two-pass algorithm:
+        - Pass 1: Lanczos iteration storing only (v_prev, v_curr, w) + tridiagonal T.
+          Memory: 3 × n × 16 bytes instead of krylov_dim × n × 16 bytes.
+        - Compute expansion coefficients c = expm(-i*t*T)[:, 0].
+        - Pass 2: Re-run Lanczos, accumulating result += c[j] * v_j on the fly.
+
+        10x memory reduction vs standard Lanczos (3 vectors vs 30).
+        Enables Path C for 24-26 qubit systems on 16 GB VRAM.
+        """
+        device = psi.device
+        n = len(psi)
+        norm_psi = torch.linalg.norm(psi).real
+
+        if norm_psi.item() < 1e-15:
+            return psi.clone()
+
+        actual_dim = min(krylov_dim, n)
+
+        # --- Pass 1: Build tridiagonal T using only 3 vectors ---
+        alpha = torch.zeros(actual_dim, dtype=torch.float64, device=device)
+        beta = torch.zeros(actual_dim, dtype=torch.float64, device=device)
+
+        v_curr = psi / norm_psi
+        w = self._apply_hamiltonian_matvec(v_curr)
+        alpha[0] = torch.vdot(v_curr, w).real
+        w = w - alpha[0] * v_curr
+
+        m = 1
+        for j in range(1, actual_dim):
+            b = torch.linalg.norm(w).real
+            if b.item() < 1e-12:
+                break
+            beta[j] = b
+            v_prev = v_curr
+            v_curr = w / b
+
+            w = self._apply_hamiltonian_matvec(v_curr)
+            alpha[j] = torch.vdot(v_curr, w).real
+            w = w - alpha[j] * v_curr - b * v_prev
+
+            m = j + 1
+
+        # Free working vectors from pass 1
+        del v_curr, v_prev, w
+
+        # Build tridiagonal T and compute expansion coefficients
+        T = torch.zeros(m, m, dtype=torch.complex128, device=device)
+        T.diagonal().copy_(alpha[:m].to(torch.complex128))
+        if m > 1:
+            T.diagonal(1).copy_(beta[1:m].to(torch.complex128))
+            T.diagonal(-1).copy_(beta[1:m].to(torch.complex128))
+
+        expT = torch.linalg.matrix_exp(-1j * t * T)
+        coeffs = expT[:, 0] * norm_psi
+
+        # --- Pass 2: Re-run Lanczos, accumulating result on the fly ---
+        result = torch.zeros(n, dtype=torch.complex128, device=device)
+
+        v_curr = psi / norm_psi
+        result += coeffs[0] * v_curr
+
+        w = self._apply_hamiltonian_matvec(v_curr)
+        w = w - alpha[0] * v_curr
+
+        for j in range(1, m):
+            b = beta[j]
+            v_prev = v_curr
+            v_curr = w / b
+            result += coeffs[j] * v_curr
+
+            w = self._apply_hamiltonian_matvec(v_curr)
+            w = w - alpha[j] * v_curr - b * v_prev
+
+        return result
+
+    def _should_use_lowmem_lanczos(self, krylov_dim: int = 30) -> bool:
+        """Auto-select low-memory Lanczos when V matrix would use >40% of VRAM."""
+        dim = 2 ** self.n_qubits
+        v_matrix_bytes = krylov_dim * dim * 16  # complex128
+
+        if torch.cuda.is_available():
+            free_vram = torch.cuda.mem_get_info()[0]
+            return v_matrix_bytes > free_vram * 0.4
+        else:
+            # On CPU, use lowmem for >4 GB V matrix
+            return v_matrix_bytes > 4 * 1024**3
+
     def _sample_exact(self, krylov_power: int) -> Dict[str, int]:
         """
         Exact time evolution in full 2^n Hilbert space via Lanczos.
@@ -1261,17 +1358,22 @@ class QuantumCircuitSKQD:
         """
         self._precompute_pauli_masks_lightweight()
 
+        # Auto-select Lanczos variant based on VRAM
+        use_lowmem = self._should_use_lowmem_lanczos()
+
         if krylov_power == 0 and not hasattr(self, "_exact_info_printed"):
             n_terms = len(self.pauli_coefficients)
             dim = 2**self.n_qubits
             T = self.config.total_evolution_time
+            mode = "low-memory 2-pass" if use_lowmem else "standard"
             print(
                 f"  Exact Lanczos evolution ({n_terms} Pauli terms, dim={dim:,}, "
-                f"T={T:.6f} per step, state-cached)"
+                f"T={T:.6f} per step, state-cached, {mode})"
             )
             self._exact_info_printed = True
 
         T = self.config.total_evolution_time
+        evolve_fn = self._lanczos_exact_evolution_lowmem if use_lowmem else self._lanczos_exact_evolution
 
         # Phase 1: Use cached evolved state from previous Krylov step
         if krylov_power == 0:
@@ -1279,17 +1381,21 @@ class QuantumCircuitSKQD:
         elif krylov_power - 1 in self._cached_exact_states:
             # Reuse |ψₖ₋₁⟩ and apply one evolution: |ψₖ⟩ = e^{-iHT}|ψₖ₋₁⟩
             psi = self._cached_exact_states[krylov_power - 1].clone()
-            psi = self._lanczos_exact_evolution(psi, T)
+            psi = evolve_fn(psi, T)
             psi = psi / torch.linalg.norm(psi)
         else:
             # Fallback: evolve from scratch (shouldn't happen with sequential k)
             psi = self._get_initial_state_gpu()
             for _ in range(krylov_power):
-                psi = self._lanczos_exact_evolution(psi, T)
+                psi = evolve_fn(psi, T)
                 psi = psi / torch.linalg.norm(psi)
 
         # Cache for next step
         self._cached_exact_states[krylov_power] = psi.clone()
+
+        # Evict previous state to free VRAM (only state k-1 is ever needed)
+        if krylov_power > 0 and (krylov_power - 1) in self._cached_exact_states:
+            del self._cached_exact_states[krylov_power - 1]
 
         # Sample from |ψ|²
         return self._sample_from_state(psi, krylov_power)
