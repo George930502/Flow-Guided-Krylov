@@ -425,21 +425,17 @@ def run_comparison(
     # PySCF's CPU FCI (iterative Davidson) is the gold standard — correct for all
     # systems, handles up to ~15M configs. Use it as the primary path.
     #
-    # Tier 1: ≤5K configs → H.fci_energy() CPU matrix diag (fast, correct)
-    # Tier 2: ≤15M + geometry → PySCF CPU Davidson (correct, handles large systems)
+    # Tier 1: geometry available + ≤15M → PySCF CPU Davidson (gold standard, float64)
+    # Tier 2: ≤1K configs (no geometry) → H.fci_energy() CPU matrix diag
     # Tier 3: CCSD(T) fallback (NOT variational)
+    #
+    # PySCF Davidson is preferred because MolecularHamiltonian stores integrals
+    # as float32, causing precision loss in matrix diag for >1K configs
+    # (NH3: 4 mHa, CO: 6 mHa off). PySCF uses float64 throughout.
+    # PySCF is also faster than matrix diag for ≥1,225 configs.
 
-    if n_configs <= 5000:
-        # Tier 1: CPU matrix diag — fast for small systems
-        try:
-            ref_energy = H.fci_energy()
-            ref_type = "FCI"
-            print(f"  FCI energy: {ref_energy:.8f} Ha")
-        except Exception as e:
-            print(f"  CPU matrix FCI failed: {e}")
-
-    if ref_energy is None and geometry is not None and n_configs <= 15_000_000:
-        # Tier 2: PySCF CPU iterative Davidson — gold standard for large FCI
+    if geometry is not None and n_configs <= 15_000_000:
+        # Tier 1: PySCF CPU Davidson — gold standard, float64 throughout
         try:
             from moderate_system_benchmark import compute_pyscf_fci
             print(f"  Computing FCI via PySCF Davidson ({n_configs:,} configs)...")
@@ -449,6 +445,15 @@ def run_comparison(
             print(f"  FCI energy: {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
         except Exception as e:
             print(f"  PySCF FCI failed: {e}")
+
+    if ref_energy is None and n_configs <= 1000:
+        # Tier 2: CPU matrix diag fallback — only for tiny systems without geometry
+        try:
+            ref_energy = H.fci_energy()
+            ref_type = "FCI"
+            print(f"  FCI energy: {ref_energy:.8f} Ha")
+        except Exception as e:
+            print(f"  CPU matrix FCI failed: {e}")
 
     if ref_energy is None:
         # Tier 3: CCSD(T) fallback

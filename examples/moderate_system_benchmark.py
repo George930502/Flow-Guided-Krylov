@@ -387,20 +387,10 @@ def run_benchmark(
     energy_type = "HF"
 
     # Reference energy hierarchy:
-    # Tier 1: ≤5K configs → CPU matrix diag (fast)
-    # Tier 2: ≤15M → PySCF CPU Davidson (gold standard, correct for all sizes)
-    # Tier 3: CCSD(T) fallback (NOT variational)
-    # Note: GPU FCI CUDA kernels disabled — profiling showed wrong energies for
-    # several systems (H2O 2.6 Ha off, N2 15 mHa). PySCF CPU is the gold standard.
-
-    if n_valid <= 5000:
-        print("Computing FCI energy (CPU matrix diag)...")
-        try:
-            E_exact = H.fci_energy()
-            energy_type = "FCI"
-            print(f"  FCI Energy: {E_exact:.8f} Ha")
-        except Exception as e:
-            print(f"  CPU matrix FCI failed: {e}")
+    # Tier 1: ≤15M → PySCF CPU Davidson (gold standard, float64 throughout)
+    # Tier 2: CCSD(T) fallback (NOT variational)
+    # Note: H.fci_energy() matrix diag uses float32 integrals, causing precision
+    # loss for >1K configs (NH3: 4 mHa, CO: 6 mHa). PySCF is preferred.
 
     if energy_type != "FCI" and n_valid <= 15_000_000:
         print(f"Computing FCI energy (PySCF CPU Davidson, {n_valid:,} determinants)...")
