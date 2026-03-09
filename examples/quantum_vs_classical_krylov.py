@@ -293,45 +293,37 @@ def run_comparison(
 
     # ------------------------------------------------------------------
     # 2. Path B: Classical Trotterized (state-vector, GPU, 2nd-order)
-    #    Skip when 2^n > 100K — phase_table OOMs (n_terms × dim × 16 bytes)
+    #    Now uses lightweight masks for large systems (no phase_table OOM)
     # ------------------------------------------------------------------
     full_dim = 2 ** n_qubits
-    pathB_feasible = full_dim <= 100_000  # ~16 qubits max
     pathB_energy = None
     pathB_error = None
     pathB_time = None
     pathB_basis_size = None
 
     if "B" in paths:
-        if pathB_feasible:
-            step_idx += 1
-            print(f"\n{'─' * 60}")
-            print(f"  [{step_idx}/{n_enabled}] Path B: Trotterized State-Vector "
-                  f"(order={trotter_order}, dt={optimal_dt:.6f})")
-            print(f"{'─' * 60}")
+        step_idx += 1
+        print(f"\n{'─' * 60}")
+        print(f"  [{step_idx}/{n_enabled}] Path B: Trotterized State-Vector "
+              f"(order={trotter_order}, dt={optimal_dt:.6f})")
+        print(f"{'─' * 60}")
 
-            t0 = time.time()
-            pathB_results = _run_quantum_skqd(
-                H, max_krylov_dim, optimal_dt, num_trotter_steps, trotter_order,
-                quantum_shots, backend="classical", verbose=verbose,
-            )
-            pathB_time = time.time() - t0
-            pathB_energy = pathB_results["best_energy"]
-            pathB_error = abs(pathB_energy - fci_energy) * 1000
-            pathB_basis_size = (
-                pathB_results["basis_sizes"][-1] if pathB_results["basis_sizes"] else 0
-            )
-            n_pauli_terms = pathB_results["n_pauli_terms"]
+        t0 = time.time()
+        pathB_results = _run_quantum_skqd(
+            H, max_krylov_dim, optimal_dt, num_trotter_steps, trotter_order,
+            quantum_shots, backend="classical", verbose=verbose,
+        )
+        pathB_time = time.time() - t0
+        pathB_energy = pathB_results["best_energy"]
+        pathB_error = abs(pathB_energy - fci_energy) * 1000
+        pathB_basis_size = (
+            pathB_results["basis_sizes"][-1] if pathB_results["basis_sizes"] else 0
+        )
+        n_pauli_terms = pathB_results["n_pauli_terms"]
 
-            print(f"  Energy: {pathB_energy:.8f} Ha")
-            print(f"  Error:  {pathB_error:.4f} mHa | Time: {pathB_time:.1f}s | "
-                  f"Basis: {pathB_basis_size} | Pauli terms: {n_pauli_terms}")
-        else:
-            step_idx += 1
-            print(f"\n{'─' * 60}")
-            print(f"  [{step_idx}/{n_enabled}] Path B: SKIPPED "
-                  f"(2^{n_qubits}={full_dim:,} too large for phase_table)")
-            print(f"{'─' * 60}")
+        print(f"  Energy: {pathB_energy:.8f} Ha")
+        print(f"  Error:  {pathB_error:.4f} mHa | Time: {pathB_time:.1f}s | "
+              f"Basis: {pathB_basis_size} | Pauli terms: {n_pauli_terms}")
 
     # ------------------------------------------------------------------
     # 3. Path A: CUDA-Q Circuit (if available, 2nd-order)
@@ -419,7 +411,7 @@ def run_comparison(
         print(f"    Path C: {'PASS' if classical_error < chem_acc else 'FAIL'}")
     if pathB_error is not None:
         print(f"    Path B: {'PASS' if pathB_error < chem_acc else 'FAIL'}")
-    elif "B" in paths and pathB_feasible:
+    elif "B" in paths and pathB_energy is None:
         print(f"    Path B: SKIPPED")
     if pathA_error is not None:
         print(f"    Path A: {'PASS' if pathA_error < chem_acc else 'FAIL'}")
