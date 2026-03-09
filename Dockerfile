@@ -30,6 +30,9 @@ RUN pip install --no-cache-dir "numpy<2"
 # Install CuPy 13.x (last version supporting numpy 1.x) for GPU acceleration
 RUN pip install --no-cache-dir "cupy-cuda12x<14" || echo "CuPy installation skipped (CPU mode)"
 
+# Install gpu4pyscf for GPU-accelerated FCI (CUDA-kernel Davidson solver)
+RUN pip install --no-cache-dir gpu4pyscf || echo "gpu4pyscf installation skipped"
+
 # Install CUDA-Q for quantum circuit simulation (Path A: exp_pauli gates)
 RUN pip install --no-cache-dir cuda-quantum-cu12 || echo "CUDA-Q installation skipped"
 

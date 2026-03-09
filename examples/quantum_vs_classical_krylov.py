@@ -385,18 +385,32 @@ def run_comparison(
         except Exception as e:
             print(f"  Matrix FCI failed: {e}")
 
+    if ref_energy is None:
+        try:
+            from utils.gpu_fci import GPU4PYSCF_AVAILABLE, compute_gpu_fci
+            if GPU4PYSCF_AVAILABLE:
+                geometry = mol_data.geometry
+                basis = mol_data.basis
+                print(f"  Computing FCI via GPU4PySCF Davidson ({n_configs:,} configs)...")
+                t0 = time.time()
+                ref_energy = compute_gpu_fci(geometry, basis)
+                ref_type = "FCI"
+                print(f"  GPU FCI energy: {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
+        except Exception as e:
+            print(f"  GPU FCI failed: {e}")
+
     if ref_energy is None and n_configs <= 15_000_000:
         try:
             from moderate_system_benchmark import compute_pyscf_fci
             geometry = mol_data.geometry
             basis = mol_data.basis
-            print(f"  Computing FCI via PySCF Davidson ({n_configs:,} configs)...")
+            print(f"  Computing FCI via PySCF CPU Davidson ({n_configs:,} configs)...")
             t0 = time.time()
             ref_energy = compute_pyscf_fci(geometry, basis)
             ref_type = "FCI"
             print(f"  PySCF FCI energy: {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
         except Exception as e:
-            print(f"  PySCF FCI failed: {e}")
+            print(f"  PySCF CPU FCI failed: {e}")
 
     if ref_energy is None:
         if ccsd_t_energy is not None:

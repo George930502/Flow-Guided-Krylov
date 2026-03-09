@@ -1585,6 +1585,62 @@ class MolecularHamiltonian(Hamiltonian):
 
         return fci_E
 
+    def gpu_fci_energy(
+        self, max_memory: int = 8000, conv_tol: float = 1e-10, max_cycle: int = 300
+    ) -> float:
+        """
+        Compute FCI energy on GPU using gpu4pyscf's Davidson solver.
+
+        Uses CUDA-kernel-accelerated H×CI matvec (contract_2e) inside
+        PySCF's Davidson iteration. Significantly faster than CPU for
+        large config spaces (>2K configs) and enables exact FCI for
+        systems where matrix-based diag would OOM.
+
+        Requires gpu4pyscf and CuPy. Falls back with RuntimeError if unavailable.
+
+        Args:
+            max_memory: Max memory in MB for FCI solver
+            conv_tol: Energy convergence tolerance
+            max_cycle: Maximum Davidson iterations
+
+        Returns:
+            FCI ground state energy in Hartree
+        """
+        import time
+
+        try:
+            from ..utils.gpu_fci import compute_gpu_fci_from_integrals, GPU4PYSCF_AVAILABLE
+        except ImportError:
+            from utils.gpu_fci import compute_gpu_fci_from_integrals, GPU4PYSCF_AVAILABLE
+
+        if not GPU4PYSCF_AVAILABLE:
+            raise RuntimeError(
+                "gpu4pyscf not available. Install with: pip install gpu4pyscf"
+            )
+
+        n_configs = 1
+        from math import comb
+        n_configs = comb(self.n_orbitals, self.n_alpha) * comb(self.n_orbitals, self.n_beta)
+        print(f"Computing GPU FCI energy ({n_configs:,} configs, gpu4pyscf Davidson)...")
+        start_time = time.time()
+
+        fci_E = compute_gpu_fci_from_integrals(
+            h1e=self.h1e.cpu().numpy() if hasattr(self.h1e, 'cpu') else self.h1e,
+            h2e=self.h2e.cpu().numpy() if hasattr(self.h2e, 'cpu') else self.h2e,
+            n_orbitals=self.n_orbitals,
+            n_alpha=self.n_alpha,
+            n_beta=self.n_beta,
+            nuclear_repulsion=self.nuclear_repulsion,
+            max_memory=max_memory,
+            conv_tol=conv_tol,
+            max_cycle=max_cycle,
+        )
+
+        elapsed = time.time() - start_time
+        print(f"GPU FCI energy: {fci_E:.8f} Ha (computed in {elapsed:.1f}s)")
+
+        return fci_E
+
 
 def compute_molecular_integrals(
     geometry: List[Tuple[str, Tuple[float, float, float]]],

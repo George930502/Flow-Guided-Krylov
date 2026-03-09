@@ -395,8 +395,23 @@ def run_benchmark(
         except Exception as e:
             print(f"  Matrix-based FCI failed: {e}")
 
+    if energy_type != "FCI":
+        try:
+            from utils.gpu_fci import GPU4PYSCF_AVAILABLE, compute_gpu_fci
+            if GPU4PYSCF_AVAILABLE:
+                print(f"Computing FCI energy (GPU4PySCF Davidson, {n_valid:,} determinants)...")
+                t0 = time.time()
+                E_fci = compute_gpu_fci(mol_data.geometry, mol_data.basis)
+                elapsed = time.time() - t0
+                E_exact = E_fci
+                energy_type = "FCI"
+                mol_data.fci_energy = E_fci
+                print(f"  GPU FCI Energy: {E_exact:.8f} Ha (computed in {elapsed:.1f}s)")
+        except Exception as e:
+            print(f"  GPU FCI failed: {e}")
+
     if energy_type != "FCI" and n_valid <= 15_000_000:
-        print(f"Computing FCI energy (PySCF iterative Davidson, {n_valid:,} determinants)...")
+        print(f"Computing FCI energy (PySCF CPU Davidson, {n_valid:,} determinants)...")
         try:
             t0 = time.time()
             E_fci = compute_pyscf_fci(mol_data.geometry, mol_data.basis)
@@ -406,7 +421,7 @@ def run_benchmark(
             mol_data.fci_energy = E_fci
             print(f"  PySCF FCI Energy: {E_exact:.8f} Ha (computed in {elapsed:.1f}s)")
         except Exception as e:
-            print(f"  PySCF FCI failed: {e}")
+            print(f"  PySCF CPU FCI failed: {e}")
 
     if energy_type != "FCI":
         if mol_data.ccsd_t_energy:
