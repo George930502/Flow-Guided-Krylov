@@ -3,7 +3,7 @@ Quantum Circuit vs Classical Krylov: 3-Way Comparison.
 
 Compares three SKQD implementations on the same molecular systems:
 
-1. Path C (Classical SKQD): exact e^{-iHt} in particle-conserving subspace (no Trotter error)
+1. Path C (Best Classical): CuPy fused-diagonal Trotter on GPU (Lanczos CPU fallback)
 2. Path B (Classical Trotterized): second-order Suzuki-Trotter on GPU state-vector
 3. Path A (CUDA-Q Circuit): real quantum circuit via exp_pauli gates, second-order Trotter
 
@@ -384,6 +384,7 @@ def run_comparison(
     enabled_paths: Optional[Set[str]] = None,
     profile: bool = False,
     max_vram_gb: Optional[float] = None,
+    pathc_backend: Optional[str] = None,
 ) -> ComparisonResult:
     """Run comparison for selected paths: C, B, A (default: all)."""
     paths = enabled_paths or {"C", "B", "A"}
@@ -419,6 +420,13 @@ def run_comparison(
     n_qubits = H.num_sites
     n_orb = H.n_orbitals
     n_configs = comb(n_orb, H.n_alpha) * comb(n_orb, H.n_beta)
+
+    # Adaptive scaling for medium-large systems (improved subspace coverage)
+    if n_configs > 50_000:
+        max_krylov_dim = max(max_krylov_dim, 20)
+        quantum_shots = max(quantum_shots, 500_000)
+        print(f"  Adaptive: krylov_dim={max_krylov_dim}, shots={quantum_shots:,} "
+              f"(config space > 50K)")
 
     # --- Reference energy hierarchy ---
     # Profiling showed GPU FCI CUDA kernels have bugs (H2O 2.6 Ha off, N2 15 mHa).
@@ -521,15 +529,16 @@ def run_comparison(
         else:
             step_idx += 1
             print(f"\n{'─' * 60}")
-            print(f"  [{step_idx}/{n_enabled}] Path C: Exact Lanczos "
-                  f"(no Trotter, dt={optimal_dt:.6f})")
+            print(f"  [{step_idx}/{n_enabled}] Path C: Best Classical "
+                  f"(CuPy Trotter on GPU, Lanczos fallback, dt={optimal_dt:.6f})")
             print(f"{'─' * 60}")
 
             _reset_vram_stats()
             t0 = time.time()
+            c_backend = pathc_backend or "exact"
             pathC_results = _run_quantum_skqd(
                 H, max_krylov_dim, optimal_dt, num_trotter_steps, trotter_order,
-                quantum_shots, backend="exact", verbose=verbose,
+                quantum_shots, backend=c_backend, verbose=verbose,
             )
             classical_time = time.time() - t0
             classical_energy = pathC_results["best_energy"]
@@ -933,7 +942,7 @@ def print_summary_table(results: List[ComparisonResult], enabled_paths: Set[str]
     print(f"  Only variable: time evolution method")
     print(f"\nBackends:")
     if has_C:
-        print(f"  Path C: exact e^{{-iHt}} via Lanczos (full 2^n space, no Trotter)")
+        print(f"  Path C: best classical (CuPy fused-diag Trotter on GPU, Lanczos CPU fallback)")
     if has_B:
         print(f"  Path B: state-vector Trotter-2 on GPU (cos(t)I - i*sin(t)P)")
     if has_A:
@@ -960,8 +969,13 @@ def main():
     parser.add_argument(
         "--paths", nargs="+", default=["C", "B", "A"],
         choices=["C", "B", "A"],
-        help="Paths to run: C (exact Lanczos), B (classical Trotter), A (CUDA-Q). "
+        help="Paths to run: C (best classical), B (classical Trotter), A (CUDA-Q). "
              "Default: all three. Example: --paths A  or  --paths C A",
+    )
+    parser.add_argument(
+        "--backend", default=None, choices=["exact", "lanczos"],
+        help="Force Path C backend: 'exact' (CuPy Trotter on GPU, default) or "
+             "'lanczos' (force Lanczos). Only affects Path C.",
     )
     parser.add_argument("--krylov-dim", type=int, default=15,
                         help="Max Krylov dimension (default: 15, paper Fig. 1)")
@@ -998,7 +1012,7 @@ def main():
 
     print(f"SKQD Comparison — Path {enabled_label} (Controlled Experiment)")
     if "C" in enabled_paths:
-        print(f"  Path C: Exact Lanczos (no Trotter, full 2^n space)")
+        print(f"  Path C: Best Classical (CuPy Trotter on GPU, Lanczos CPU fallback)")
     if "B" in enabled_paths:
         print(f"  Path B: State-vector Trotter-{args.trotter_order} (full 2^n space)")
     if "A" in enabled_paths:
@@ -1026,6 +1040,7 @@ def main():
                 enabled_paths=enabled_paths,
                 profile=args.profile,
                 max_vram_gb=args.max_vram,
+                pathc_backend=args.backend,
             )
             results.append(result)
         except Exception as e:

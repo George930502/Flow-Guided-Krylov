@@ -234,6 +234,77 @@ def _get_cupy_trotter_kernel():
         return None
 
 
+# ---------------------------------------------------------------------------
+# CuPy fused diagonal Trotter kernel: fuses ALL diagonal Pauli rotations
+# into a single kernel launch (Z/I-only strings, flip_mask==0).
+# ---------------------------------------------------------------------------
+
+_CUPY_FUSED_DIAG_KERNEL = None
+
+
+def _get_cupy_fused_diag_kernel():
+    """
+    Compile and cache a CUDA kernel that fuses all diagonal Pauli rotations.
+
+    For each basis state x, accumulates all diagonal exp(-iθ_k P_k) rotations
+    in registers before writing result. Reduces diagonal kernel launches from
+    n_diag_terms to 1 per half-step.
+    """
+    global _CUPY_FUSED_DIAG_KERNEL
+    if _CUPY_FUSED_DIAG_KERNEL is not None:
+        return _CUPY_FUSED_DIAG_KERNEL
+    if not CUPY_AVAILABLE:
+        return None
+
+    kernel_code = r"""
+    extern "C" __global__
+    void fused_diagonal_trotter(
+        double* psi_r, double* psi_i,
+        const long long* yz_masks,
+        const double* cos_vals,
+        const double* sin_vals,
+        const double* iny_r_vals,
+        const double* iny_i_vals,
+        int n_diag_terms,
+        int dim
+    ) {
+        int x = blockIdx.x * blockDim.x + threadIdx.x;
+        if (x >= dim) return;
+
+        // Accumulate combined rotation as (acc_r + i*acc_i) multiplier
+        double acc_r = 1.0, acc_i = 0.0;
+
+        for (int k = 0; k < n_diag_terms; k++) {
+            int parity = __popc((long long)x & yz_masks[k]) & 1;
+            double sign = 1.0 - 2.0 * parity;
+            double ph_r = iny_r_vals[k] * sign;
+            double ph_i = iny_i_vals[k] * sign;
+
+            // rot = cos_t - i * sin_t * phase
+            // -i * (ph_r + i*ph_i) = ph_i - i*ph_r
+            double rot_r = cos_vals[k] + sin_vals[k] * ph_i;
+            double rot_i = -sin_vals[k] * ph_r;
+
+            // acc = acc * rot
+            double new_r = acc_r * rot_r - acc_i * rot_i;
+            double new_i = acc_r * rot_i + acc_i * rot_r;
+            acc_r = new_r;
+            acc_i = new_i;
+        }
+
+        // Apply accumulated rotation to psi[x]
+        double pr = psi_r[x], pi = psi_i[x];
+        psi_r[x] = acc_r * pr - acc_i * pi;
+        psi_i[x] = acc_r * pi + acc_i * pr;
+    }
+    """
+    try:
+        _CUPY_FUSED_DIAG_KERNEL = cp.RawKernel(kernel_code, "fused_diagonal_trotter")
+        return _CUPY_FUSED_DIAG_KERNEL
+    except Exception:
+        return None
+
+
 # Threshold for dense Trotter unitary (Phase 3 — dim × dim complex128 ~ dim² × 16 bytes)
 TROTTER_UNITARY_DIM_LIMIT = 8192  # ~13 qubits, U is ~1GB
 
@@ -285,7 +356,8 @@ class QuantumSKQDConfig:
     # Initial state
     initial_state: str = "hf"  # "hf" for molecular, "neel" for spin
 
-    # Backend selection: "auto" (CUDA-Q if available), "cudaq", "classical"
+    # Backend selection: "auto" (CUDA-Q if available), "cudaq", "classical",
+    # "exact" (CuPy Trotter on GPU, Lanczos CPU fallback), "lanczos" (force Lanczos)
     backend: str = "auto"
 
 
@@ -923,11 +995,9 @@ class QuantumCircuitSKQD:
         """
         Apply one full Trotter step via CuPy fused kernel.
 
-        Each Pauli rotation is a single kernel launch operating in-place.
-        Eliminates: Python function call overhead, .item() GPU→CPU syncs,
-        intermediate tensor allocations, popcount Python calls.
-
-        Expected: ~0.01ms per term (vs 0.55ms PyTorch) = ~55x speedup.
+        Uses a fused diagonal kernel for all diagonal Pauli terms (flip_mask==0)
+        in a single launch, then individual launches for off-diagonal terms.
+        This reduces kernel launches by ~2.5x for typical molecular Hamiltonians.
         """
         dim = len(psi)
         n_terms = len(self.pauli_coefficients)
@@ -945,15 +1015,50 @@ class QuantumCircuitSKQD:
             self._cupy_cos_cpu = [float(v.real.item()) for v in cos_vals]
             self._cupy_sin_cpu = [float(v.real.item()) for v in sin_vals]
 
+            # Split into diagonal (flip_mask==0) and off-diagonal indices
+            self._cupy_diag_indices = [
+                k for k in range(n_terms)
+                if self._cupy_flip_masks_cpu[k] == 0 and abs(self._cupy_sin_cpu[k]) >= 1e-15
+            ]
+            self._cupy_offdiag_indices = [
+                k for k in range(n_terms)
+                if self._cupy_flip_masks_cpu[k] != 0 and abs(self._cupy_sin_cpu[k]) >= 1e-15
+            ]
+
+            # Pre-allocate CuPy arrays for fused diagonal kernel
+            n_diag = len(self._cupy_diag_indices)
+            if n_diag > 0:
+                self._cupy_diag_yz = cp.array(
+                    [self._cupy_yz_masks_cpu[k] for k in self._cupy_diag_indices],
+                    dtype=cp.int64,
+                )
+                self._cupy_diag_cos = cp.array(
+                    [self._cupy_cos_cpu[k] for k in self._cupy_diag_indices],
+                    dtype=cp.float64,
+                )
+                self._cupy_diag_sin = cp.array(
+                    [self._cupy_sin_cpu[k] for k in self._cupy_diag_indices],
+                    dtype=cp.float64,
+                )
+                self._cupy_diag_iny_r = cp.array(
+                    [self._cupy_iny_r_cpu[k] for k in self._cupy_diag_indices],
+                    dtype=cp.float64,
+                )
+                self._cupy_diag_iny_i = cp.array(
+                    [self._cupy_iny_i_cpu[k] for k in self._cupy_diag_indices],
+                    dtype=cp.float64,
+                )
+
         flip_masks = self._cupy_flip_masks_cpu
         yz_masks = self._cupy_yz_masks_cpu
         iny_r = self._cupy_iny_r_cpu
         iny_i = self._cupy_iny_i_cpu
         cos_v = self._cupy_cos_cpu
         sin_v = self._cupy_sin_cpu
+        diag_indices = self._cupy_diag_indices
+        offdiag_indices = self._cupy_offdiag_indices
 
         # Convert psi to separate real/imag CuPy arrays (in-place via DLPack)
-        # We need contiguous real/imag views for the kernel
         psi_r_torch = psi.real.contiguous()
         psi_i_torch = psi.imag.contiguous()
 
@@ -965,48 +1070,53 @@ class QuantumCircuitSKQD:
         np_float64 = np.float64
         np_int32 = np.int32
 
+        fused_diag_kernel = _get_cupy_fused_diag_kernel()
+        n_diag = len(diag_indices)
+
+        def _apply_half_step(term_order):
+            """Apply diagonal (fused) + off-diagonal (individual) for one half-step."""
+            # Fused diagonal: single kernel launch for all Z/I-only terms
+            if n_diag > 0 and fused_diag_kernel is not None:
+                fused_diag_kernel(
+                    (grid,), (block,),
+                    (psi_r, psi_i,
+                     self._cupy_diag_yz,
+                     self._cupy_diag_cos, self._cupy_diag_sin,
+                     self._cupy_diag_iny_r, self._cupy_diag_iny_i,
+                     np_int32(n_diag), np_int32(dim)),
+                )
+            elif n_diag > 0:
+                # Fallback: individual diagonal launches
+                for k in diag_indices:
+                    kernel(
+                        (grid,), (block,),
+                        (psi_r, psi_i,
+                         np_int64(flip_masks[k]), np_int64(yz_masks[k]),
+                         np_float64(iny_r[k]), np_float64(iny_i[k]),
+                         np_float64(cos_v[k]), np_float64(sin_v[k]),
+                         np_int32(dim)),
+                    )
+
+            # Off-diagonal: individual kernel launches (non-commutative)
+            for k in term_order:
+                kernel(
+                    (grid,), (block,),
+                    (psi_r, psi_i,
+                     np_int64(flip_masks[k]), np_int64(yz_masks[k]),
+                     np_float64(iny_r[k]), np_float64(iny_i[k]),
+                     np_float64(cos_v[k]), np_float64(sin_v[k]),
+                     np_int32(dim)),
+                )
+
         if self.config.trotter_order == 2:
             for _ in range(self.config.num_trotter_steps):
                 # Forward half-step
-                for k in range(n_terms):
-                    st = sin_v[k]
-                    if abs(st) < 1e-15:
-                        continue
-                    kernel(
-                        (grid,), (block,),
-                        (psi_r, psi_i,
-                         np_int64(flip_masks[k]), np_int64(yz_masks[k]),
-                         np_float64(iny_r[k]), np_float64(iny_i[k]),
-                         np_float64(cos_v[k]), np_float64(st),
-                         np_int32(dim)),
-                    )
-                # Backward half-step (reversed)
-                for k in range(n_terms - 1, -1, -1):
-                    st = sin_v[k]
-                    if abs(st) < 1e-15:
-                        continue
-                    kernel(
-                        (grid,), (block,),
-                        (psi_r, psi_i,
-                         np_int64(flip_masks[k]), np_int64(yz_masks[k]),
-                         np_float64(iny_r[k]), np_float64(iny_i[k]),
-                         np_float64(cos_v[k]), np_float64(st),
-                         np_int32(dim)),
-                    )
+                _apply_half_step(offdiag_indices)
+                # Backward half-step (reversed off-diagonal, same fused diagonal)
+                _apply_half_step(list(reversed(offdiag_indices)))
         else:
             for _ in range(self.config.num_trotter_steps):
-                for k in range(n_terms):
-                    st = sin_v[k]
-                    if abs(st) < 1e-15:
-                        continue
-                    kernel(
-                        (grid,), (block,),
-                        (psi_r, psi_i,
-                         np_int64(flip_masks[k]), np_int64(yz_masks[k]),
-                         np_float64(iny_r[k]), np_float64(iny_i[k]),
-                         np_float64(cos_v[k]), np_float64(st),
-                         np_int32(dim)),
-                    )
+                _apply_half_step(offdiag_indices)
 
         # Reconstruct complex torch tensor from real/imag CuPy arrays
         result = torch.complex(
@@ -1457,8 +1567,16 @@ class QuantumCircuitSKQD:
             sample_fn = self._sample_classical_trotterized
             backend = f"Classical Trotterized (GPU: {self._device.type})"
         elif requested == "exact":
+            # Prefer CuPy Trotter for speed; fall back to Lanczos on CPU
+            if CUPY_AVAILABLE and self._device.type == "cuda":
+                sample_fn = self._sample_classical_trotterized
+                backend = f"CuPy Trotterized (GPU, fused-diagonal)"
+            else:
+                sample_fn = self._sample_exact
+                backend = f"Exact Lanczos (CPU)"
+        elif requested == "lanczos":
             sample_fn = self._sample_exact
-            backend = f"Exact Lanczos (GPU: {self._device.type})"
+            backend = f"Exact Lanczos ({self._device.type})"
         else:  # "auto"
             if CUDAQ_AVAILABLE:
                 sample_fn = self._sample_cudaq
@@ -1476,6 +1594,12 @@ class QuantumCircuitSKQD:
         cumulative: Dict[str, int] = {}
         cumulative_results = []
 
+        # Pre-compute essential configs (HF + singles + doubles) for injection
+        essential_bitstrings = self._get_essential_bitstrings()
+        if essential_bitstrings:
+            print(f"  Essential config injection: {len(essential_bitstrings)} configs "
+                  f"(HF + singles + doubles)")
+
         for k in range(max_k):
             if progress:
                 print(f"  Generating Krylov state U^{k}...")
@@ -1485,12 +1609,99 @@ class QuantumCircuitSKQD:
             # Accumulate (union of bitstrings across Krylov powers)
             for bs, count in samples.items():
                 cumulative[bs] = cumulative.get(bs, 0) + count
+
+            # Inject essential configs to ensure ground-state coverage
+            for bs in essential_bitstrings:
+                if bs not in cumulative:
+                    cumulative[bs] = 1
+
             cumulative_results.append(dict(cumulative))
 
         self._all_samples = all_samples
         self._cumulative_results = cumulative_results
 
         return all_samples, cumulative_results
+
+    def _get_essential_bitstrings(self) -> List[str]:
+        """Generate HF + single + double excitation bitstrings for config injection."""
+        if self.hamiltonian is None or not hasattr(self.hamiltonian, "n_orbitals"):
+            return []
+
+        from itertools import combinations
+
+        H = self.hamiltonian
+        n_orb = H.n_orbitals
+        n_alpha = H.n_alpha
+        n_beta = H.n_beta
+        n_qubits = self.n_qubits
+
+        hf = H.get_hf_state().cpu().numpy()
+        def _cfg_to_bs(c):
+            return "".join(str(int(v)) for v in c)
+
+        bitstrings = [_cfg_to_bs(hf)]
+
+        occ_alpha = list(range(n_alpha))
+        occ_beta = list(range(n_beta))
+        virt_alpha = list(range(n_alpha, n_orb))
+        virt_beta = list(range(n_beta, n_orb))
+
+        # Single excitations
+        for i in occ_alpha:
+            for a in virt_alpha:
+                cfg = hf.copy()
+                cfg[i] = 0
+                cfg[a] = 1
+                bitstrings.append(_cfg_to_bs(cfg))
+        for i in occ_beta:
+            for a in virt_beta:
+                cfg = hf.copy()
+                cfg[i + n_orb] = 0
+                cfg[a + n_orb] = 1
+                bitstrings.append(_cfg_to_bs(cfg))
+
+        # Double excitations (capped at 5000)
+
+        max_doubles = 5000
+        count = 0
+        for i, j in combinations(occ_alpha, 2):
+            for a, b_orb in combinations(virt_alpha, 2):
+                if count >= max_doubles:
+                    break
+                cfg = hf.copy()
+                cfg[i] = 0
+                cfg[j] = 0
+                cfg[a] = 1
+                cfg[b_orb] = 1
+                bitstrings.append(_cfg_to_bs(cfg))
+                count += 1
+        for i, j in combinations(occ_beta, 2):
+            for a, b_orb in combinations(virt_beta, 2):
+                if count >= max_doubles:
+                    break
+                cfg = hf.copy()
+                cfg[i + n_orb] = 0
+                cfg[j + n_orb] = 0
+                cfg[a + n_orb] = 1
+                cfg[b_orb + n_orb] = 1
+                bitstrings.append(_cfg_to_bs(cfg))
+                count += 1
+        for i in occ_alpha:
+            for j in occ_beta:
+                for a in virt_alpha:
+                    for b_orb in virt_beta:
+                        if count >= max_doubles:
+                            break
+                        cfg = hf.copy()
+                        cfg[i] = 0
+                        cfg[j + n_orb] = 0
+                        cfg[a] = 1
+                        cfg[b_orb + n_orb] = 1
+                        bitstrings.append(_cfg_to_bs(cfg))
+                        count += 1
+
+        # Deduplicate
+        return list(set(bitstrings))
 
     def _basis_from_samples(self, sample_dict: Dict[str, int]) -> torch.Tensor:
         """Convert sample dictionary to basis state tensor on GPU (vectorized)."""
