@@ -720,16 +720,62 @@ class QuantumCircuitSKQD:
         """
         Build and cache CUDA-Q kernels ONCE.
 
-        Two kernel types (HF and Neel initial states):
-        - Full from-scratch evolution + measurement via cudaq.sample()
-        - Each call applies krylov_power full Trotter steps from |ψ₀⟩
+        Kernel types:
+        - init_hf / init_neel: Prepare initial state (no evolution, no measurement)
+        - evolve_from_amplitudes: Initialize from list[complex], apply 1 Trotter step
+        - krylov_circuit_hf/neel: Full from-scratch evolution + measurement (fallback)
 
-        Note: State-caching via cudaq.get_state(kernel, cudaq.State, ...) was
-        attempted but silently returns the input state unchanged on nvidia/fp64
-        target (CUDA-Q v0.12). Reverted to from-scratch for correctness.
+        State caching uses list[complex] amplitudes (NOT cudaq.State) to avoid
+        a CUDA-Q v0.12 bug where cudaq.get_state(kernel, cudaq.State, ...) silently
+        returns the input state unchanged on the nvidia/fp64 target.
         """
         if self._cudaq_kernels_built:
             return
+
+        # --- State-cached kernels (no measurement, for get_state) ---
+
+        @cudaq.kernel
+        def init_hf_kernel(
+            num_qubits: int,
+            occ_qubits: list[int],
+        ):
+            """Prepare HF initial state (no evolution, no measurement)."""
+            qubits = cudaq.qvector(num_qubits)
+            for oq in range(len(occ_qubits)):
+                x(qubits[occ_qubits[oq]])
+
+        @cudaq.kernel
+        def init_neel_kernel(
+            num_qubits: int,
+        ):
+            """Prepare Neel initial state (no evolution, no measurement)."""
+            qubits = cudaq.qvector(num_qubits)
+            for qubit_index in range(num_qubits):
+                if qubit_index % 2 == 0:
+                    x(qubits[qubit_index])
+
+        @cudaq.kernel
+        def evolve_from_amplitudes(
+            amplitudes: list[complex],
+            trotter_steps: int,
+            H_pauli_words: list[cudaq.pauli_word],
+            angles: list[float],
+        ):
+            """Initialize from amplitudes, apply ONE Trotter step (no measurement).
+
+            Uses list[complex] instead of cudaq.State to avoid the nvidia/fp64
+            bug where cudaq.qvector(cudaq.State) silently produces a no-op.
+            """
+            qubits = cudaq.qvector(amplitudes)
+            for _ in range(trotter_steps):
+                for i in range(len(angles)):
+                    exp_pauli(angles[i], qubits, H_pauli_words[i])
+
+        self._kernel_init_hf = init_hf_kernel
+        self._kernel_init_neel = init_neel_kernel
+        self._kernel_evolve_from_amplitudes = evolve_from_amplitudes
+
+        # --- Fallback kernels (full from-scratch evolution + measurement) ---
 
         @cudaq.kernel
         def krylov_circuit_hf(
@@ -771,36 +817,96 @@ class QuantumCircuitSKQD:
         self._kernel_neel = krylov_circuit_neel
         self._cudaq_kernels_built = True
 
+        # Amplitude cache for incremental evolution: k → list[complex]
+        self._cached_cudaq_amplitudes: Dict[int, list] = {}
+
     def _sample_cudaq(self, krylov_power: int) -> Dict[str, int]:
         """
-        Sample from Krylov state U^k|ψ₀⟩ using CUDA-Q circuit simulation.
+        Sample from Krylov state U^k|ψ₀⟩ using CUDA-Q with amplitude caching.
 
-        Uses cudaq.sample with full from-scratch evolution per krylov_power.
-        Total Trotter applications scale as O(k²) across all Krylov steps,
-        but cuQuantum's fused exp_pauli backend is fast enough in practice.
+        O(k) state-cached approach using list[complex] amplitudes:
+        1. k=0: get_state of initial state (HF/Neel) → extract amplitudes
+        2. k>0: initialize from cached amplitudes, apply ONE Trotter step
+        3. Sample from |ψ|² via torch.multinomial
 
-        Note: State-caching via cudaq.get_state(kernel, cudaq.State, ...) was
-        attempted but cudaq.get_state on kernels with cudaq.State input silently
-        returns the input state unchanged on the nvidia/fp64 target (CUDA-Q v0.12),
-        producing no evolution. Reverted to from-scratch approach for correctness.
+        Uses list[complex] (not cudaq.State) for state passing to avoid the
+        nvidia/fp64 bug. Falls back to from-scratch cudaq.sample() on failure.
         """
         self._init_cudaq()
         self._build_cudaq_kernels()
 
         cudaq.set_random_seed(self.config.seed + krylov_power)
 
-        if not hasattr(self, "_cudaq_info_printed"):
-            self._cudaq_info_printed = True
-            n_terms = len(self.pauli_coefficients)
-            dim = 2 ** self.n_qubits
-            print(f"  CUDA-Q from-scratch mode ({n_terms} Pauli terms, "
-                  f"dim={dim:,}, {krylov_power}*{self.config.num_trotter_steps} "
-                  f"Trotter steps)")
+        try:
+            return self._sample_cudaq_cached(krylov_power)
+        except Exception as e:
+            if krylov_power == 0:
+                print(f"  CUDA-Q amplitude caching failed ({e}), "
+                      f"falling back to from-scratch sampling")
+            return self._sample_cudaq_from_scratch(krylov_power)
 
-        return self._sample_cudaq_from_scratch(krylov_power)
+    def _sample_cudaq_cached(self, krylov_power: int) -> Dict[str, int]:
+        """State-cached CUDA-Q: get_state → extract amplitudes → cache → sample."""
+        if krylov_power == 0:
+            # Get initial state (no evolution)
+            if self.config.initial_state == "hf":
+                state = cudaq.get_state(
+                    self._kernel_init_hf,
+                    self.n_qubits,
+                    self._occupied_qubits,
+                )
+            else:
+                state = cudaq.get_state(
+                    self._kernel_init_neel,
+                    self.n_qubits,
+                )
+
+            if not hasattr(self, "_cudaq_cached_info_printed"):
+                self._cudaq_cached_info_printed = True
+                n_terms = len(self.pauli_coefficients)
+                dim = 2 ** self.n_qubits
+                print(f"  CUDA-Q amplitude-cached mode ({n_terms} Pauli terms, "
+                      f"dim={dim:,}, 1 Trotter step/k)")
+        else:
+            # Evolve from cached amplitudes by ONE Trotter step
+            prev_amps = self._cached_cudaq_amplitudes[krylov_power - 1]
+            state = cudaq.get_state(
+                self._kernel_evolve_from_amplitudes,
+                prev_amps,
+                self.config.num_trotter_steps,
+                self._pauli_words_cudaq,
+                self._exp_pauli_angles,
+            )
+
+        # Extract amplitudes as numpy array → cache as list[complex]
+        psi_np = np.array(state, dtype=np.complex128)
+
+        # Validate: state should be normalized (catch silent failures)
+        norm_sq = np.sum(np.abs(psi_np) ** 2)
+        if abs(norm_sq - 1.0) > 0.01:
+            raise RuntimeError(
+                f"CUDA-Q state not normalized (|ψ|²={norm_sq:.6f}), "
+                f"amplitude caching may not be working"
+            )
+
+        # Cache amplitudes for next step, evict previous
+        self._cached_cudaq_amplitudes[krylov_power] = psi_np.tolist()
+        if krylov_power > 0 and (krylov_power - 1) in self._cached_cudaq_amplitudes:
+            del self._cached_cudaq_amplitudes[krylov_power - 1]
+
+        # Sample from |ψ|²
+        psi = torch.from_numpy(psi_np).to(self._device)
+        return self._sample_from_state(psi, krylov_power)
 
     def _sample_cudaq_from_scratch(self, krylov_power: int) -> Dict[str, int]:
-        """From-scratch CUDA-Q sampling: full circuit per krylov_power."""
+        """Fallback: full from-scratch CUDA-Q sampling (O(k²) total)."""
+        if not hasattr(self, "_cudaq_fallback_printed"):
+            self._cudaq_fallback_printed = True
+            n_terms = len(self.pauli_coefficients)
+            dim = 2 ** self.n_qubits
+            print(f"  CUDA-Q from-scratch fallback ({n_terms} Pauli terms, "
+                  f"dim={dim:,})")
+
         if self.config.initial_state == "hf":
             result = cudaq.sample(
                 self._kernel_hf,
