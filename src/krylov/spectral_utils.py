@@ -10,7 +10,7 @@ Per SKQD paper (Theorem 3.1, Epperly et al.):
 Four strategies for different config-space sizes:
   - Small (≤5K): Dense diagonalization
   - Medium (5K-20K): Sparse eigsh on full matrix (built once via matrix_elements_fast)
-  - Medium-large (20K-200K): Matrix-free Lanczos (accurate, no full matrix)
+  - Medium-large (20K-200K): Sparse batched eigsh (GPU-vectorized COO build)
   - Very large (>200K): Diagonal approximation O(n_configs)
 """
 
@@ -76,70 +76,96 @@ def _spectral_range_sparse(hamiltonian, basis_tensor: torch.Tensor) -> float:
     return E_max - E_min
 
 
-def _spectral_range_matfree(hamiltonian, basis_tensor: torch.Tensor) -> float:
+def _spectral_range_sparse_batched(hamiltonian, basis_tensor: torch.Tensor) -> float:
     """
-    Matrix-free Lanczos for medium-large config spaces (20K-200K).
+    Sparse eigsh for medium-large config spaces (20K-200K).
 
-    Uses scipy.sparse.linalg.eigsh with a LinearOperator backed by the
-    Hamiltonian's Slater-Condon rules. No full matrix construction needed.
-    O(n_configs) per Lanczos iteration, ~20 iterations total.
+    Builds a sparse COO matrix in batches using GPU-vectorized
+    get_connections_vectorized_batch (same engine as matrix_elements_fast),
+    then runs eigsh for extremal eigenvalues. Avoids the O(n²) dense matrix.
+
+    For 108K configs with ~100 connections each → ~10M nonzeros → ~240 MB sparse.
     """
-    from scipy.sparse.linalg import eigsh as scipy_eigsh, LinearOperator
+    from scipy.sparse.linalg import eigsh as scipy_eigsh
+    from scipy.sparse import coo_matrix
 
     n = len(basis_tensor)
     device = basis_tensor.device
 
-    # Build integer-encoded lookup for fast basis matching
+    # Integer-encode all basis configs for O(1) lookup via searchsorted
     n_sites = basis_tensor.shape[1]
-    # Encode each config as an integer for O(1) lookup
     powers = torch.pow(2, torch.arange(n_sites - 1, -1, -1, device=device, dtype=torch.int64))
-    basis_ints = (basis_tensor * powers.unsqueeze(0)).sum(dim=1)  # shape (n,)
-    int_to_idx = {}
-    for i, val in enumerate(basis_ints.cpu().numpy()):
-        int_to_idx[int(val)] = i
+    config_ints = (basis_tensor.long() * powers.unsqueeze(0)).sum(dim=1)
+    sorted_config_ints, sort_order = config_ints.sort()
 
-    # Pre-compute diagonal elements
-    diag = hamiltonian.diagonal_elements_batch(basis_tensor).cpu().numpy().astype(np.float64)
+    # Collect COO entries: rows, cols, vals
+    all_rows = []
+    all_cols = []
+    all_vals = []
 
-    def matvec(v):
-        """H @ v using diagonal + off-diagonal Slater-Condon connections."""
-        result = diag * v  # diagonal part
+    # Diagonal elements (vectorized)
+    diag = hamiltonian.diagonal_elements_batch(basis_tensor).to(torch.float64)
+    diag_idx = np.arange(n)
+    all_rows.append(diag_idx)
+    all_cols.append(diag_idx)
+    all_vals.append(diag.cpu().numpy())
 
-        # Off-diagonal: iterate over basis states, get connections
-        v_torch = torch.from_numpy(v).to(device=device, dtype=torch.float64)
-        result_torch = torch.from_numpy(result).to(device=device, dtype=torch.float64)
+    # Off-diagonal: process in batches to limit GPU memory
+    batch_size = min(5000, n)
+    for i_start in range(0, n, batch_size):
+        i_end = min(i_start + batch_size, n)
+        batch = basis_tensor[i_start:i_end]
 
-        # Process in batches to manage memory
-        batch_size = min(2000, n)
-        for i_start in range(0, n, batch_size):
-            i_end = min(i_start + batch_size, n)
-            batch = basis_tensor[i_start:i_end]
+        connected, elements, batch_indices = hamiltonian.get_connections_vectorized_batch(batch)
+        if len(connected) == 0:
+            continue
 
-            for local_idx in range(len(batch)):
-                global_idx = i_start + local_idx
-                cfg = batch[local_idx]
+        # Map connected configs to basis indices via searchsorted
+        conn_ints = (connected.long() * powers.unsqueeze(0)).sum(dim=1)
+        search_pos = torch.searchsorted(sorted_config_ints, conn_ints)
+        search_pos_clamped = search_pos.clamp(max=n - 1)
+        match_mask = sorted_config_ints[search_pos_clamped] == conn_ints
 
-                connected, h_elements = hamiltonian.get_connections(cfg)
-                if connected is None or len(connected) == 0:
-                    continue
+        if not match_mask.any():
+            continue
 
-                for conn_cfg, h_elem in zip(connected, h_elements):
-                    conn_int = int((conn_cfg * powers).sum().item())
-                    j = int_to_idx.get(conn_int)
-                    if j is not None and j != global_idx:
-                        result_torch[global_idx] += h_elem.real * v_torch[j]
+        valid_k = match_mask.nonzero(as_tuple=True)[0]
+        # row = matched basis index, col = source config (offset by batch start)
+        rows = sort_order[search_pos_clamped[valid_k]].cpu().numpy()
+        cols = (batch_indices[valid_k] + i_start).cpu().numpy()
+        vals = elements[valid_k].to(torch.float64).cpu().numpy()
 
-        return result_torch.cpu().numpy()
+        # Filter out diagonal entries and negligible values
+        off_diag = rows != cols
+        significant = np.abs(vals) > 1e-14
+        mask = off_diag & significant
+        all_rows.append(rows[mask])
+        all_cols.append(cols[mask])
+        all_vals.append(vals[mask])
 
-    H_op = LinearOperator((n, n), matvec=matvec, dtype=np.float64)
+    # Build sparse matrix
+    rows_cat = np.concatenate(all_rows)
+    cols_cat = np.concatenate(all_cols)
+    vals_cat = np.concatenate(all_vals)
+
+    H_sp = coo_matrix((vals_cat, (rows_cat, cols_cat)), shape=(n, n)).tocsr()
+    # Enforce Hermitian symmetry
+    H_sp = 0.5 * (H_sp + H_sp.T)
+
+    del rows_cat, cols_cat, vals_cat, basis_tensor
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    print(f"    Sparse matrix: {H_sp.nnz:,} nonzeros "
+          f"({H_sp.nnz * 8 / 1024**2:.0f} MB)")
 
     try:
-        E_min = float(scipy_eigsh(H_op, k=1, which='SA', return_eigenvectors=False)[0])
-        E_max = float(scipy_eigsh(H_op, k=1, which='LA', return_eigenvectors=False)[0])
+        E_min = float(scipy_eigsh(H_sp, k=1, which='SA', return_eigenvectors=False)[0])
+        E_max = float(scipy_eigsh(H_sp, k=1, which='LA', return_eigenvectors=False)[0])
         return E_max - E_min
     except Exception as e:
-        print(f"  Matrix-free Lanczos failed ({e}), falling back to diagonal approx")
-        return _spectral_range_diagonal(hamiltonian, basis_tensor)
+        print(f"  Sparse batched eigsh failed ({e}), falling back to diagonal approx")
+        return _spectral_range_diagonal(hamiltonian, _enumerate_basis(hamiltonian))
 
 
 def _spectral_range_diagonal(hamiltonian, basis_tensor: torch.Tensor) -> float:
@@ -182,7 +208,7 @@ def compute_optimal_dt(hamiltonian) -> Tuple[float, float]:
     Strategy selection by config-space size:
       ≤5K:      Dense eigvalsh (exact, fast)
       5K-20K:   Sparse eigsh on full matrix (built once via matrix_elements_fast)
-      20K-200K: Matrix-free Lanczos (accurate, no full matrix construction)
+      20K-200K: Sparse batched eigsh (GPU-vectorized COO build, no dense matrix)
       >200K:    Diagonal approximation with 1.2x safety factor
 
     Args:
@@ -202,10 +228,10 @@ def compute_optimal_dt(hamiltonian) -> Tuple[float, float]:
         basis_tensor = _enumerate_basis(hamiltonian)
         spectral_range = _spectral_range_diagonal(hamiltonian, basis_tensor)
     elif n > 20_000:
-        # Medium-large (20K-200K): matrix-free Lanczos — accurate, no full matrix
-        print(f"  Spectral range: matrix-free Lanczos ({n:,} configs)")
+        # Medium-large (20K-200K): build sparse matrix in batches, then eigsh
+        print(f"  Spectral range: sparse batched eigsh ({n:,} configs)")
         basis_tensor = _enumerate_basis(hamiltonian)
-        spectral_range = _spectral_range_matfree(hamiltonian, basis_tensor)
+        spectral_range = _spectral_range_sparse_batched(hamiltonian, basis_tensor)
     elif n > 5000:
         # Medium: build full matrix once via optimized matrix_elements_fast,
         # then sparse eigsh. Much faster than matrix-free LinearOperator
