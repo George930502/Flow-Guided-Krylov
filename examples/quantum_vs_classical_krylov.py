@@ -429,21 +429,32 @@ def run_comparison(
               f"(config space > 50K)")
 
     # --- Reference energy hierarchy ---
-    # Profiling showed GPU FCI CUDA kernels have bugs (H2O 2.6 Ha off, N2 15 mHa).
-    # PySCF's CPU FCI (iterative Davidson) is the gold standard — correct for all
-    # systems, handles up to ~15M configs. Use it as the primary path.
+    # CRITICAL: The reference MUST use the SAME integrals as the projected
+    # Hamiltonian. Using a separate PySCF FCI run (compute_pyscf_fci) creates
+    # a fresh SCF with potentially different MO coefficients, causing the
+    # projected energy to appear below FCI (variational principle violation).
     #
-    # Tier 1: geometry available + ≤15M → PySCF CPU Davidson (gold standard, float64)
-    # Tier 2: ≤1K configs (no geometry) → H.fci_energy() CPU matrix diag
+    # Tier 1: H.fci_energy() — uses SAME matrix_elements() as pipeline (guaranteed
+    #         variational). Feasible for ≤200K configs (sparse eigsh).
+    # Tier 2: PySCF Davidson fallback for very large systems (>200K configs)
     # Tier 3: CCSD(T) fallback (NOT variational)
-    #
-    # PySCF Davidson is preferred because MolecularHamiltonian stores integrals
-    # as float32, causing precision loss in matrix diag for >1K configs
-    # (NH3: 4 mHa, CO: 6 mHa off). PySCF uses float64 throughout.
-    # PySCF is also faster than matrix diag for ≥1,225 configs.
 
-    if geometry is not None and n_configs <= 15_000_000:
-        # Tier 1: PySCF CPU Davidson — gold standard, float64 throughout
+    # H.fci_energy() builds a dense n×n matrix → memory ~ n²×8 bytes.
+    # 20K configs → 3.2 GB, feasible on 16 GB GPU. Above that → OOM.
+    if n_configs <= 20_000:
+        # Tier 1: H.fci_energy() — same integrals, guaranteed variational bound
+        try:
+            print(f"  Computing FCI via H.fci_energy() ({n_configs:,} configs)...")
+            t0 = time.time()
+            ref_energy = H.fci_energy()
+            ref_type = "FCI"
+            print(f"  FCI energy: {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
+        except Exception as e:
+            print(f"  H.fci_energy() failed: {e}")
+
+    if ref_energy is None and geometry is not None and n_configs <= 15_000_000:
+        # Tier 2: PySCF Davidson — separate SCF, may not be variational bound
+        # for projected Hamiltonian (different integrals)
         try:
             from moderate_system_benchmark import compute_pyscf_fci
             print(f"  Computing FCI via PySCF Davidson ({n_configs:,} configs)...")
@@ -451,17 +462,9 @@ def run_comparison(
             ref_energy = compute_pyscf_fci(geometry, basis)
             ref_type = "FCI"
             print(f"  FCI energy: {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
+            print(f"  WARNING: PySCF FCI uses separate SCF — variational bound not guaranteed")
         except Exception as e:
             print(f"  PySCF FCI failed: {e}")
-
-    if ref_energy is None and n_configs <= 1000:
-        # Tier 2: CPU matrix diag fallback — only for tiny systems without geometry
-        try:
-            ref_energy = H.fci_energy()
-            ref_type = "FCI"
-            print(f"  FCI energy: {ref_energy:.8f} Ha")
-        except Exception as e:
-            print(f"  CPU matrix FCI failed: {e}")
 
     if ref_energy is None:
         # Tier 3: CCSD(T) fallback
