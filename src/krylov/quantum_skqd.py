@@ -720,15 +720,58 @@ class QuantumCircuitSKQD:
         """
         Build and cache CUDA-Q kernels ONCE.
 
-        Kernel compilation is expensive; defining inside a per-call method
-        forces recompilation at each Krylov step. Cache as instance attributes.
+        Three kernel types:
+        1. init_hf / init_neel: Prepare initial state (no evolution, no measurement)
+        2. evolve_from_state: Take cudaq.State, apply ONE Trotter step (no measurement)
+        3. Legacy krylov_circuit_*: Full from-scratch evolution + measurement (fallback)
 
-        NOTE: Angles are pre-computed outside the kernel (in _init_cudaq) and
-        passed as list[float]. CUDA-Q's JIT miscompiles `coeffs[i] * dt`
-        arithmetic inside kernels, so we pass final angles directly.
+        State-cached kernels (1+2) use cudaq.get_state() for state extraction,
+        then manual sampling from |ψ|². This reduces total Trotter applications
+        from O(k²) to O(k) by reusing cached intermediate states.
         """
         if self._cudaq_kernels_built:
             return
+
+        # --- State-cached kernels (no measurement, for get_state) ---
+
+        @cudaq.kernel
+        def init_hf_kernel(
+            num_qubits: int,
+            occ_qubits: list[int],
+        ):
+            """Prepare HF initial state (no evolution, no measurement)."""
+            qubits = cudaq.qvector(num_qubits)
+            for oq in range(len(occ_qubits)):
+                x(qubits[occ_qubits[oq]])
+
+        @cudaq.kernel
+        def init_neel_kernel(
+            num_qubits: int,
+        ):
+            """Prepare Neel initial state (no evolution, no measurement)."""
+            qubits = cudaq.qvector(num_qubits)
+            for qubit_index in range(num_qubits):
+                if qubit_index % 2 == 0:
+                    x(qubits[qubit_index])
+
+        @cudaq.kernel
+        def evolve_one_step(
+            state: cudaq.State,
+            trotter_steps: int,
+            H_pauli_words: list[cudaq.pauli_word],
+            angles: list[float],
+        ):
+            """Apply ONE Trotter step to an existing state (no measurement)."""
+            qubits = cudaq.qvector(state)
+            for _ in range(trotter_steps):
+                for i in range(len(angles)):
+                    exp_pauli(angles[i], qubits, H_pauli_words[i])
+
+        self._kernel_init_hf = init_hf_kernel
+        self._kernel_init_neel = init_neel_kernel
+        self._kernel_evolve_one_step = evolve_one_step
+
+        # --- Legacy kernels (full from-scratch, for fallback) ---
 
         @cudaq.kernel
         def krylov_circuit_hf(
@@ -770,22 +813,78 @@ class QuantumCircuitSKQD:
         self._kernel_neel = krylov_circuit_neel
         self._cudaq_kernels_built = True
 
+        # State cache for incremental evolution
+        self._cached_cudaq_states: Dict[int, Any] = {}
+
     def _sample_cudaq(self, krylov_power: int) -> Dict[str, int]:
         """
-        Sample from Krylov state U^k|psi_0> using CUDA-Q quantum circuit.
+        Sample from Krylov state U^k|ψ₀⟩ using CUDA-Q with state caching.
 
-        Follows the NVIDIA tutorial's quantum_krylov_evolution_circuit exactly.
-        Target and kernels are initialized once; only the random seed
-        changes per Krylov step.
+        State-cached approach (O(k) total Trotter steps instead of O(k²)):
+        1. k=0: get_state of initial state (HF/Neel, no evolution)
+        2. k>0: evolve cached state k-1 by ONE Trotter step via get_state
+        3. Sample from |ψ|² via torch.multinomial (same as Path C)
 
-        Uses pre-computed angles (from _init_cudaq) to avoid CUDA-Q JIT bug
-        with in-kernel list[float] arithmetic.
+        Falls back to legacy from-scratch sampling if get_state fails.
         """
         self._init_cudaq()
         self._build_cudaq_kernels()
 
         cudaq.set_random_seed(self.config.seed + krylov_power)
 
+        try:
+            return self._sample_cudaq_cached(krylov_power)
+        except Exception as e:
+            if krylov_power == 0:
+                print(f"  CUDA-Q state caching unavailable ({e}), "
+                      f"using legacy from-scratch sampling")
+            return self._sample_cudaq_legacy(krylov_power)
+
+    def _sample_cudaq_cached(self, krylov_power: int) -> Dict[str, int]:
+        """State-cached CUDA-Q: get_state → cache → manual sampling."""
+        if krylov_power == 0:
+            # Get initial state (no evolution)
+            if self.config.initial_state == "hf":
+                state = cudaq.get_state(
+                    self._kernel_init_hf,
+                    self.n_qubits,
+                    self._occupied_qubits,
+                )
+            else:
+                state = cudaq.get_state(
+                    self._kernel_init_neel,
+                    self.n_qubits,
+                )
+
+            if not hasattr(self, "_cudaq_cached_info_printed"):
+                self._cudaq_cached_info_printed = True
+                n_terms = len(self.pauli_coefficients)
+                dim = 2 ** self.n_qubits
+                print(f"  CUDA-Q state-cached mode ({n_terms} Pauli terms, "
+                      f"dim={dim:,}, 1 Trotter step/k)")
+        else:
+            # Evolve cached state by ONE Trotter step
+            prev_state = self._cached_cudaq_states[krylov_power - 1]
+            state = cudaq.get_state(
+                self._kernel_evolve_one_step,
+                prev_state,
+                self.config.num_trotter_steps,
+                self._pauli_words_cudaq,
+                self._exp_pauli_angles,
+            )
+
+        # Cache state for next step, evict previous
+        self._cached_cudaq_states[krylov_power] = state
+        if krylov_power > 0 and (krylov_power - 1) in self._cached_cudaq_states:
+            del self._cached_cudaq_states[krylov_power - 1]
+
+        # Convert cudaq.State → torch tensor → sample from |ψ|²
+        psi_np = np.array(state, dtype=np.complex128)
+        psi = torch.from_numpy(psi_np).to(self._device)
+        return self._sample_from_state(psi, krylov_power)
+
+    def _sample_cudaq_legacy(self, krylov_power: int) -> Dict[str, int]:
+        """Legacy from-scratch CUDA-Q sampling (O(k²) total, no state caching)."""
         if self.config.initial_state == "hf":
             result = cudaq.sample(
                 self._kernel_hf,
