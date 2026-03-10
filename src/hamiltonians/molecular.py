@@ -65,8 +65,8 @@ class MolecularHamiltonian(Hamiltonian):
 
         self.device = device
         self.integrals = integrals
-        self.h1e = torch.from_numpy(integrals.h1e).float().to(device)
-        self.h2e = torch.from_numpy(integrals.h2e).float().to(device)
+        self.h1e = torch.from_numpy(integrals.h1e).double().to(device)
+        self.h2e = torch.from_numpy(integrals.h2e).double().to(device)
         self.nuclear_repulsion = integrals.nuclear_repulsion
         self.n_orbitals = integrals.n_orbitals
         self.n_electrons = integrals.n_electrons
@@ -368,7 +368,7 @@ class MolecularHamiltonian(Hamiltonian):
         Returns:
             (batch_size,) diagonal energies
         """
-        configs = configs.to(self.device).float()
+        configs = configs.to(self.device).double()
         batch_size = configs.shape[0]
         n_orb = self.n_orbitals
 
@@ -378,7 +378,7 @@ class MolecularHamiltonian(Hamiltonian):
 
         # Nuclear repulsion
         energies = torch.full((batch_size,), self.nuclear_repulsion,
-                             device=self.device, dtype=torch.float32)
+                             device=self.device, dtype=torch.float64)
 
         # One-body: sum_p h_pp * (n_p^alpha + n_p^beta)
         energies += (n_alpha + n_beta) @ self.h1_diag
@@ -575,7 +575,7 @@ class MolecularHamiltonian(Hamiltonian):
 
         # Convert to torch tensors once at the end
         connected = torch.from_numpy(np.array(connected_list)).to(device)
-        elements = torch.tensor(elements_list, dtype=torch.float32, device=device)
+        elements = torch.tensor(elements_list, dtype=torch.float64, device=device)
 
         return connected, elements
 
@@ -1105,7 +1105,7 @@ class MolecularHamiltonian(Hamiltonian):
         configs = configs.to(self.device)
         n_configs = configs.shape[0]
 
-        H = torch.zeros(n_configs, n_configs, device=self.device)
+        H = torch.zeros(n_configs, n_configs, device=self.device, dtype=torch.float64)
 
         # Vectorized diagonal (already GPU-accelerated)
         H.diagonal().copy_(self.diagonal_elements_batch(configs))
@@ -1260,13 +1260,13 @@ class MolecularHamiltonian(Hamiltonian):
             return (
                 torch.tensor([], dtype=torch.long, device=device),
                 torch.tensor([], dtype=torch.long, device=device),
-                torch.tensor([], dtype=torch.float32, device=device),
+                torch.tensor([], dtype=torch.float64, device=device),
             )
 
         return (
             torch.tensor(all_rows, dtype=torch.long, device=device),
             torch.tensor(all_cols, dtype=torch.long, device=device),
-            torch.tensor(all_vals, dtype=torch.float32, device=device),
+            torch.tensor(all_vals, dtype=torch.float64, device=device),
         )
 
     def matrix_elements(
@@ -1291,7 +1291,7 @@ class MolecularHamiltonian(Hamiltonian):
         n_bra = configs_bra.shape[0]
         n_ket = configs_ket.shape[0]
 
-        H = torch.zeros(n_bra, n_ket, device=self.device)
+        H = torch.zeros(n_bra, n_ket, device=self.device, dtype=torch.float64)
 
         # Integer-encode bra configs for O(log n) lookup via searchsorted
         bra_ints = (configs_bra.long() * self._powers_gpu).sum(dim=1)
