@@ -1141,7 +1141,17 @@ class MolecularHamiltonian(Hamiltonian):
                 cols = cols[off_diag]
                 vals = vals[off_diag]
 
-                # Assign both triangles for Hermitian symmetry
+                # Keep only ONE canonical direction per pair (source < target)
+                # to avoid non-deterministic GPU last-write-wins when both
+                # directions (i→j and j→i) produce slightly different values
+                # due to floating-point JW sign/integral computation paths.
+                # Without this, eigenvalues can violate the variational principle.
+                lower = cols < rows
+                rows = rows[lower]
+                cols = cols[lower]
+                vals = vals[lower]
+
+                # Assign both triangles from the canonical direction
                 H[rows, cols] = vals
                 H[cols, rows] = vals
 
