@@ -1595,6 +1595,46 @@ class MolecularHamiltonian(Hamiltonian):
 
         return fci_E
 
+    def pyscf_fci_energy(self, conv_tol: float = 1e-10, max_cycle: int = 300) -> float:
+        """
+        Compute FCI energy using PySCF's iterative Davidson solver with OUR integrals.
+
+        Unlike compute_pyscf_fci() which runs a separate SCF (producing different
+        MO coefficients), this method passes self.h1e and self.h2e directly to
+        PySCF's fci.direct_spin1.kernel. This guarantees the variational bound:
+        any subspace projection using the same integrals will yield E >= E_FCI.
+
+        Works for ANY config space size (PySCF Davidson is iterative, no dense matrix).
+
+        Returns:
+            FCI ground state energy in Hartree
+        """
+        import time
+        from pyscf import fci
+
+        h1e_np = self.h1e.cpu().numpy().astype(np.float64)
+        h2e_np = self.h2e.cpu().numpy().astype(np.float64)
+
+        n_configs = 1
+        from math import comb
+        n_configs = comb(self.n_orbitals, self.n_alpha) * comb(self.n_orbitals, self.n_beta)
+        print(f"Computing FCI via PySCF Davidson with OUR integrals ({n_configs:,} configs)...")
+        start_time = time.time()
+
+        cisolver = fci.direct_spin1.FCI()
+        cisolver.conv_tol = conv_tol
+        cisolver.max_cycle = max_cycle
+
+        e_fci, _ = cisolver.kernel(
+            h1e_np, h2e_np, self.n_orbitals, (self.n_alpha, self.n_beta)
+        )
+        fci_E = float(e_fci) + self.nuclear_repulsion
+
+        elapsed = time.time() - start_time
+        print(f"PySCF FCI energy: {fci_E:.8f} Ha (computed in {elapsed:.1f}s)")
+
+        return fci_E
+
     def gpu_fci_energy(
         self, max_memory: int = 8000, conv_tol: float = 1e-10, max_cycle: int = 300
     ) -> float:

@@ -1,275 +1,304 @@
-# Flow-Guided Krylov Quantum Diagonalization
+# HF-State SKQD: Classical vs Quantum Krylov from Hartree-Fock
 
-A quantum chemistry pipeline for computing molecular ground-state energies by combining **Normalizing Flow-Assisted Neural Quantum States (NF-NQS)** with **Krylov subspace diagonalization**. The core idea: use a normalizing flow to discover high-probability Slater determinants, then diagonalize the Hamiltonian projected onto that basis to systematically converge toward FCI-level accuracy.
+Sample-Based Krylov Quantum Diagonalization (SKQD) for molecular ground-state energies, starting from the **Hartree-Fock (HF) determinant** as the initial state. Two solvers are provided:
 
-Three subspace solvers are available:
-- **Classical SKQD** -- Exact matrix exponential in particle-conserving subspace
-- **Quantum SKQD** -- Trotterized time evolution via CUDA-Q circuits or classical state-vector simulation
-- **SQD** -- IBM's sampling-based batch diagonalization with S-CORE config recovery
+- **Classical SKQD** -- Exact matrix exponential (`gpu_expm_multiply`) in the particle-conserving subspace
+- **Quantum SKQD** -- Trotterized time evolution (2nd-order Suzuki-Trotter) in the full 2^n Hilbert space, via CUDA-Q circuits or classical state-vector simulation
 
-The quantum SKQD implementation follows the paper by Yu et al. (arXiv:2501.09702) with paper-compliant hyperparameters: `dt = pi / spectral_range` (Epperly Theorem 3.1), Krylov dimension d=15, single second-order Suzuki-Trotter step per evolution, and 10^5 shots per Krylov state.
+Both solvers construct the same Krylov subspace:
+
+```
+|psi_k> = (e^{-i H dt})^k |HF>,    k = 0, 1, ..., d-1
+```
+
+then project the Hamiltonian onto the sampled basis and diagonalize to obtain the ground-state energy.
 
 ---
 
 ## Table of Contents
 
-- [Methodology](#methodology)
-- [Quantum vs Classical SKQD (Ablation Study)](#quantum-vs-classical-skqd-ablation-study)
-- [The 7 Ablation Pipelines](#the-7-ablation-pipelines)
+- [Algorithm](#algorithm)
 - [Available Molecular Systems](#available-molecular-systems)
-- [Quick Start](#quick-start)
-- [Installation](#installation)
-- [Running Examples](#running-examples)
-- [GPU Acceleration](#gpu-acceleration)
+- [Benchmark Results](#benchmark-results)
+- [Installation (Docker)](#installation-docker)
+- [Running the Code](#running-the-code)
+  - [Basic Usage](#basic-usage)
+  - [CLI Options](#cli-options)
+  - [Examples](#examples)
+- [Pipeline API](#pipeline-api)
+- [Classical vs Quantum SKQD](#classical-vs-quantum-skqd)
+- [Paper-Compliant Parameters](#paper-compliant-parameters)
 - [Architecture](#architecture)
+- [GPU Acceleration](#gpu-acceleration)
 - [Tech Stack](#tech-stack)
 - [References](#references)
 - [License](#license)
 
 ---
 
-## Methodology
+## Algorithm
 
-### 3-Stage Pipeline
+### Krylov Subspace Construction
+
+Starting from the Hartree-Fock determinant `|HF>`, SKQD applies time evolution to build a Krylov basis:
 
 ```
-Stage 1: Basis Generation
-  ├── Direct-CI: deterministic HF + singles + doubles (Slater-Condon rules)
-  ├── NF-NQS: particle-conserving flow (GumbelTopK) co-trained with NQS
-  └── Hybrid: NF-learned basis merged with Direct-CI essentials
-        |
-        v
-Stage 2: Diversity-Aware Selection
-  ├── Bucket configs by excitation rank (0=HF, 1=singles, 2=doubles, ...)
-  ├── DPP-greedy selection for diversity within each bucket
-  └── Essential configs (HF + singles + doubles) always preserved
-        |
-        v
-Stage 3: Subspace Diagonalization
-  ├── Classical SKQD: exact e^{-iHdt} in particle-conserving subspace
-  ├── Quantum SKQD: Trotterized evolution (CUDA-Q or state-vector)
-  └── SQD: noise injection -> S-CORE config recovery -> batch diag
+|psi_0> = |HF>
+|psi_1> = e^{-i H dt} |HF>
+|psi_2> = (e^{-i H dt})^2 |HF>
+  ...
+|psi_{d-1}> = (e^{-i H dt})^{d-1} |HF>
 ```
 
-**Stage 1 -- Basis Generation** supports three strategies. *Direct-CI* deterministically enumerates Hartree-Fock plus all single and double excitations using Slater-Condon rules. *NF-NQS* trains a particle-conserving normalizing flow (using the Gumbel-Top-K straight-through estimator to enforce exact electron count) co-trained with a neural quantum state to learn the ground-state distribution. *Hybrid* merges NF-discovered configurations with Direct-CI essentials for robustness.
+At each step k, the evolved state is measured in the computational basis (with `shots` samples). The union of all sampled configurations across all Krylov steps forms the **cumulative basis**. The Hamiltonian is then projected onto this basis via Slater-Condon rules and diagonalized.
 
-**Stage 2 -- Diversity-Aware Selection** applies excitation-rank stratification with a physics-informed budget:
+### Classical SKQD
 
-| Excitation Rank | Budget | Description |
-|-----------------|--------|-------------|
-| 0 | 5% | HF and near-HF configurations |
-| 1 | 25% | Single excitations |
-| 2 | 50% | Double excitations (dominant in ground state) |
-| 3 | 15% | Triple excitations |
-| 4+ | 5% | Higher excitations |
+Operates in the **particle-conserving subspace** (dimension = C(n_orb, n_alpha) x C(n_orb, n_beta)), which is 10-100x smaller than the full 2^n Hilbert space. Time evolution uses the **exact matrix exponential** via GPU-accelerated Lanczos (`gpu_expm_multiply`), so there is **no Trotter error**.
 
-Within each bucket, DPP-greedy selection maximizes `weight * hamming_distance` to ensure diversity (`min_hamming_distance=2`).
+### Quantum SKQD
 
-**Stage 3 -- Subspace Diagonalization** offers three solvers. *Classical SKQD* constructs a Krylov subspace via exact matrix exponential `|psi_k> = e^{-ikH*dt}|psi_0>` in the particle-conserving subspace, expanding the basis at each step. *Quantum SKQD* uses Trotterized time evolution (2nd-order Suzuki-Trotter) in the full 2^n Hilbert space, either via CUDA-Q quantum circuits (Path A) or classical state-vector simulation (Path B). *SQD* (from IBM's "Chemistry Beyond Exact Diagonalization") injects depolarizing noise, applies S-CORE configuration recovery, performs batch diagonalization with self-consistent orbital occupancy iteration, and extrapolates to zero variance.
+Operates in the **full 2^n Hilbert space**. The molecular Hamiltonian is transformed to Pauli form via **Jordan-Wigner mapping**. Time evolution uses **2nd-order Suzuki-Trotter decomposition**:
 
----
+```
+S_2(dt) = prod_j exp(-i c_j P_j dt/2) * prod_j exp(-i c_j P_j dt/2)  (reversed)
+```
 
-## Quantum vs Classical SKQD (Ablation Study)
+Three execution backends (auto-selected):
 
-The `examples/quantum_vs_classical_krylov.py` script provides a controlled 3-way comparison where **only the time evolution method changes** while all other variables remain identical:
-
-| Path | Time Evolution | Hilbert Space | Description |
-|------|---------------|---------------|-------------|
-| **Path C** (Classical) | Exact Lanczos `e^{-iHdt}` | Full 2^n | Gold standard, no Trotter error |
-| **Path B** (Trotterized) | Classical state-vector Trotter | Full 2^n | Isolates Trotter error |
-| **Path A** (CUDA-Q) | Quantum circuit Trotter | Full 2^n | Full quantum simulation |
-
-All three paths use identical hyperparameters via `QuantumCircuitSKQD`:
-- **Time step**: `dt = pi / spectral_range` (Epperly Theorem 3.1)
-- **Krylov dimension**: d=15 (paper default)
-- **Trotter steps**: 1 (single S_2(dt) per evolution, paper's `[S_2(dt)]^k`)
-- **Shots**: 10^5 per Krylov state
-- **Initial state**: Hartree-Fock
-- **Basis accumulation**: Cumulative union across all Krylov states
-
-### Benchmark Results (all 7 systems, STO-3G)
-
-| System | Qubits | Path C (mHa) | Path B (mHa) | Path A (mHa) |
-|--------|--------|-------------|-------------|-------------|
-| H2     | 4      | 0.0000      | 0.0000      | 0.0000      |
-| LiH    | 12     | 0.0074      | 0.0119      | 0.0099      |
-| H2O    | 14     | 0.0626      | 0.0478      | 0.0437      |
-| BeH2   | 14     | 0.0198      | 0.0160      | 0.0198      |
-| NH3    | 16     | 0.3234      | 0.4253      | 0.3599      |
-| CH4    | 18     | 0.5451      | skip        | 0.4986      |
-| N2     | 20     | 1.1427      | skip        | 1.1003      |
-
-All systems achieve chemical accuracy (< 1.594 mHa). Path B skips systems >= 18 qubits due to memory limits (phase table is n_terms x 2^n_qubits).
-
----
-
-## The 7 Ablation Pipelines
-
-The pipeline supports 7 experimental configurations spanning two ablation axes:
-
-| # | Pipeline | Basis Strategy | Solver | Workflow |
-|---|----------|---------------|--------|----------|
-| 1 | CudaQ SKQD | HF only | SKQD | HF reference state -> Krylov expansion |
-| 2 | Pure SKQD | Direct-CI (HF+S+D) | SKQD | HF + singles + doubles -> Krylov expansion |
-| 3 | Pure SQD | Direct-CI (HF+S+D) | SQD | HF + singles + doubles -> noise -> S-CORE -> batch diag |
-| 4 | NF-Trained SKQD | NF + Direct-CI | SKQD | NF training + HF+S+D -> Krylov |
-| 5 | NF-Trained SQD | NF + Direct-CI | SQD | NF training + HF+S+D -> noise -> S-CORE |
-| 6 | NF-only SKQD | NF only | SKQD | NF basis -> Krylov (no essential config injection) |
-| 7 | NF-only SQD | NF only | SQD | NF basis -> noise -> S-CORE (no essential config injection) |
-
-**Ablation Axis 1 -- HF-only vs Direct-CI:** Does pre-injecting singles and doubles help, or can Krylov discover them on its own? Compare CudaQ SKQD (#1) against Pure SKQD (#2).
-
-**Ablation Axis 2 -- NF+Direct-CI vs NF-only:** Does essential config injection help when the NF provides a learned basis? Compare pipelines #4/#5 against #6/#7.
+| Backend | Method | When Used |
+|---------|--------|-----------|
+| **Path A** (CUDA-Q) | `exp_pauli` quantum circuits | CUDA-Q installed + NVIDIA GPU |
+| **Path B** (State-Vector) | Classical Trotter on GPU | Small systems (< 18 qubits) |
+| **Path C** (Lanczos) | Exact `gpu_expm_multiply` | Fallback / large systems |
 
 ---
 
 ## Available Molecular Systems
 
-All factory functions use the **STO-3G** basis set. Reference energies are computed from FCI at runtime via PySCF.
+All factory functions use the **STO-3G** basis set. Reference energies are computed from FCI at runtime.
 
-| Factory Function | Molecule | Electrons | Orbitals | Qubits | Configs |
-|-----------------|----------|-----------|----------|--------|---------|
-| `create_h2_hamiltonian(bond_length=0.74)` | H2 | 2 | 2 | 4 | 4 |
-| `create_lih_hamiltonian(bond_length=1.6)` | LiH | 4 | 6 | 12 | 225 |
-| `create_h2o_hamiltonian()` | H2O | 10 | 7 | 14 | 441 |
-| `create_beh2_hamiltonian()` | BeH2 | 6 | 7 | 14 | 1,225 |
-| `create_nh3_hamiltonian()` | NH3 | 10 | 8 | 16 | 3,136 |
-| `create_ch4_hamiltonian()` | CH4 | 10 | 9 | 18 | 15,876 |
-| `create_n2_hamiltonian(bond_length=1.10)` | N2 | 14 | 10 | 20 | 14,400 |
-
-All small systems (up to 18 qubits) achieve exact FCI energy (0.0000 mHa error) in Direct-CI mode.
+| Key | Molecule | Electrons | Orbitals | Qubits | Configs |
+|-----|----------|-----------|----------|--------|---------|
+| `h2` | H2 | 2 | 2 | 4 | 4 |
+| `lih` | LiH | 4 | 6 | 12 | 225 |
+| `h2o` | H2O | 10 | 7 | 14 | 441 |
+| `beh2` | BeH2 | 6 | 7 | 14 | 1,225 |
+| `nh3` | NH3 | 10 | 8 | 16 | 3,136 |
+| `ch4` | CH4 | 10 | 9 | 18 | 15,876 |
+| `n2` | N2 | 14 | 10 | 20 | 14,400 |
 
 ---
 
-## Quick Start
+## Benchmark Results
+
+Tested via Docker on NVIDIA GPU (CUDA 12.1), with paper-compliant parameters: d=15, 10^5 shots, dt = pi/spectral_range.
+
+All results verified against FCI reference energies computed at runtime.
+
+| System | Qubits | FCI Energy (Ha) | Classical Error (mHa) | Classical Time | Quantum Error (mHa) | Quantum Time | Status |
+|--------|--------|-----------------|----------------------|----------------|---------------------|--------------|--------|
+| H2     | 4      | -1.13728383     | 0.0000               | 0.4s           | 0.0000              | 0.7s         | PASS   |
+| LiH    | 12     | -7.88232438     | 0.0049               | 1.1s           | 0.0022              | 5.3s         | PASS   |
+| H2O    | 14     | -75.01315470    | 0.0380               | 3.1s           | 0.0085              | 9.3s         | PASS   |
+| BeH2   | 14     | -15.59511756    | 0.0147               | 9.3s           | 0.0104              | 6.0s         | PASS   |
+
+**Chemical accuracy threshold: 1.594 mHa (1 kcal/mol). All 8/8 runs PASS.**
+
+Quantum SKQD uses CUDA-Q backend (Path A) with `exp_pauli` quantum circuits. Classical SKQD uses exact matrix exponential in the particle-conserving subspace.
+
+---
+
+## Installation (Docker)
+
+Docker provides a reproducible environment with all dependencies pre-installed (PyTorch, PySCF, CuPy, CUDA-Q).
+
+### Prerequisites
+
+- [Docker](https://docs.docker.com/get-docker/)
+- [Docker Compose](https://docs.docker.com/compose/install/)
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (for GPU support)
+
+### Setup
+
+```bash
+git clone https://github.com/George930502/Flow-Guided-Krylov.git
+cd Flow-Guided-Krylov
+git checkout hf-skqd-focused
+
+# Build the Docker image
+docker-compose build
+
+# Verify the image runs correctly
+docker-compose run --rm flow-krylov-gpu python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+```
+
+The Docker image (`pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime`) includes:
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| PyTorch | 2.2.0 + CUDA 12.1 | Neural networks + GPU linear algebra |
+| PySCF | >= 2.3 | Molecular integrals (SCF, FCI) |
+| CuPy | 13.x | GPU sparse eigensolvers, DLPack zero-copy |
+| CUDA-Q | latest | Quantum circuit simulation (`exp_pauli`) |
+| SciPy | >= 1.10 | CPU fallback eigensolvers |
+| NumPy | < 2 | Compatible with PyTorch 2.2.0 |
+
+---
+
+## Running the Code
+
+All commands use `docker-compose run --rm flow-krylov-gpu` as the prefix.
+
+### Basic Usage
+
+```bash
+# Run both classical and quantum SKQD on all 7 systems (H2 through N2)
+docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py
+
+# Run on specific systems
+docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --systems h2 lih h2o beh2
+
+# Classical SKQD only (faster, no Trotter overhead)
+docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --mode classical
+
+# Quantum SKQD only (Trotterized, uses CUDA-Q)
+docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --mode quantum
+```
+
+### CLI Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--systems` | all 7 | Space-separated list: `h2 lih h2o beh2 nh3 ch4 n2` |
+| `--mode` | `both` | `classical`, `quantum`, or `both` |
+| `--krylov-dim` | `15` | Maximum Krylov subspace dimension (paper: d=15) |
+| `--trotter-steps` | `1` | Trotter steps per evolution (quantum only, paper: 1) |
+| `--shots` | `100000` | Measurement shots per Krylov state (paper: 10^5) |
+
+### Examples
+
+```bash
+# Custom Krylov dimension
+docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --krylov-dim 10
+
+# Custom shots
+docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --shots 50000
+
+# Combine options: specific systems, quantum only, custom dim
+docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --systems h2 lih --mode quantum --krylov-dim 20
+
+# CPU-only (no GPU required)
+docker-compose run --rm flow-krylov-cpu python examples/hf_skqd_comparison.py --mode classical
+
+# Interactive shell inside Docker
+docker-compose run --rm shell
+# Then inside the container:
+python examples/hf_skqd_comparison.py --systems h2 lih
+```
+
+---
+
+## Pipeline API
+
+### Quick Start (inside Docker container)
 
 ```python
-from src.pipeline import FlowGuidedKrylovPipeline, PipelineConfig
-from src.hamiltonians.molecular import create_lih_hamiltonian
+from hamiltonians.molecular import create_lih_hamiltonian
+from krylov.skqd import SampleBasedKrylovDiagonalization, SKQDConfig
+from krylov.spectral_utils import compute_optimal_dt
 
-# Create molecular Hamiltonian
+# 1. Build Hamiltonian
 H = create_lih_hamiltonian(bond_length=1.6)
 
-# Run pipeline with SKQD solver in Direct-CI mode
+# 2. Compute optimal time step (Epperly Theorem 3.1)
+dt, spectral_range = compute_optimal_dt(H)
+
+# 3. Run classical SKQD from HF state
+config = SKQDConfig(max_krylov_dim=15, time_step=dt)
+solver = SampleBasedKrylovDiagonalization(H, config=config, initial_state=H.get_hf_state())
+results = solver.run()
+
+# 4. Check result
+fci = H.fci_energy()
+best = min(results["energies"])
+print(f"SKQD energy: {best:.8f} Ha")
+print(f"FCI energy:  {fci:.8f} Ha")
+print(f"Error:       {abs(best - fci) * 1000:.4f} mHa")
+```
+
+### Using the Quantum SKQD Solver Directly
+
+```python
+from hamiltonians.molecular import create_h2o_hamiltonian
+from krylov.quantum_skqd import QuantumCircuitSKQD, QuantumSKQDConfig
+from krylov.spectral_utils import compute_optimal_dt
+
+H = create_h2o_hamiltonian()
+dt, _ = compute_optimal_dt(H)
+
+config = QuantumSKQDConfig(
+    max_krylov_dim=15,
+    total_evolution_time=dt,
+    num_trotter_steps=1,
+    shots=100_000,
+    initial_state="hf",
+    backend="auto",  # auto-selects best available backend
+)
+
+solver = QuantumCircuitSKQD.from_molecular_hamiltonian(H, config=config)
+results = solver.run()
+
+print(f"Best energy: {results['best_energy']:.8f} Ha")
+print(f"Backend:     {results['backend']}")
+```
+
+### Using the Full Pipeline
+
+```python
+from pipeline import FlowGuidedKrylovPipeline, PipelineConfig
+from hamiltonians.molecular import create_lih_hamiltonian
+
+H = create_lih_hamiltonian(bond_length=1.6)
+
+# Classical SKQD via pipeline (Direct-CI mode skips NF training)
 config = PipelineConfig(subspace_mode="skqd", skip_nf_training=True)
 pipeline = FlowGuidedKrylovPipeline(H, config=config)
 results = pipeline.run()
 
-# Check results against FCI
-E_exact = H.fci_energy()
-print(f"Energy: {results['combined_energy']:.6f} Ha")
-print(f"Error:  {abs(results['combined_energy'] - E_exact) * 1000:.4f} mHa")
-```
-
-To use the SQD solver instead:
-
-```python
-config = PipelineConfig(subspace_mode="sqd", skip_nf_training=True)
-```
-
-To enable NF-NQS training (recommended for systems with >20 qubits):
-
-```python
-config = PipelineConfig(subspace_mode="skqd", skip_nf_training=False)
-```
-
-To run the 3-way quantum vs classical SKQD comparison:
-
-```python
-from examples.quantum_vs_classical_krylov import run_comparison
-
-results = run_comparison(systems=["h2", "lih"], max_krylov_dim=15, num_trotter_steps=1)
+print(f"Energy: {results['combined_energy']:.8f} Ha")
+print(f"FCI:    {H.fci_energy():.8f} Ha")
 ```
 
 ---
 
-## Installation
+## Classical vs Quantum SKQD
 
-### With uv (recommended)
-
-```bash
-git clone https://github.com/George930502/Flow-Guided-Krylov.git
-cd Flow-Guided-Krylov
-
-# Install core dependencies
-uv sync
-
-# Include GPU support (CuPy)
-uv sync --extra cuda
-
-# Include dev tools (pytest, black, ruff, mypy)
-uv sync --extra dev
-```
-
-### With pip
-
-```bash
-git clone https://github.com/George930502/Flow-Guided-Krylov.git
-cd Flow-Guided-Krylov
-
-pip install -e .
-
-# For GPU support
-pip install cupy-cuda12x>=12.0.0
-```
-
-### With Docker (GPU)
-
-```bash
-docker-compose build
-docker-compose run --rm flow-krylov-gpu
-```
+| Aspect | Classical SKQD | Quantum SKQD |
+|--------|---------------|--------------|
+| **Hilbert space** | Particle-conserving subspace | Full 2^n |
+| **Time evolution** | Exact matrix exponential (Lanczos) | 2nd-order Suzuki-Trotter |
+| **Trotter error** | None | O(dt^3) per step |
+| **Initial state** | HF determinant | HF determinant |
+| **Implementation** | `src/krylov/skqd.py` | `src/krylov/quantum_skqd.py` |
+| **GPU backend** | `gpu_expm_multiply` (PyTorch/CuPy) | CUDA-Q / CuPy / PyTorch |
+| **Memory scaling** | O(subspace_dim^2) | O(2^n) for state vector |
+| **Advantage** | Exact, fast for small systems | Mimics quantum hardware |
 
 ---
 
-## Running Examples
+## Paper-Compliant Parameters
 
-```bash
-# Validate all small systems (H2, LiH, H2O, BeH2, NH3, CH4)
-python examples/validate_small_systems.py
+All defaults follow Yu et al. (arXiv:2501.09702):
 
-# SKQD vs SQD side-by-side comparison
-python examples/subspace_comparison.py
-
-# 3-way quantum vs classical SKQD comparison (ablation study)
-python examples/quantum_vs_classical_krylov.py --systems h2 lih h2o beh2
-python examples/quantum_vs_classical_krylov.py --systems h2 lih --krylov-dim 15 --trotter-steps 1
-
-# Full 7-experiment ablation study
-python examples/nf_trained_comparison.py
-python examples/nf_trained_comparison.py --systems h2 lih h2o
-
-# Moderate system benchmarks (20-30 qubits)
-python examples/moderate_system_benchmark.py
-
-# Docker (GPU)
-docker-compose run --rm flow-krylov-gpu python examples/quantum_vs_classical_krylov.py --systems h2 lih
-docker-compose run --rm flow-krylov-gpu python examples/subspace_comparison.py
-docker-compose run --rm flow-krylov-gpu python examples/nf_trained_comparison.py
-```
-
----
-
-## GPU Acceleration
-
-The pipeline is designed for end-to-end GPU execution, from NF training through final diagonalization.
-
-- **Particle-conserving subspace**: operates in the electron-number subspace (10-100x smaller than the full Hilbert space)
-- **GPU Lanczos matrix exponential** (`gpu_expm_multiply`): Krylov time evolution without materializing the full matrix exponential
-- **GPU eigensolvers** (`gpu_eigsh`): dense `torch.linalg.eigh` for n <= 10K, CuPy sparse `eigsh` for larger subspaces
-- **DLPack zero-copy**: CuPy interop via `torch.from_dlpack()` / `cp.from_dlpack()` avoids GPU-to-CPU-to-GPU round-trips
-- **ConnectionCache**: GPU integer-encoded LRU cache prevents redundant Hamiltonian connection recomputation
-- **Vectorized Slater-Condon rules**: batch matrix element evaluation on GPU via `get_connections_vectorized_batch()`
-- **Searchsorted-based integer encoding**: O(n log n) configuration matching replaces O(n^2) Python dict lookups
-- **Batched config recovery**: SQD S-CORE uses `torch.multinomial` for vectorized orbital flipping
-- **Seeded GPU sampling**: deterministic `torch.Generator` with per-Krylov-step seeds for reproducibility
-- **Vectorized Lanczos projection**: single `coeffs @ V_matrix` matmul replaces Python loop
-- **Cached arange tensors**: avoids redundant `torch.arange` allocation in Trotter evolution
-- **Chunked S^2 matrix**: GPU-resident chunked computation bounds memory while avoiding CPU fallback
-- **Vectorized DPP selection**: greedy diversity selection inner loop fully on GPU
-- **TF32 matmul acceleration**: automatically enabled for CUDA matmul and cuDNN operations
-
-All GPU features degrade gracefully: CuPy falls back to SciPy, CUDA-Q falls back to classical NumPy sampling.
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| Time step dt | pi / spectral_range | Epperly Theorem 3.1 |
+| Krylov dimension d | 15 | Paper Fig. 1 (Ising simulation) |
+| Trotter decomposition | 2nd-order Suzuki-Trotter | Paper Section IV |
+| Trotter steps per evolution | 1 | Paper: `[S_2(dt)]^k` |
+| Shots per Krylov state | 100,000 | Paper Section V |
+| Basis accumulation | Cumulative union | Paper algorithm |
 
 ---
 
@@ -277,43 +306,63 @@ All GPU features degrade gracefully: CuPy falls back to SciPy, CUDA-Q falls back
 
 ```
 src/
-├── pipeline.py                        # PipelineConfig + FlowGuidedKrylovPipeline orchestrator
+├── pipeline.py                        # PipelineConfig + FlowGuidedKrylovPipeline
+├── hamiltonians/
+│   ├── base.py                        # Hamiltonian ABC
+│   ├── molecular.py                   # MolecularHamiltonian (PySCF, Slater-Condon)
+│   └── pauli_mapping.py               # Jordan-Wigner (molecular -> Pauli strings)
+├── krylov/
+│   ├── skqd.py                        # Classical SKQD (exact exp in subspace)
+│   ├── quantum_skqd.py                # Quantum SKQD (Trotter in full 2^n)
+│   ├── sqd.py                         # SQD solver (IBM paper, batch diag)
+│   ├── basis_sampler.py               # CUDA-Q / classical Krylov sampling
+│   └── spectral_utils.py              # compute_optimal_dt (pi / spectral_range)
 ├── flows/
 │   ├── particle_conserving_flow.py    # NF with exact electron count (GumbelTopK)
 │   └── physics_guided_training.py     # Co-trains NF + NQS
 ├── nqs/
 │   ├── base.py                        # NeuralQuantumState ABC
 │   └── dense.py                       # DenseNQS, SignedDenseNQS
-├── hamiltonians/
-│   ├── base.py                        # Hamiltonian ABC (diagonal_element, get_connections)
-│   ├── molecular.py                   # MolecularHamiltonian (PySCF integrals, Slater-Condon)
-│   └── pauli_mapping.py              # Jordan-Wigner transformation (molecular -> Pauli strings)
-├── krylov/
-│   ├── skqd.py                        # Classical SKQD solver (exact matrix exponential)
-│   ├── quantum_skqd.py               # Quantum SKQD (CUDA-Q + classical Trotter)
-│   ├── sqd.py                         # SQD solver (IBM paper algorithm)
-│   ├── basis_sampler.py              # CUDA-Q / classical Krylov sampling
-│   └── spectral_utils.py            # Shared compute_optimal_dt (pi / spectral_range)
 ├── postprocessing/
 │   ├── diversity_selection.py         # DPP-greedy diversity selection
 │   ├── projected_hamiltonian.py       # H_ij = <x_i|H|x_j> construction
-│   ├── eigensolver.py                 # Davidson / sparse eigsh / adaptive selection
+│   ├── eigensolver.py                 # Davidson / sparse eigsh / adaptive
 │   └── utils.py
 └── utils/
     ├── gpu_linalg.py                  # gpu_eigh, gpu_eigsh, gpu_expm_multiply
+    ├── gpu_fci.py                     # GPU FCI via gpu4pyscf (optional)
     └── connection_cache.py            # GPU-accelerated Hamiltonian connection cache
+
+examples/
+├── hf_skqd_comparison.py             # ** Main script: Classical vs Quantum SKQD from HF **
+├── quantum_vs_classical_krylov.py    # 3-way comparison (Paths A/B/C)
+├── subspace_comparison.py            # SKQD vs SQD side-by-side
+├── validate_small_systems.py         # Small system validation
+└── moderate_system_benchmark.py      # 20-30 qubit systems
 ```
 
 ### Key Classes
 
-- **`PipelineConfig`** -- Master dataclass controlling the entire pipeline. Key fields: `subspace_mode` (`"skqd"` or `"sqd"`), `skip_nf_training` (enables Direct-CI mode), `auto_time_step` (computes `dt = pi / spectral_range` from Epperly Theorem 3.1). Paper-compliant defaults: `max_krylov_dim=15`, `quantum_num_trotter_steps=1`, `shots_per_krylov=100000`.
-- **`FlowGuidedKrylovPipeline`** -- Orchestrator that executes all 3 stages via `.run()`.
-- **`MolecularHamiltonian`** -- Second-quantized electronic Hamiltonian from PySCF one- and two-electron integrals. Implements Slater-Condon rules for matrix element evaluation.
-- **`ParticleConservingFlowSampler`** -- Normalizing flow that always produces configurations with exactly `n_alpha + n_beta` electrons via Gumbel-Top-K differentiable sampling.
-- **`SampleBasedKrylovDiagonalization`** -- Classical SKQD solver. Constructs Krylov subspace via exact time evolution in the particle-conserving subspace. Seeded RNG for reproducibility. `max_diag_basis_size=15000` caps dense diagonalization to prevent OOM.
-- **`QuantumCircuitSKQD`** -- Quantum SKQD solver. 3 backends: CUDA-Q circuits (Path A), classical state-vector Trotter (Path B), exact Lanczos (Path C). Jordan-Wigner transformation via `pauli_mapping.py`.
-- **`SQDSolver`** -- IBM SQD implementation. Two sub-modes: SQD-Clean (`noise_rate=0`, default) and SQD-Recovery (`noise_rate>0`, injects depolarizing noise then runs S-CORE configuration recovery).
-- **`PhysicsGuidedFlowTrainer`** -- Co-trains NF + NQS with cross-entropy loss weighted by `|E|`.
+- **`SampleBasedKrylovDiagonalization`** (`src/krylov/skqd.py`) -- Classical SKQD solver. Builds Krylov subspace via exact time evolution in the particle-conserving subspace. Starts from HF state by default.
+- **`QuantumCircuitSKQD`** (`src/krylov/quantum_skqd.py`) -- Quantum SKQD solver. Jordan-Wigner + Trotterized evolution. Three backends: CUDA-Q (Path A), state-vector (Path B), Lanczos (Path C).
+- **`MolecularHamiltonian`** (`src/hamiltonians/molecular.py`) -- Second-quantized Hamiltonian from PySCF. Factory functions: `create_h2_hamiltonian()`, ..., `create_n2_hamiltonian()`.
+- **`SKQDConfig`** / **`QuantumSKQDConfig`** -- Configuration dataclasses with paper-compliant defaults.
+- **`compute_optimal_dt()`** (`src/krylov/spectral_utils.py`) -- Computes `dt = pi / spectral_range` (Epperly Theorem 3.1).
+
+---
+
+## GPU Acceleration
+
+The pipeline is designed for end-to-end GPU execution:
+
+- **GPU Lanczos matrix exponential** (`gpu_expm_multiply`): Krylov time evolution without materializing the full matrix
+- **GPU eigensolvers** (`gpu_eigsh`): dense `torch.linalg.eigh` for n <= 10K, CuPy sparse for larger
+- **DLPack zero-copy**: CuPy interop via `cp.from_dlpack()` avoids GPU-CPU round-trips
+- **Fused CUDA kernel**: CuPy kernel for Pauli matrix-vector products (quantum SKQD)
+- **ConnectionCache**: GPU integer-encoded LRU cache for Hamiltonian connections
+- **Vectorized Slater-Condon rules**: batch matrix element evaluation on GPU
+
+All GPU features degrade gracefully to CPU (CuPy -> SciPy, CUDA-Q -> classical NumPy).
 
 ---
 
@@ -322,15 +371,10 @@ src/
 | Component | Technology |
 |-----------|------------|
 | Language | Python 3.10+ |
-| Package Manager | uv (hatchling build) |
-| Neural Networks | PyTorch >= 2.0 |
+| Neural Networks | PyTorch 2.2.0 |
 | Molecular Integrals | PySCF >= 2.3 |
 | Eigensolvers | SciPy (CPU) / CuPy (GPU) |
 | Quantum Circuits | CUDA-Q (optional, graceful fallback) |
-| Formatting | black (line-length 100) |
-| Linting | ruff (line-length 100) |
-| Type Checking | mypy |
-| Testing | pytest |
 | Containerization | Docker (pytorch/pytorch:2.2.0-cuda12.1) |
 
 ---
@@ -339,9 +383,8 @@ src/
 
 1. Yu, Robledo-Moreno et al., "Sample-based Krylov Quantum Diagonalization" ([arXiv:2501.09702](https://arxiv.org/abs/2501.09702))
 2. Robledo-Moreno, Motta et al., "Chemistry Beyond the Scale of Exact Diagonalization", *Science* 2024
-3. "Improved Ground State Estimation via Normalising Flow-Assisted Neural Quantum States" ([arXiv:2506.12128](https://arxiv.org/abs/2506.12128))
+3. Epperly et al., Theorem 3.1: optimal Krylov time step `dt = pi / spectral_range`
 4. NVIDIA CUDA-Q SKQD Tutorial (Heisenberg model, Trotterized evolution)
-5. Epperly et al., Theorem 3.1: optimal Krylov time step `dt = pi / spectral_range`
 
 ---
 

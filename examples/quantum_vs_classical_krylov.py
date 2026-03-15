@@ -330,7 +330,6 @@ def _get_molecule_data(system_key: str):
         create_h2s_molecule,
         create_c2h4_molecule,
         create_nh3_631g_molecule,
-        compute_pyscf_fci,
     )
 
     factory_map = {
@@ -430,13 +429,12 @@ def run_comparison(
 
     # --- Reference energy hierarchy ---
     # CRITICAL: The reference MUST use the SAME integrals as the projected
-    # Hamiltonian. Using a separate PySCF FCI run (compute_pyscf_fci) creates
-    # a fresh SCF with potentially different MO coefficients, causing the
-    # projected energy to appear below FCI (variational principle violation).
+    # Hamiltonian. All tiers now use H's own h1e/h2e integrals to guarantee
+    # the variational bound (E_projected >= E_FCI).
     #
-    # Tier 1: H.fci_energy() — uses SAME matrix_elements() as pipeline (guaranteed
-    #         variational). Feasible for ≤200K configs (sparse eigsh).
-    # Tier 2: PySCF Davidson fallback for very large systems (>200K configs)
+    # Tier 1: H.fci_energy() — dense matrix diag, feasible for ≤20K configs
+    # Tier 2: H.pyscf_fci_energy() — PySCF iterative Davidson with OUR integrals
+    #         (works for any config space size, guaranteed variational bound)
     # Tier 3: CCSD(T) fallback (NOT variational)
 
     # H.fci_energy() builds a dense n×n matrix → memory ~ n²×8 bytes.
@@ -452,19 +450,17 @@ def run_comparison(
         except Exception as e:
             print(f"  H.fci_energy() failed: {e}")
 
-    if ref_energy is None and geometry is not None and n_configs <= 15_000_000:
-        # Tier 2: PySCF Davidson — separate SCF, may not be variational bound
-        # for projected Hamiltonian (different integrals)
+    if ref_energy is None:
+        # Tier 2: H.pyscf_fci_energy() — PySCF Davidson with OUR h1e/h2e integrals
+        # Iterative solver, no dense matrix needed. Guaranteed variational bound.
         try:
-            from moderate_system_benchmark import compute_pyscf_fci
-            print(f"  Computing FCI via PySCF Davidson ({n_configs:,} configs)...")
+            print(f"  Computing FCI via PySCF Davidson with Hamiltonian integrals...")
             t0 = time.time()
-            ref_energy = compute_pyscf_fci(geometry, basis)
+            ref_energy = H.pyscf_fci_energy()
             ref_type = "FCI"
             print(f"  FCI energy: {ref_energy:.8f} Ha ({time.time() - t0:.1f}s)")
-            print(f"  WARNING: PySCF FCI uses separate SCF — variational bound not guaranteed")
         except Exception as e:
-            print(f"  PySCF FCI failed: {e}")
+            print(f"  H.pyscf_fci_energy() failed: {e}")
 
     if ref_energy is None:
         # Tier 3: CCSD(T) fallback
