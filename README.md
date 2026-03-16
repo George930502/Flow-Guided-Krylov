@@ -20,9 +20,12 @@ then project the Hamiltonian onto the sampled basis and diagonalize to obtain th
 - [Algorithm](#algorithm)
 - [Available Molecular Systems](#available-molecular-systems)
 - [Benchmark Results](#benchmark-results)
-- [Installation (Docker)](#installation-docker)
+- [Installation](#installation)
+  - [Option A: uv (Local / WSL)](#option-a-uv-local--wsl)
+  - [Option B: Docker (GPU)](#option-b-docker-gpu)
 - [Running the Code](#running-the-code)
-  - [Basic Usage](#basic-usage)
+  - [With uv (local / WSL)](#with-uv-local--wsl)
+  - [With Docker (GPU)](#with-docker-gpu)
   - [CLI Options](#cli-options)
   - [Examples](#examples)
 - [Pipeline API](#pipeline-api)
@@ -109,17 +112,53 @@ Quantum SKQD uses CUDA-Q backend (Path A) with `exp_pauli` quantum circuits. Cla
 
 ---
 
-## Installation (Docker)
+## Installation
+
+Two installation methods are available: **uv** (lightweight, recommended for local development) and **Docker** (fully reproducible GPU environment).
+
+### Option A: uv (Local / WSL)
+
+[uv](https://docs.astral.sh/uv/) manages the Python version, virtual environment, and all dependencies from `pyproject.toml` in a single command. PySCF requires a Linux environment, so **WSL** (Windows Subsystem for Linux) is needed on Windows.
+
+#### Prerequisites
+
+- Linux or WSL (Ubuntu recommended) -- PySCF does not install on native Windows
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+
+#### Setup
+
+```bash
+git clone https://github.com/George930502/Flow-Guided-Krylov.git
+cd Flow-Guided-Krylov
+git checkout hf-skqd-focused
+
+# Install all dependencies (creates .venv automatically)
+uv sync
+
+# Verify
+uv run python -c "import torch, pyscf; print(f'PyTorch {torch.__version__}, PySCF {pyscf.__version__}')"
+```
+
+> **Note (Windows users):** Run the above commands inside WSL, not PowerShell. The project directory can be on the Windows filesystem (`/mnt/c/...`) -- uv handles cross-filesystem installs automatically (first install may be slow due to file copies).
+
+#### Optional extras
+
+```bash
+uv sync --extra dev     # pytest, black, ruff, mypy
+uv sync --extra cuda    # CuPy + CUDA-Q (requires NVIDIA GPU + CUDA toolkit)
+```
+
+### Option B: Docker (GPU)
 
 Docker provides a reproducible environment with all dependencies pre-installed (PyTorch, PySCF, CuPy, CUDA-Q).
 
-### Prerequisites
+#### Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/)
 - [Docker Compose](https://docs.docker.com/compose/install/)
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (for GPU support)
 
-### Setup
+#### Setup
 
 ```bash
 git clone https://github.com/George930502/Flow-Guided-Krylov.git
@@ -148,18 +187,32 @@ The Docker image (`pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime`) includes:
 
 ## Running the Code
 
-All commands use `docker-compose run --rm flow-krylov-gpu` as the prefix.
-
-### Basic Usage
+### With uv (local / WSL)
 
 ```bash
 # Run both classical and quantum SKQD on all 7 systems (H2 through N2)
+uv run python examples/hf_skqd_comparison.py
+
+# Run on specific systems
+uv run python examples/hf_skqd_comparison.py --systems h2 lih h2o beh2
+
+# Classical SKQD only (faster, no Trotter overhead)
+uv run python examples/hf_skqd_comparison.py --mode classical
+
+# Quantum SKQD only (Trotterized, uses CUDA-Q if installed)
+uv run python examples/hf_skqd_comparison.py --mode quantum
+```
+
+### With Docker (GPU)
+
+```bash
+# Run both classical and quantum SKQD on all 7 systems
 docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py
 
 # Run on specific systems
 docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --systems h2 lih h2o beh2
 
-# Classical SKQD only (faster, no Trotter overhead)
+# Classical SKQD only
 docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --mode classical
 
 # Quantum SKQD only (Trotterized, uses CUDA-Q)
@@ -180,20 +233,19 @@ docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --
 
 ```bash
 # Custom Krylov dimension
-docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --krylov-dim 10
+uv run python examples/hf_skqd_comparison.py --krylov-dim 10
 
 # Custom shots
-docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --shots 50000
+uv run python examples/hf_skqd_comparison.py --shots 50000
 
 # Combine options: specific systems, quantum only, custom dim
-docker-compose run --rm flow-krylov-gpu python examples/hf_skqd_comparison.py --systems h2 lih --mode quantum --krylov-dim 20
+uv run python examples/hf_skqd_comparison.py --systems h2 lih --mode quantum --krylov-dim 20
 
-# CPU-only (no GPU required)
+# Docker: CPU-only (no GPU required)
 docker-compose run --rm flow-krylov-cpu python examples/hf_skqd_comparison.py --mode classical
 
-# Interactive shell inside Docker
+# Docker: Interactive shell
 docker-compose run --rm shell
-# Then inside the container:
 python examples/hf_skqd_comparison.py --systems h2 lih
 ```
 
