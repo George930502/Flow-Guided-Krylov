@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "nqs-sqd"
+version = "0.1.0"
+description = "NQS-SQD: Classical NF vs Quantum Circuit Configuration Samplers for Molecular Ground State Energy"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pyscf>=2.4",
+    "numba>=0.58",
+    "tqdm",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+quantum = [
+    "qiskit>=1.0",
+    "ffsim",
+    "qiskit-addon-sqd",
+]
+cuda = [
+    "cupy-cuda12x",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

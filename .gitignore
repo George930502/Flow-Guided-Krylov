@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+dist/
+build/
+*.log
+*.err
+*.slurm.bak
+results/*.json
+results/*.csv
+.cache/
+*.swp
+*.swo
