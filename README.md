@@ -233,6 +233,19 @@ All results within **chemical accuracy** (< 1.6 mHa).
 
 HI+NQS+SQD achieves **lower energy** than both CCSD(T) and SCI for large molecules.
 
+### Classical Expansion Study (C2H4, 28 qubits)
+
+Effect of adding singles/doubles excitations from top-amplitude configurations:
+
+| Variant | Energy (Ha) | vs SCI (mHa) | Time |
+|---------|-------------|-------------|------|
+| SCI (CIPSI, PT2) | -77.2351408123 | 0.000 | 744s |
+| HI+NQS+SQD (no expansion) | -77.2352813675 | **-0.141** | 485s |
+| HI+NQS+SQD + expansion (no PT2) | -77.2352926820 | **-0.152** | 462s |
+| HI+NQS+SQD + expansion (with PT2) | -77.2353131332 | **-0.172** | 895s |
+
+All HI+NQS+SQD variants achieve **lower energy than SCI**. Adding classical expansion improves accuracy further, with PT2 selection giving the best result at the cost of more computation time.
+
 ### HI+NQS+SQD vs HI-VQE (quantum circuit)
 
 | Molecule | Qubits | HI-VQE err (mHa) | HI+NQS+SQD err (mHa) |
