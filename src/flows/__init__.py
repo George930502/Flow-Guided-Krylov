@@ -1,6 +1,10 @@
-"""Normalizing Flow models for importance sampling."""
+"""Normalizing Flow models for molecular configuration sampling."""
 
-from .discrete_flow import DiscreteFlowSampler
-from .training import FlowNQSTrainer, TrainingConfig
+from .particle_conserving_flow import ParticleConservingFlowSampler
+from .training import PhysicsGuidedConfig, PhysicsGuidedFlowTrainer
 
-__all__ = ["DiscreteFlowSampler", "FlowNQSTrainer", "TrainingConfig"]
+__all__ = [
+    "ParticleConservingFlowSampler",
+    "PhysicsGuidedFlowTrainer",
+    "PhysicsGuidedConfig",
+]

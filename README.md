@@ -1,230 +1,361 @@
-# Flow-Guided Krylov Quantum Diagonalization
+# HI+NQS+SQD: Neural Quantum State Sampling for Sample-based Quantum Diagonalization
 
-A hybrid quantum-classical algorithm for computing ground state energies of molecular systems with **chemical accuracy** (< 1 kcal/mol). This pipeline combines [Normalizing Flow-Assisted Neural Quantum States (NF-NQS)](https://arxiv.org/abs/2506.12128) for discovering important quantum states with [Sample-Based Krylov Quantum Diagonalization (SKQD)](https://arxiv.org/abs/2501.09702) for energy refinement, using the [Gumbel-Top-K trick](https://arxiv.org/pdf/1903.06059) for particle-conserving sampling.
+A classical analog of IBM's HI-VQE algorithm, replacing quantum circuits with autoregressive Neural Quantum States (NQS) for sample-based quantum diagonalization.
 
-## Pipeline Overview
+## Method Overview
 
-The algorithm runs in four stages:
+**HI+NQS+SQD** (Handover Iterative NQS + Sample-based Quantum Diagonalization) is a self-consistent loop where an autoregressive Transformer NQS and IBM's SQD solver improve each other iteratively.
+
+### Algorithm Flowchart
 
 ```
-Stage 1: Physics-Guided NF-NQS Training
-    │   Train particle-conserving normalizing flow with NQS
-    │   Mixed objective: teacher + physics + entropy
-    ▼
-Stage 2: Diversity-Aware Basis Extraction
-    │   Select configurations by excitation rank (singles, doubles, etc.)
-    │   DPP-inspired selection for maximum diversity
-    ▼
-Stage 3: Residual-Based Expansion (Selected-CI Style)
-    │   Iteratively add missing important configurations
-    │   PT2 importance estimation: ε = |⟨x|H|Φ⟩|² / |E - Eₓ|
-    │   Early stopping when energy converges
-    ▼
-Stage 4: SKQD Refinement
-        Krylov subspace diagonalization for final energy
+┌─────────────────────────────────────────────────────────────────┐
+│                      HI+NQS+SQD Algorithm                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────┐                                           │
+│  │  Initialize NQS   │  Autoregressive Transformer              │
+│  │  (random weights) │  on GPU (CUDA)                           │
+│  └────────┬─────────┘                                           │
+│           │                                                     │
+│           ▼                                                     │
+│  ┌─────────────────────────────────────────────────────┐        │
+│  │  ① NQS Sampling (GPU)                               │        │
+│  │                                                     │        │
+│  │  For each orbital i = 1, ..., N:                    │        │
+│  │    P(σᵢ | σ₁,...,σᵢ₋₁) via causal self-attention   │        │
+│  │    Sample σᵢ ∈ {0,1} with particle number constraint│        │
+│  │                                                     │        │
+│  │  → n_samples configurations (all valid)             │        │
+│  └────────┬────────────────────────────────────────────┘        │
+│           │                                                     │
+│           ▼                                                     │
+│  ┌─────────────────────────────────────────────────────┐        │
+│  │  ② Cumulative Basis Update                          │        │
+│  │                                                     │        │
+│  │  - Deduplicate new configs against existing basis    │        │
+│  │  - Add truly new configs to cumulative set           │        │
+│  │  - (Optional) Classical expansion: add singles/      │        │
+│  │    doubles excitations from top-amplitude configs    │        │
+│  └────────┬────────────────────────────────────────────┘        │
+│           │                                                     │
+│           ▼                                                     │
+│  ┌─────────────────────────────────────────────────────┐        │
+│  │  ③ SQD Diagonalization (IBM qiskit-addon-sqd)       │        │
+│  │                                                     │        │
+│  │  - Configuration recovery (fix particle number)      │        │
+│  │  - solve_fermion(bitstrings, h1e, h2e)              │        │
+│  │    → Projects H into subspace of sampled configs     │        │
+│  │    → PySCF selected CI kernel diagonalizes           │        │
+│  │  - Returns: E₀, orbital occupancies                  │        │
+│  └────────┬────────────────────────────────────────────┘        │
+│           │                                                     │
+│           ▼                                                     │
+│  ┌─────────────────────────────────────────────────────┐        │
+│  │  ④ NQS Update (GPU backpropagation)                 │        │
+│  │                                                     │        │
+│  │  Loss = λ_wf × (-Σ wᵢ log p_NQS(xᵢ))              │        │
+│  │       + λ_E  × (Σ wᵢ (Hᵢᵢ-E₀) log p_NQS(xᵢ))     │        │
+│  │       + λ_ent × mean(log p_NQS)                     │        │
+│  │                                                     │        │
+│  │  where wᵢ = softmax(-(Hᵢᵢ - E₀))                   │        │
+│  │                                                     │        │
+│  │  Mini-batch gradient descent (avoid GPU OOM)         │        │
+│  └────────┬────────────────────────────────────────────┘        │
+│           │                                                     │
+│           ▼                                                     │
+│  ┌─────────────────────────────────────────────────────┐        │
+│  │  ⑤ Convergence Check                                │        │
+│  │                                                     │        │
+│  │  If |ΔE| < 10⁻⁶ for 3 consecutive iterations:      │        │
+│  │    → CONVERGED, return best energy                   │        │
+│  │  Else:                                              │        │
+│  │    → Back to ① with updated NQS                     │        │
+│  └─────────────────────────────────────────────────────┘        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Key Features
+### Comparison: HI-VQE vs HI+NQS+SQD
 
-- **Chemical Accuracy**: Achieves < 1 kcal/mol error on H₂, LiH, H₂O, and larger molecules
-- **Particle Conservation**: Gumbel-Top-K sampling guarantees correct electron count
-- **Physics-Guided Training**: Energy importance weighting for faster convergence
-- **Adaptive Scaling**: Automatic parameter adjustment based on system size
-- **Early Stopping**: Stops residual expansion when energy improvement stagnates
-- **GPU Accelerated**: Full CUDA support with vectorized operations
+```
+┌─────────────────────────────┐     ┌─────────────────────────────┐
+│        HI-VQE (IBM)         │     │      HI+NQS+SQD (Ours)     │
+├─────────────────────────────┤     ├─────────────────────────────┤
+│                             │     │                             │
+│  Quantum Circuit U(θ)|HF⟩   │     │  Transformer NQS p_θ(x)    │
+│  (CUDA-Q UCCSD)            │     │  (Autoregressive, GPU)      │
+│         │                   │     │         │                   │
+│         ▼                   │     │         ▼                   │
+│  Measure → bitstrings       │     │  Sample → configurations    │
+│         │                   │     │         │                   │
+│         ▼                   │     │         ▼                   │
+│  ┌─────────────────────┐   │     │  ┌─────────────────────┐   │
+│  │  IBM solve_fermion  │   │     │  │  IBM solve_fermion  │   │
+│  │  (qiskit-addon-sqd) │   │     │  │  (qiskit-addon-sqd) │   │
+│  └──────────┬──────────┘   │     │  └──────────┬──────────┘   │
+│             │               │     │             │               │
+│             ▼               │     │             ▼               │
+│  COBYLA/SPSA updates θ     │     │  Backprop updates θ         │
+│  (noisy, ~3 evals/step)   │     │  (exact gradients, fast)    │
+│             │               │     │             │               │
+│             ▼               │     │             ▼               │
+│  Repeat until convergence   │     │  Repeat until convergence   │
+│                             │     │                             │
+│  Requires: quantum hardware │     │  Requires: GPU only         │
+└─────────────────────────────┘     └─────────────────────────────┘
+```
 
-## Molecular Benchmark Results
+### NQS Architecture: Autoregressive Transformer
 
-| Molecule | Qubits | Valid Configs | Error (mHa) | Error (kcal/mol) | Status |
-|----------|--------|---------------|-------------|------------------|--------|
-| H₂       | 4      | 4             | < 0.01      | < 0.01           | **PASS** |
-| LiH      | 12     | 225           | < 0.5       | < 0.3            | **PASS** |
-| H₂O      | 14     | 441           | < 0.5       | < 0.3            | **PASS** |
-| BeH₂     | 14     | 1,225         | < 1.0       | < 0.6            | **PASS** |
-| NH₃      | 16     | 3,136         | < 5.0       | < 3.1            | In progress |
-| N₂       | 20     | 14,400        | < 10.0      | < 6.3            | In progress |
+```
+Configuration: [α₁, α₂, ..., αₙ, β₁, β₂, ..., βₙ]
 
-**Chemical accuracy threshold: 1.6 mHa (1 kcal/mol)**
+Alpha channel (causal self-attention):
+  P(α₁)
+  P(α₂ | α₁)              ← each orbital sees all previous
+  P(α₃ | α₁, α₂)
+  ...
+  P(αₙ | α₁, ..., αₙ₋₁)
+
+Beta channel (causal self-attention + cross-attention to alpha):
+  P(β₁ | α₁, ..., αₙ)     ← sees full alpha configuration
+  P(β₂ | β₁, α₁, ..., αₙ)
+  ...
+  P(βₙ | β₁, ..., βₙ₋₁, α₁, ..., αₙ)
+
+┌──────────────────────────────────────────────────────────┐
+│  Transformer Block (× N_layers)                          │
+│  ┌────────────────────┐  ┌─────────────────────────────┐ │
+│  │  Alpha:             │  │  Beta:                      │ │
+│  │  Causal Self-Attn   │  │  Causal Self-Attn           │ │
+│  │  + LayerNorm        │  │  + Cross-Attn (to Alpha)    │ │
+│  │  + FFN              │  │  + LayerNorm + FFN          │ │
+│  └────────────────────┘  └─────────────────────────────┘ │
+└──────────────────────────────────────────────────────────┘
+
+Auto-scaling by system size:
+  ≤10Q:  embed=64,  heads=4, layers=3
+  12-14Q: embed=128, heads=4, layers=4
+  16-20Q: embed=128, heads=8, layers=6
+  22-30Q: embed=192, heads=8, layers=6
+  32-40Q: embed=256, heads=8, layers=8
+  42Q+:   embed=256, heads=8, layers=10
+```
+
+### Key Differences from HI-VQE
+
+| | HI-VQE (IBM) | HI+NQS+SQD (Ours) |
+|--|--------------|---------------------|
+| Sampler | Quantum circuit (UCCSD) | Autoregressive Transformer NQS |
+| Hardware | Quantum computer | Classical GPU (H200) |
+| Parameter update | SPSA/COBYLA (noisy gradients) | Backpropagation (exact gradients) |
+| Particle conservation | Post-selection or EPA gates | Constrained autoregressive sampling |
+| SQD backend | qiskit-addon-sqd | qiskit-addon-sqd (same) |
+| Sampling diversity | Limited by circuit depth | Autoregressive gives high diversity |
+
+## Benchmark Design
+
+We systematically compare **6 methods** across 11 molecules (12-30 qubits):
+
+### Methods Tested
+
+```
+Classical (NQS-based):              Quantum (circuit-based):
+┌──────────────────────┐            ┌──────────────────────┐
+│ NQS+SQD              │            │ QC+SQD               │
+│ (two-stage, no       │            │ (CUDA-Q UCCSD +      │
+│  feedback)            │            │  IBM SQD, one-shot)  │
+├──────────────────────┤            ├──────────────────────┤
+│ NQS+SKQD             │            │ QC+SKQD              │
+│ (two-stage, Krylov   │            │ (Trotter evolution + │
+│  expansion)           │            │  Krylov sampling)    │
+├──────────────────────┤            ├──────────────────────┤
+│ HI+NQS+SQD ★         │            │ HI-VQE               │
+│ (iterative feedback  │            │ (iterative circuit   │
+│  loop, our method)    │            │  optimization)       │
+└──────────────────────┘            └──────────────────────┘
+```
+
+### Classical Baselines
+
+| Method | Description |
+|--------|-------------|
+| FCI | Full Configuration Interaction (exact, exponential cost) |
+| CCSD | Coupled Cluster Singles and Doubles |
+| CCSD(T) | CCSD with perturbative triples correction |
+| SCI (CIPSI) | Selected Configuration Interaction with PT2 selection |
+
+### Test Molecules
+
+| Molecule | Qubits | Basis | Type | Hilbert Space |
+|----------|--------|-------|------|---------------|
+| LiH | 12 | STO-3G | Full | 225 |
+| H2O | 14 | STO-3G | Full | 441 |
+| BeH2 | 14 | STO-3G | Full | 1,225 |
+| NH3 | 16 | STO-3G | Full | 3,136 |
+| CH4 | 18 | STO-3G | Full | 15,876 |
+| N2 | 20 | STO-3G | Full | 14,400 |
+| HCN | 22 | STO-3G | Full | 108,900 |
+| C2H2 | 24 | STO-3G | Full | 627,264 |
+| H2S | 26 | STO-3G | Full | 3,025 |
+| C2H4 | 28 | STO-3G | Full | 11,778,624 |
+| Benzene | 30 | STO-3G | CAS(6,15) | 207,025 |
+
+### Stability Testing
+
+Each method tested with **5 random seeds** to measure mean and standard deviation.
+
+## Results
+
+### Accuracy Comparison (error vs FCI in mHa)
+
+| Molecule | Qubits | FCI (Ha) | CCSD | CCSD(T) | SCI (basis) | **HI+NQS+SQD** (basis) |
+|----------|--------|----------|------|---------|-------------|------------------------|
+| LiH | 12 | -7.8823 | 0.011 | 0.002 | 0.000 (69) | **0.000** (225) |
+| H2O | 14 | -75.0132 | 0.118 | 0.050 | 0.000 (133) | **0.000** (441) |
+| BeH2 | 14 | -15.5951 | 0.397 | 0.185 | 0.000 (169) | **0.000** (1,200) |
+| NH3 | 16 | -55.5177 | 0.091 | -0.033 | 0.000 (1,576) | **-0.126** (3,074) |
+| CH4 | 18 | -39.8060 | 0.234 | 0.094 | 0.001 (1,629) | **0.000** (11,129) |
+| N2 | 20 | -107.6541 | 3.925 | 2.201 | 0.000 (1,588) | **0.000** (12,632) |
+| HCN | 22 | -91.8422 | 3.446 | 2.178 | 0.010 (3,833) | **0.000** (15,000) |
+| H2S | 26 | -394.3547 | 0.066 | 0.018 | 0.000 (865) | **0.000** (3,013) |
+| Benzene | 30 | -227.9565 | — | — | 0.083 (1,713) | **0.000** (10,000) |
+
+All results within **chemical accuracy** (< 1.6 mHa).
+
+### Molecules without FCI Reference (absolute energies in Ha)
+
+| Molecule | Qubits | Hilbert Space | CCSD(T) | SCI (basis) | **HI+NQS+SQD** (basis) |
+|----------|--------|---------------|---------|-------------|------------------------|
+| C2H2 | 24 | 627,264 | -76.0227 | -76.0245 (5,302) | **-76.0246** (10,000) |
+| C2H4 | 28 | 11,778,624 | -77.2348 | -77.2351 (10,000) | **-77.2353** (10,000) |
+
+HI+NQS+SQD achieves **lower energy** than both CCSD(T) and SCI for large molecules.
+
+### Classical Expansion Study (C2H4, 28 qubits)
+
+Effect of adding singles/doubles excitations from top-amplitude configurations:
+
+| Variant | Energy (Ha) | vs SCI (mHa) | Time |
+|---------|-------------|-------------|------|
+| SCI (CIPSI, PT2) | -77.2351408123 | 0.000 | 744s |
+| HI+NQS+SQD (no expansion) | -77.2352813675 | **-0.141** | 485s |
+| HI+NQS+SQD + expansion (no PT2) | -77.2352926820 | **-0.152** | 462s |
+| HI+NQS+SQD + expansion (with PT2) | -77.2353131332 | **-0.172** | 895s |
+
+All HI+NQS+SQD variants achieve **lower energy than SCI**. Adding classical expansion improves accuracy further, with PT2 selection giving the best result at the cost of more computation time.
+
+### HI+NQS+SQD vs HI-VQE (quantum circuit)
+
+| Molecule | Qubits | HI-VQE err (mHa) | HI+NQS+SQD err (mHa) |
+|----------|--------|-------------------|------------------------|
+| LiH | 12 | 19.612 ± 0.413 | **0.000 ± 0.000** |
+| H2O | 14 | 43.282 ± 5.208 | **0.000 ± 0.000** |
+| BeH2 | 14 | 30.899 ± 5.424 | **0.000 ± 0.000** |
+| NH3 | 16 | 62.339 ± 1.335 | **-0.126** |
+
+(5 random seeds, mean ± std)
+
+### Computation Time (GPU: NVIDIA H200)
+
+| Molecule | Qubits | SCI Time | HI+NQS+SQD Time | Bottleneck |
+|----------|--------|----------|------------------|------------|
+| LiH | 12 | <1s | 4s | NQS update |
+| H2O | 14 | <1s | 2s | NQS update |
+| BeH2 | 14 | <1s | 2s | NQS update |
+| NH3 | 16 | 3s | 6s | NQS update |
+| CH4 | 18 | 4s | 54s | SQD (solve_fermion) |
+| N2 | 20 | 3s | 44s | SQD (solve_fermion) |
+| HCN | 22 | 10s | 68s | SQD (solve_fermion) |
+| C2H2 | 24 | 100s | 485s | SQD (solve_fermion) |
+| H2S | 26 | <1s | 11s | NQS sampling |
+| C2H4 | 28 | 744s | 485s | SQD (solve_fermion) |
+| Benzene | 30 | 7s | 102s | SQD (solve_fermion) |
+
+### Time Breakdown per Iteration (representative)
+
+```
+CH4 (18Q):  [sample=0.4s  sqd=10.7s  update=2.1s]  → SQD dominates
+N2  (20Q):  [sample=0.5s  sqd=11.1s  update=1.5s]  → SQD dominates
+HCN (22Q):  [sample=1.3s  sqd=9.3s   update=5.7s]  → SQD dominates
+```
+
+NQS sampling on GPU is fast (~1s). The bottleneck is IBM's `solve_fermion` on CPU.
+
+## Project Architecture
+
+```
+nqs-sqd/
+├── src/
+│   ├── methods/                    # 6 comparison methods
+│   │   ├── hi_nqs_sqd.py          # ★ HI+NQS+SQD (our method)
+│   │   ├── hi_vqe.py              # HI-VQE (CUDA-Q + IBM SQD)
+│   │   ├── nqs_sqd.py             # NQS+SQD (two-stage)
+│   │   ├── nqs_skqd.py            # NQS+SKQD (two-stage)
+│   │   ├── qc_sqd.py              # QC+SQD (quantum circuit)
+│   │   └── qc_skqd.py             # QC+SKQD (quantum Krylov)
+│   ├── samplers/
+│   │   ├── cudaq_sampler.py       # CUDA-Q UCCSD circuit sampler
+│   │   ├── cudaq_circuits.py      # CUDA-Q kernel definitions
+│   │   ├── transformer_nf_sampler.py  # Transformer NQS sampler
+│   │   └── nf_sampler.py          # Dense NF sampler
+│   ├── nqs/
+│   │   ├── transformer.py         # Autoregressive Transformer NQS
+│   │   └── dense.py               # Dense feed-forward NQS
+│   ├── solvers/
+│   │   ├── sqd.py                 # SQD solver
+│   │   ├── skqd.py                # SKQD Krylov solver
+│   │   ├── fci.py                 # Full CI (exact)
+│   │   ├── ccsd.py                # CCSD / CCSD(T)
+│   │   └── sci.py                 # CIPSI selected CI
+│   ├── hamiltonians/
+│   │   └── molecular.py           # PySCF molecular Hamiltonians
+│   ├── molecules.py               # 20+ molecule registry (4-58Q)
+│   └── utils/
+├── scripts/                        # Benchmark and test scripts
+├── results/                        # Output data
+└── README.md
+```
+
+## Dependencies
+
+- **PyTorch** >= 2.0 (GPU acceleration for NQS)
+- **PySCF** >= 2.4 (molecular integrals)
+- **qiskit-addon-sqd** >= 0.12 (IBM's SQD solver: `solve_fermion`)
+- **CUDA-Q** >= 0.8 (quantum circuit simulation for HI-VQE)
+- **NumPy**, **SciPy**, **Numba** (numerics)
 
 ## Quick Start
 
-### Installation
-
 ```bash
-# Clone the repository
-git clone https://github.com/George930502/Flow-Guided-Krylov.git
-cd Flow-Guided-Krylov
+# Install
+pip install torch pyscf qiskit-addon-sqd cuda-quantum
 
-# Install with Docker (recommended)
-docker-compose build
-docker-compose run --rm flow-krylov-gpu
+# Run HI+NQS+SQD on a molecule
+python -c "
+from src.molecules import get_molecule
+from src.methods.hi_nqs_sqd import run_hi_nqs_sqd, HINQSSQDConfig
 
-# Or install manually
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-pip install numpy scipy matplotlib tqdm normflows pyscf
-pip install -e .
+H, info = get_molecule('H2O')
+cfg = HINQSSQDConfig(n_samples=5000, max_iterations=30)
+result = run_hi_nqs_sqd(H, info, config=cfg)
+print(f'Energy: {result.energy:.10f} Ha')
+print(f'Basis: {result.diag_dim}, Time: {result.wall_time:.1f}s')
+"
+
+# Run full benchmark
+python scripts/run_six_methods.py --molecules "LiH,H2O,BeH2"
 ```
 
-### Basic Usage
+## References
 
-```python
-from src.pipeline import FlowGuidedKrylovPipeline, PipelineConfig
-from src.hamiltonians.molecular import create_lih_hamiltonian
-
-# Create molecular Hamiltonian
-H = create_lih_hamiltonian(bond_length=1.6)
-E_exact = H.fci_energy()
-
-# Run pipeline (auto-adapts to system size)
-pipeline = FlowGuidedKrylovPipeline(H, exact_energy=E_exact)
-results = pipeline.run()
-
-# Check results
-print(f"Energy: {results['combined_energy']:.6f} Ha")
-print(f"Error: {abs(results['combined_energy'] - E_exact) * 1000:.2f} mHa")
-```
-
-### Run Molecular Benchmarks
-
-```bash
-# Run all molecules
-python examples/benchmark.py --molecule all
-
-# Run specific molecule
-python examples/benchmark.py --molecule lih
-
-# Available molecules: h2, lih, h2o, beh2, nh3, n2, ch4
-```
-
-### Configuration Options
-
-```python
-from src.pipeline import PipelineConfig
-
-config = PipelineConfig(
-    # Particle conservation (critical for molecules)
-    use_particle_conserving_flow=True,
-
-    # Physics-guided training weights
-    teacher_weight=0.5,
-    physics_weight=0.4,
-    entropy_weight=0.1,
-
-    # Training
-    samples_per_batch=2000,
-    max_epochs=400,
-
-    # Residual expansion (Selected-CI style)
-    use_residual_expansion=True,
-    residual_iterations=8,
-    use_perturbative_selection=True,  # PT2 importance
-
-    # SKQD
-    max_krylov_dim=8,
-
-    # Hardware
-    device="cuda",
-)
-```
-
-## Pipeline Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     FLOW-GUIDED KRYLOV PIPELINE                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│   INPUT: Molecular Geometry + Basis Set                                 │
-│                          │                                              │
-│                          ▼                                              │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │  PREPROCESSING: Molecular Hamiltonian Construction              │  │
-│   │  • PySCF integrals (h_pq, g_pqrs)                               │  │
-│   │  • Jordan-Wigner transformation                                 │  │
-│   │  • HF reference state                                           │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
-│                          │                                              │
-│                          ▼                                              │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │  STAGE 1: Physics-Guided NF-NQS Training                        │  │
-│   │  • Gumbel-Top-K sampling (particle conservation)                │  │
-│   │  • Mixed loss: L = w_t·L_teacher + w_p·L_physics - w_e·H       │  │
-│   │  • Temperature annealing: T = 1.0 → 0.1                        │  │
-│   │  Output: accumulated_basis                                      │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
-│                          │                                              │
-│                          ▼                                              │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │  STAGE 2: Diversity-Aware Basis Selection                       │  │
-│   │  • Excitation rank bucketing (singles, doubles, ...)           │  │
-│   │  • Budget: 5% rank-0, 25% rank-1, 50% rank-2, ...              │  │
-│   │  • DPP-inspired greedy selection                                │  │
-│   │  Output: selected_basis                                         │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
-│                          │                                              │
-│                          ▼                                              │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │  STAGE 3: Residual-Based Expansion (Selected-CI)                │  │
-│   │  • PT2 importance: ε_x = |⟨x|H|Φ⟩|² / |E - E_x|                │  │
-│   │  • Batch diagonal computation (optimized)                       │  │
-│   │  • Early stopping on energy stagnation                          │  │
-│   │  Output: expanded_basis, residual_energy                        │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
-│                          │                                              │
-│                          ▼                                              │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │  STAGE 4: Sample-Based Krylov Quantum Diagonalization           │  │
-│   │  • Sparse time evolution: |ψ_k⟩ = e^{-ikHΔt}|ψ_0⟩              │  │
-│   │  • Cumulative Krylov basis sampling                             │  │
-│   │  • Regularized subspace diagonalization                         │  │
-│   │  Output: combined_energy (final result)                         │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
-│                          │                                              │
-│                          ▼                                              │
-│   OUTPUT: Ground State Energy with Chemical Accuracy                    │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-## Project Structure
-
-```
-Flow-Guided-Krylov/
-├── src/
-│   ├── pipeline.py                    # Main pipeline
-│   ├── flows/
-│   │   ├── particle_conserving_flow.py  # Gumbel-Top-K flow
-│   │   └── physics_guided_training.py   # Mixed-objective training
-│   ├── nqs/
-│   │   └── dense.py                     # Neural quantum state
-│   ├── hamiltonians/
-│   │   └── molecular.py                 # Molecular Hamiltonians (PySCF)
-│   ├── krylov/
-│   │   ├── skqd.py                      # SKQD with sparse evolution
-│   │   └── residual_expansion.py        # Selected-CI expansion
-│   └── postprocessing/
-│       └── diversity_selection.py       # Excitation rank bucketing
-├── docs/                                # Detailed documentation
-├── examples/
-│   └── benchmark.py                     # Molecular benchmarks
-└── tests/                               # Unit tests
-```
-
-## Documentation
-
-See the `docs/` folder for detailed documentation:
-
-- [Pipeline Architecture](docs/PIPELINE_ARCHITECTURE.md) - Complete pipeline overview
-- [Stage 1: NF-NQS Co-Training](docs/STAGE1_NF_NQS_COTRAINING.md) - 10 techniques explained
-- [Stage 2: Diversity Selection](docs/STAGE2_DIVERSITY_SELECTION.md) - Excitation bucketing
-- [Stage 3: Residual Expansion](docs/STAGE3_RESIDUAL_EXPANSION.md) - PT2 importance
-- [Stage 4: SKQD](docs/STAGE4_SKQD.md) - Krylov subspace methods
-- [Molecular Hamiltonian](docs/MODULE_MOLECULAR_HAMILTONIAN.md) - PySCF integration
+1. Pellow-Jarman et al. (2025) "HIVQE: Handover Iterative Variational Quantum Eigensolver for Efficient Quantum Chemistry Calculations", arXiv:2503.06292
+2. Robledo-Moreno et al. (2024) "Chemistry beyond exact solutions on a quantum-centric supercomputer", Nature
+3. Yu et al. (2025) "Quantum-Centric Algorithm for Sample-Based Krylov Diagonalization", arXiv:2501.09702
+4. von Glehn et al. (2023) "A self-attention ansatz for ab-initio quantum chemistry" (Psiformer)
+5. Huron, Malrieu, Rancurel (1973) "Iterative perturbation calculations" (CIPSI)
 
 ## License
 
-MIT License
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues and pull requests.
+MIT

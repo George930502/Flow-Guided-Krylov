@@ -1,7 +1,7 @@
 """Base class for Neural Quantum States."""
 
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -63,7 +63,7 @@ class NeuralQuantumState(nn.Module, ABC):
         """
         pass
 
-    def log_psi(self, x: torch.Tensor) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    def log_psi(self, x: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Compute log(ψ_θ(x)) for batch of configurations.
 

@@ -70,6 +70,232 @@ def compute_hamming_distance(
     return (config1 != config2).sum().item()
 
 
+def bitpack_configs(configs: torch.Tensor) -> torch.Tensor:
+    """Pack binary configs into int64 for O(1) Hamming via XOR + popcount.
+
+    For sites <= 64: each config is packed into a single int64, returns (n,).
+    At 64 sites, the sign bit (bit 63) is used, producing negative values --
+    this is correct for XOR+popcount since those operate on bit patterns.
+
+    For sites > 64: configs are split into ceil(sites/64) words, returns (n, num_words).
+    Hamming distance = sum of popcount(a_word XOR b_word) for each word.
+    Use ``bitpacked_hamming`` for computing Hamming distances from packed tensors.
+
+    Args:
+        configs: (n, sites) binary tensor
+
+    Returns:
+        (n,) int64 tensor if sites <= 64, or (n, num_words) int64 tensor if sites > 64
+    """
+    n, sites = configs.shape
+    device = configs.device
+    if sites <= 64:
+        powers = (1 << torch.arange(sites, dtype=torch.int64, device=device)).flip(0)
+        return (configs.long() * powers).sum(dim=1)
+    else:
+        # Split into 64-bit words. XOR+popcount works on bit patterns,
+        # so the sign bit is fine.
+        word_size = 64
+        num_words = (sites + word_size - 1) // word_size
+        words = []
+        for w in range(num_words):
+            start = w * word_size
+            end = min(start + word_size, sites)
+            chunk_size = end - start
+            powers = (1 << torch.arange(chunk_size, dtype=torch.int64, device=device)).flip(0)
+            words.append((configs[:, start:end].long() * powers).sum(dim=1))
+        return torch.stack(words, dim=1)
+
+
+def bitpacked_hamming(
+    packed: torch.Tensor, idx_a: torch.Tensor, idx_b: torch.Tensor
+) -> torch.Tensor:
+    """Compute Hamming distances between bitpacked config pairs.
+
+    Works for both single-word (n,) and multi-word (n, num_words) packed tensors.
+
+    Args:
+        packed: packed configs from ``bitpack_configs``
+        idx_a: (k,) indices for first set of configs
+        idx_b: (k,) indices for second set of configs
+
+    Returns:
+        (k,) int32 tensor of Hamming distances
+    """
+    if packed.dim() == 1:
+        xor = packed[idx_a] ^ packed[idx_b]
+        return _popcount_int64(xor)
+    else:
+        xor = packed[idx_a] ^ packed[idx_b]  # (k, num_words)
+        return sum(_popcount_int64(xor[:, w]) for w in range(xor.shape[1]))
+
+
+def hamming_bitpacked(a, b) -> int:
+    """Hamming distance between two bitpacked configs. O(1)."""
+    # Convert torch tensors to Python int via raw bytes to avoid int64 overflow
+    # in older PyTorch versions (2.5 etc.) where .item() raises on large uint values
+    if hasattr(a, 'numpy'):
+        a = int.from_bytes(a.cpu().numpy().tobytes(), byteorder='little', signed=True)
+    if hasattr(b, 'numpy'):
+        b = int.from_bytes(b.cpu().numpy().tobytes(), byteorder='little', signed=True)
+    # Mask to 64 bits to handle signed int64 correctly (Python bin(-x) gives '-0b...')
+    return bin((a ^ b) & 0xFFFFFFFFFFFFFFFF).count('1')
+
+
+def hamming_bitpacked_batch(packed: torch.Tensor, idx: int, indices: torch.Tensor) -> torch.Tensor:
+    """Hamming distance from packed[idx] to packed[indices]. Vectorized O(k).
+
+    Works for both single-word (n,) and multi-word (n, num_words) packed tensors.
+    """
+    xor = packed[indices] ^ packed[idx]
+    if packed.dim() == 1:
+        return _popcount_int64(xor)
+    else:
+        return sum(_popcount_int64(xor[:, w]) for w in range(xor.shape[1]))
+
+
+# Byte-level popcount lookup table (0-255)
+_POPCOUNT_TABLE = torch.zeros(256, dtype=torch.int32)
+for _i in range(256):
+    _POPCOUNT_TABLE[_i] = bin(_i).count('1')
+_POPCOUNT_TABLE_CACHE: dict = {}  # device -> table tensor
+
+
+def _popcount_int64(x: torch.Tensor) -> torch.Tensor:
+    """Vectorized popcount for int64 tensor using byte lookup table."""
+    # Cache table per device to avoid repeated .to() calls in hot loops
+    dev = x.device
+    if dev not in _POPCOUNT_TABLE_CACHE:
+        _POPCOUNT_TABLE_CACHE[dev] = _POPCOUNT_TABLE.to(dev)
+    table = _POPCOUNT_TABLE_CACHE[dev]
+
+    # Ensure at least 1-dim; unsqueeze scalar tensors
+    was_scalar = x.dim() == 0
+    if was_scalar:
+        x = x.unsqueeze(0)
+
+    # Extract 8 bytes per int64 via bit-shifts (avoids view(dtype) which is unsupported)
+    shifts = torch.tensor(
+        [0, 8, 16, 24, 32, 40, 48, 56], device=x.device, dtype=torch.long,
+    )
+    x_bytes = ((x.unsqueeze(-1) >> shifts) & 0xFF).long()
+    counts = table[x_bytes].sum(dim=-1)
+    result = counts.int()
+    if was_scalar:
+        result = result.squeeze(0)
+    return result
+
+
+def _hamming_from_one(packed: torch.Tensor, idx: int) -> torch.Tensor:
+    """Compute Hamming distances from packed[idx] to all rows.
+
+    Works for both single-word (n,) and multi-word (n, num_words) packed tensors.
+
+    Returns:
+        (n,) int32 tensor of distances
+    """
+    xor = packed ^ packed[idx]
+    if packed.dim() == 1:
+        return _popcount_int64(xor)
+    else:
+        return sum(_popcount_int64(xor[:, w]) for w in range(xor.shape[1]))
+
+
+def stochastic_greedy_select(
+    configs: torch.Tensor,
+    weights: torch.Tensor,
+    n_select: int,
+    epsilon: float = 0.01,
+    min_hamming: int = 0,
+    seed: int = 42,
+) -> torch.Tensor:
+    """Stochastic greedy diversity selection (Mirzasoleiman et al., AAAI 2015).
+
+    Instead of evaluating ALL n candidates at each step (O(n*k)),
+    samples a random subset of size (n/k)*ln(1/epsilon) and picks the best.
+    Total evaluations: O(n * ln(1/epsilon)) instead of O(n*k).
+
+    For n=50K, k=5K, epsilon=0.01: ~230K evals instead of 250M (~1000x faster).
+
+    Args:
+        configs: (n, sites) binary configs
+        weights: (n,) importance weights
+        n_select: number of configs to select
+        epsilon: approximation parameter (smaller = better quality, more evals)
+        min_hamming: minimum Hamming distance between selected configs
+        seed: random seed
+
+    Returns:
+        (n_select,) tensor of selected indices
+    """
+    import math
+
+    n = len(configs)
+    n_select = min(n_select, n)
+
+    if n_select <= 0:
+        return torch.tensor([], dtype=torch.long)
+
+    # Bitpack for fast Hamming
+    packed = bitpack_configs(configs)
+
+    # Sample size per step: (n/k) * ln(1/eps)
+    sample_size = max(1, int((n / max(n_select, 1)) * math.log(1.0 / epsilon)))
+    sample_size = min(sample_size, n)
+
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+
+    selected = []
+    selected_mask = torch.zeros(n, dtype=torch.bool)
+    # Track min distance from each candidate to selected set
+    min_dists = torch.full((n,), fill_value=999999, dtype=torch.int32)
+
+    # Start with highest-weight config
+    first = weights.argmax().item()
+    selected.append(first)
+    selected_mask[first] = True
+
+    # Update min_dists from first selected — vectorized
+    dists = _hamming_from_one(packed, first)
+    min_dists = dists
+    min_dists[first] = 0  # self-distance irrelevant, masked by selected_mask
+
+    while len(selected) < n_select:
+        # Get remaining indices
+        remaining_indices = torch.where(~selected_mask)[0]
+        if len(remaining_indices) == 0:
+            break
+
+        # Sample subset
+        actual_sample_size = min(sample_size, len(remaining_indices))
+        perm = torch.randperm(len(remaining_indices), generator=gen)[:actual_sample_size]
+        candidates = remaining_indices[perm]
+
+        # Score candidates vectorized: weight * max(min_dist, 1)
+        cand_dists = min_dists[candidates].float()
+        cand_weights = weights[candidates]
+        scores = cand_weights * torch.clamp(cand_dists, min=1.0)
+
+        # Penalize candidates below min_hamming (only if any valid alternatives exist)
+        if min_hamming > 0:
+            valid = cand_dists >= min_hamming
+            if valid.any():
+                scores[~valid] = -float('inf')
+
+        best_local = scores.argmax().item()
+        best_idx = candidates[best_local].item()
+
+        selected.append(best_idx)
+        selected_mask[best_idx] = True
+
+        # Update min_dists incrementally — vectorized XOR + popcount
+        new_dists = _hamming_from_one(packed, best_idx)
+        min_dists = torch.minimum(min_dists, new_dists)
+
+    return torch.tensor(selected, dtype=torch.long)
+
+
 def compute_hamming_distance_matrix(
     configs: torch.Tensor,
 ) -> torch.Tensor:
@@ -219,11 +445,14 @@ class DiversitySelector:
 
             # Select diverse subset from bucket
             if self.config.use_dpp_selection and n_bucket > n_select:
-                selected = self._dpp_select(
+                # _dpp_select returns LOCAL indices into bucket_tensor (0..n_bucket-1)
+                local_selected = self._dpp_select(
                     bucket_tensor, bucket_weights, n_select
                 )
+                # Map local → global indices into unique_configs
+                selected = bucket_indices[local_selected]
             else:
-                # Simple weighted selection
+                # _weighted_select already returns global indices
                 selected = self._weighted_select(
                     bucket_indices, bucket_weights, min(n_select, n_bucket)
                 )
@@ -264,9 +493,22 @@ class DiversitySelector:
             3: int(max_configs * cfg.rank_3_fraction),
         }
 
-        # Remaining goes to rank 4+
+        # Remaining goes to rank 4+ (shared across all ranks >= 4)
         used = sum(budgets.values())
-        budgets[4] = max_configs - used
+        rank4_plus_budget = max_configs - used
+
+        # Distribute rank 4+ budget across all ranks >= 4 present in buckets
+        high_ranks = sorted(r for r in self.bucketer.buckets.keys() if r >= 4)
+        if high_ranks:
+            high_rank_counts = {r: len(self.bucketer.get_bucket(r)) for r in high_ranks}
+            total_high = sum(high_rank_counts.values())
+            if total_high > 0:
+                for r in high_ranks:
+                    budgets[r] = max(1, int(rank4_plus_budget * high_rank_counts[r] / total_high))
+            else:
+                budgets[4] = rank4_plus_budget
+        else:
+            budgets[4] = rank4_plus_budget
 
         return budgets
 
@@ -312,14 +554,31 @@ class DiversitySelector:
         all_configs: torch.Tensor,
         subset_configs: torch.Tensor,
     ) -> torch.Tensor:
-        """Find indices of subset_configs in all_configs."""
-        indices = []
-        for i in range(len(subset_configs)):
-            matches = (all_configs == subset_configs[i]).all(dim=1)
-            idx = torch.where(matches)[0]
-            if len(idx) > 0:
-                indices.append(idx[0].item())
-        return torch.tensor(indices, device=all_configs.device)
+        """Find indices of subset_configs in all_configs.
+
+        Uses hash-based O(n + m) lookup instead of O(n * m) pairwise comparison.
+        Overflow-safe: handles n_sites >= 64 via config_integer_hash.
+        """
+        n_sub = len(subset_configs)
+        if n_sub == 0:
+            return torch.tensor([], dtype=torch.long, device=all_configs.device)
+
+        try:
+            from utils.config_hash import config_integer_hash
+        except ImportError:
+            from ..utils.config_hash import config_integer_hash
+
+        all_hashes = config_integer_hash(all_configs)
+        sub_hashes = config_integer_hash(subset_configs)
+
+        hash_to_idx: dict = {}
+        for i, h in enumerate(all_hashes):
+            if h not in hash_to_idx:
+                hash_to_idx[h] = i
+
+        indices = [hash_to_idx[h] for h in sub_hashes if h in hash_to_idx]
+
+        return torch.tensor(indices, dtype=torch.long, device=all_configs.device)
 
     def _weighted_select(
         self,
@@ -341,11 +600,11 @@ class DiversitySelector:
         n_select: int,
     ) -> torch.Tensor:
         """
-        DPP-inspired selection for diversity.
+        DPP-inspired diversity selection using streaming greedy.
 
-        Uses greedy approximation to DPP:
-        1. Start with highest-weight config
-        2. Iteratively add config that maximizes weight * min_distance
+        Delegates to stochastic_greedy_select() which uses bitpacked
+        Hamming + incremental min-distance tracking. Memory O(n) instead
+        of O(n²). Time O(n·log(1/ε)) instead of O(n·k).
         """
         n = len(configs)
         device = configs.device
@@ -353,48 +612,12 @@ class DiversitySelector:
         if n <= n_select:
             return torch.arange(n, device=device)
 
-        # Compute distance matrix
-        distances = compute_hamming_distance_matrix(configs).float()
-
-        # Greedy selection
-        selected = []
-        remaining = set(range(n))
-
-        # Start with highest weight
-        first = weights.argmax().item()
-        selected.append(first)
-        remaining.remove(first)
-
-        while len(selected) < n_select and remaining:
-            best_score = -float('inf')
-            best_idx = None
-
-            for idx in remaining:
-                # Minimum distance to already selected
-                min_dist = distances[idx, selected].min().item()
-
-                # Skip if too close
-                if min_dist < self.config.min_hamming_distance:
-                    continue
-
-                # Score = weight * distance^scale
-                score = weights[idx].item() * (min_dist ** self.config.dpp_kernel_scale)
-
-                if score > best_score:
-                    best_score = score
-                    best_idx = idx
-
-            if best_idx is None:
-                # All remaining are too close, pick by weight
-                remaining_list = list(remaining)
-                remaining_weights = weights[remaining_list]
-                best_local = remaining_weights.argmax().item()
-                best_idx = remaining_list[best_local]
-
-            selected.append(best_idx)
-            remaining.remove(best_idx)
-
-        return torch.tensor(selected, device=device)
+        return stochastic_greedy_select(
+            configs,
+            weights,
+            n_select,
+            min_hamming=self.config.min_hamming_distance,
+        )
 
 
 def select_diverse_basis(
@@ -450,11 +673,25 @@ def analyze_basis_diversity(
         rank_counts[f'rank_{r}'] = ranks.count(r)
 
     # Distance statistics
+    # For large bases, use sampled pairs to avoid O(n²) memory
+    SAMPLED_DISTANCE_THRESHOLD = 5000
     if n > 1:
-        distances = compute_hamming_distance_matrix(configs)
-        # Get upper triangle (excluding diagonal)
-        triu_indices = torch.triu_indices(n, n, offset=1, device=device)
-        pairwise_dists = distances[triu_indices[0], triu_indices[1]]
+        if n <= SAMPLED_DISTANCE_THRESHOLD:
+            distances = compute_hamming_distance_matrix(configs)
+            triu_indices = torch.triu_indices(n, n, offset=1, device=device)
+            pairwise_dists = distances[triu_indices[0], triu_indices[1]]
+        else:
+            # Sample random pairs for distance statistics
+            n_samples = min(50000, n * (n - 1) // 2)
+            packed = bitpack_configs(configs)
+            gen = torch.Generator(device='cpu')
+            gen.manual_seed(42)
+            idx_a = torch.randint(0, n, (n_samples,), generator=gen)
+            idx_b = torch.randint(0, n, (n_samples,), generator=gen)
+            # Re-draw pairs where idx_a == idx_b
+            same = idx_a == idx_b
+            idx_b[same] = (idx_b[same] + 1) % n
+            pairwise_dists = bitpacked_hamming(packed, idx_a, idx_b)
 
         dist_stats = {
             'mean_distance': pairwise_dists.float().mean().item(),

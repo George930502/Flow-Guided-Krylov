@@ -1,23 +1,14 @@
-"""Utility modules for Flow-Guided Krylov pipeline."""
+"""Utility modules."""
 
-from .connection_cache import ConnectionCache
-from .system_scaler import (
-    SystemScaler,
-    SystemMetrics,
-    ScaledParameters,
-    QualityPreset,
-    SystemTier,
-    AdaptiveAdjuster,
-    auto_scale_pipeline,
-)
+from .connection_cache import ConnectionCache, compute_max_cache_size
+from .gpu_linalg import gpu_eigh, gpu_eigsh, gpu_expm_multiply
+from .config_hash import config_integer_hash
 
 __all__ = [
-    'ConnectionCache',
-    'SystemScaler',
-    'SystemMetrics',
-    'ScaledParameters',
-    'QualityPreset',
-    'SystemTier',
-    'AdaptiveAdjuster',
-    'auto_scale_pipeline',
+    "ConnectionCache",
+    "compute_max_cache_size",
+    "gpu_eigh",
+    "gpu_eigsh",
+    "gpu_expm_multiply",
+    "config_integer_hash",
 ]

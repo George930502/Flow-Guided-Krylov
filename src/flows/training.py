@@ -1,790 +1,1228 @@
 """
-Training procedures for Flow-assisted Neural Quantum States.
+Physics-Guided Training for Normalizing Flows.
 
-Implements the co-training algorithm from the NF-NQS paper:
-1. Sample from NF to get discrete configurations
-2. Evaluate NQS probabilities on sampled configurations
-3. Update NF to maximize probability in high-weight regions
-4. Update NQS to minimize energy expectation
+This module implements mixed-objective training that combines:
+1. Teacher signal: Match NQS probability distribution (standard approach)
+2. Physics signal: Energy-weighted importance (not just probability)
+3. Exploration bonus: Entropy regularization to avoid collapse
 
-Optimizations included:
-- Incremental Hamiltonian matrix caching with O(n) updates
-- GPU-resident hash table for O(1) basis deduplication
-- Vectorized energy computation
-- Reduced memory allocations via buffer reuse
+The key insight is that NF should learn to sample configurations that:
+- Have high NQS probability (teacher)
+- Have LOW local energy (physics - ground state has lowest energy)
+- Maintain diversity (exploration)
 
-Reference:
-    "Improved Ground State Estimation in Quantum Field Theories
-     via Normalising Flow-Assisted Neural Quantum States"
+References:
+- NF-NQS paper: "Improved Ground State Estimation via NF-Assisted NQS"
+- Importance sampling: configurations with low local energy matter more
 """
 
+import math
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
 import numpy as np
-from typing import Optional, Callable, Dict, Any, Set, Tuple
-from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, Any
+from dataclasses import dataclass, field
 from tqdm import tqdm
-import time
 
-# Support both package imports and direct script execution
+# Enable TensorFloat32 for better performance on Ampere+ GPUs
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision('high')
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+# Connection cache for avoiding recomputation
 try:
-    from .discrete_flow import DiscreteFlowSampler
-    from ..nqs.base import NeuralQuantumState
+    from ..utils.connection_cache import ConnectionCache, compute_max_cache_size
 except ImportError:
-    from flows.discrete_flow import DiscreteFlowSampler
-    from nqs.base import NeuralQuantumState
+    from utils.connection_cache import ConnectionCache, compute_max_cache_size
 
 
 @dataclass
-class TrainingConfig:
-    """Configuration for NF-NQS co-training."""
+class PhysicsGuidedConfig:
+    """Configuration for physics-guided flow training."""
 
-    # Sampling
-    samples_per_batch: int = 3000  # Good coverage of basis states
-    num_batches: int = 1  # Single batch per epoch
-    n_mc_samples: int = 10  # MC samples for probability estimation
+    # Batch sizes
+    samples_per_batch: int = 2000
+    num_batches: int = 1
+    nqs_chunk_size: int = 16384  # Increased chunk size for better GPU saturation
 
-    # Optimization - slower flow LR prevents chasing NQS too aggressively
-    flow_lr: float = 5e-4  # Slower for stability
-    nqs_lr: float = 1e-3  # Faster for convergence
-    grad_clip: float = 1.0
+    # Learning rates
+    flow_lr: float = 5e-4
+    nqs_lr: float = 1e-3
 
-    # Training
+    # Training epochs
     num_epochs: int = 500
-    min_epochs: int = 150  # Sufficient training before checking convergence
-    convergence_threshold: float = 0.20  # Train until flow concentrates well (<20% unique)
+    min_epochs: int = 150
+    convergence_threshold: float = 0.35
 
-    # Energy computation
-    use_local_energy: bool = False  # Use accurate subspace energy
-    use_accumulated_energy: bool = True  # Compute energy on accumulated basis for stability
-    accumulated_energy_interval: int = 1  # Compute accumulated energy every N epochs (1=every epoch)
+    # Loss weights
+    # Teacher: cross-entropy KL(NQS || Flow) -- the paper's primary term
+    # Physics: REINFORCE energy gradient -- direct "low energy is better" signal
+    # Entropy: regularizer to prevent mode collapse
+    teacher_weight: float = 1.0  # Cross-entropy (paper's primary term)
+    physics_weight: float = 0.1  # REINFORCE energy gradient signal
+    entropy_weight: float = 0.05  # Entropy regularization for exploration
 
-    # Stability - EMA and entropy regularization
-    ema_decay: float = 0.95  # Exponential moving average decay for energy tracking
-    entropy_weight: float = 0.01  # Entropy regularization to prevent premature collapse
+    # Energy baseline for physics signal
+    use_energy_baseline: bool = True  # Subtract baseline for variance reduction
 
-    # GPU optimization
-    cache_hamiltonian: bool = True  # Cache H matrix for accumulated basis
-    max_cached_basis_size: int = 8192  # Max basis size to cache
+    # Accumulated basis for energy computation
+    use_accumulated_energy: bool = True
+    max_accumulated_basis: int = 2048
+    accumulated_energy_interval: int = 50  # Increased to reduce overhead
+    prune_basis_threshold: float = 1e-6
 
-    # Basis management - CRITICAL for large systems
-    max_accumulated_basis: int = 2048  # Hard cap on accumulated basis size
-    prune_basis_threshold: float = 1e-6  # Prune states with |psi|^2 < threshold
+    # EMA for stable tracking
+    ema_decay: float = 0.95
 
-    # Logging
-    log_interval: int = 10
-    save_interval: int = 100
+    # Temperature annealing for particle-conserving flow
+    initial_temperature: float = 1.0
+    final_temperature: float = 0.3
+    temperature_decay_epochs: int = 400
+
+    # Connection caching for avoiding recomputation
+    use_connection_cache: bool = True
+    max_cache_size: int = 100000  # Max cached configurations
+    cache_warmup: bool = True  # Pre-populate cache with HF neighborhood
+    cache_warmup_excitation_level: int = 2  # Include singles (1) and doubles (2)
+
+    # torch.compile() for faster NQS evaluation
+    use_torch_compile: bool = True
+
+    # Parallel connection computation
+    use_parallel_connections: bool = True
+    parallel_workers: int = 8  # Number of parallel workers for connection computation
+
+    # Early stopping on energy plateau
+    early_stopping_patience: int = 100  # Stop if energy doesn't improve for N epochs
+    early_stopping_threshold: float = 0.001  # Minimum improvement (Ha) to reset patience
+
+    # === PAPER-ALIGNED ENERGY COMPUTATION ===
+    # Use subspace diagonalization for energy (paper's method) instead of local energy
+    # Paper Section 3.2-3.3: "Energy is computed by diagonalizing H restricted to S"
+    # This fixes the training-vs-diagonalization energy gap
+    use_subspace_energy: bool = True
+
+    # Maximum basis size for subspace diagonalization (for memory efficiency)
+    # If basis exceeds this, use top-N configs by NQS probability
+    max_subspace_diag_size: int = 2048
+
+    # Compute subspace energy every N epochs (for performance on large systems)
+    # Set to 1 to compute every epoch (most accurate but slower)
+    # Set to 5-10 for faster training with periodic energy updates
+    subspace_energy_interval: int = 1
+
+    # === ESSENTIAL CONFIGURATION INJECTION ===
+    # For molecular systems, always inject HF + low-excitation determinants
+    # into the sampled basis to ensure proper ground state discovery.
+    # Without this, NF may explore wrong region of Hilbert space.
+    inject_essential_configs: bool = True
+
+    # Include HF state in every subspace energy computation
+    always_include_hf: bool = True
+
+    # Include single excitations (important for orbital relaxation)
+    include_singles_in_basis: bool = True
+
+    # Include double excitations (most important for electron correlation)
+    include_doubles_in_basis: bool = True
 
 
-class GPUHashTable:
+class PhysicsGuidedFlowTrainer:
     """
-    Efficient hash table for basis state deduplication.
+    Trainer with mixed-objective loss for normalizing flows.
 
-    Uses Python set for O(1) lookup but minimizes CPU-GPU transfers
-    by batching tuple conversions.
-    """
+    The training objective combines three signals:
+    1. Teacher (KL divergence): Flow matches NQS probability
+    2. Physics (energy importance): Flow favors low-energy configurations
+    3. Exploration (entropy): Flow maintains sampling diversity
 
-    def __init__(self, device: str = "cuda"):
-        self.device = device
-        self._hash_set: Set[tuple] = set()
-
-    def __len__(self) -> int:
-        return len(self._hash_set)
-
-    def __contains__(self, config_tuple: tuple) -> bool:
-        return config_tuple in self._hash_set
-
-    def add_batch(self, configs: torch.Tensor) -> Tuple[torch.Tensor, int]:
-        """
-        Add batch of configs, return only new unique ones.
-
-        Args:
-            configs: (batch_size, num_sites) configurations
-
-        Returns:
-            (new_unique_configs, count_added)
-        """
-        configs_cpu = configs.cpu()
-        new_configs = []
-        count_added = 0
-
-        for i in range(configs_cpu.shape[0]):
-            config_tuple = tuple(configs_cpu[i].tolist())
-            if config_tuple not in self._hash_set:
-                self._hash_set.add(config_tuple)
-                new_configs.append(configs[i])
-                count_added += 1
-
-        if count_added == 0:
-            return torch.empty(0, configs.shape[1], device=self.device), 0
-
-        return torch.stack(new_configs), count_added
-
-    def get_all_configs(self) -> Optional[torch.Tensor]:
-        """Get all stored configs as tensor."""
-        if len(self._hash_set) == 0:
-            return None
-        configs = [list(t) for t in self._hash_set]
-        return torch.tensor(configs, dtype=torch.long, device=self.device)
-
-    def clear(self):
-        """Clear the hash table."""
-        self._hash_set.clear()
-
-
-class IncrementalHamiltonianCache:
-    """
-    Incrementally updated Hamiltonian matrix cache.
-
-    When new basis states are added, only computes new rows/columns
-    instead of rebuilding the entire matrix.
+    Loss = w_teacher * L_teacher + w_physics * L_physics - w_entropy * H(flow)
     """
 
     def __init__(
         self,
-        hamiltonian,
+        flow: nn.Module,
+        nqs: nn.Module,
+        hamiltonian: Any,
+        config: PhysicsGuidedConfig,
         device: str = "cuda",
-        max_size: int = 8192,
     ):
+        self.flow = flow
+        self.nqs = nqs
         self.hamiltonian = hamiltonian
-        self.device = device
-        self.max_size = max_size
-
-        self._matrix: Optional[torch.Tensor] = None
-        self._basis: Optional[torch.Tensor] = None
-        self._size = 0
-
-    @property
-    def matrix(self) -> Optional[torch.Tensor]:
-        return self._matrix
-
-    @property
-    def basis(self) -> Optional[torch.Tensor]:
-        return self._basis
-
-    @property
-    def size(self) -> int:
-        return self._size
-
-    def update(self, new_basis: torch.Tensor) -> bool:
-        """
-        Update cache with new basis.
-
-        Returns True if cache was updated, False if basis too large.
-        """
-        if new_basis is None or len(new_basis) == 0:
-            return False
-
-        new_size = len(new_basis)
-
-        # Check size limit
-        if new_size > self.max_size:
-            self._matrix = None
-            self._basis = None
-            self._size = 0
-            return False
-
-        # Full rebuild needed
-        if self._matrix is None or self._size == 0:
-            self._full_rebuild(new_basis)
-            return True
-
-        # Check if basis changed
-        if new_size == self._size:
-            return True
-
-        # Incremental update
-        if new_size > self._size:
-            self._incremental_update(new_basis)
-            return True
-
-        # Basis shrunk or changed completely - rebuild
-        self._full_rebuild(new_basis)
-        return True
-
-    def _full_rebuild(self, basis: torch.Tensor):
-        """Rebuild entire Hamiltonian matrix."""
-        basis = basis.to(self.device)
-
-        if hasattr(self.hamiltonian, 'matrix_elements_fast'):
-            self._matrix = self.hamiltonian.matrix_elements_fast(basis)
-        else:
-            self._matrix = self.hamiltonian.matrix_elements(basis, basis).to(self.device)
-
-        self._basis = basis
-        self._size = len(basis)
-
-    def _incremental_update(self, new_basis: torch.Tensor):
-        """Incrementally add new rows/columns."""
-        new_basis = new_basis.to(self.device)
-        old_size = self._size
-        new_size = len(new_basis)
-
-        new_states = new_basis[old_size:]
-
-        # Compute new matrix blocks
-        if hasattr(self.hamiltonian, 'matrix_elements_fast'):
-            H_new_new = self.hamiltonian.matrix_elements_fast(new_states)
-        else:
-            H_new_new = self.hamiltonian.matrix_elements(new_states, new_states).to(self.device)
-
-        H_old_new = self.hamiltonian.matrix_elements(
-            self._basis, new_states
-        ).to(self.device)
-        H_new_old = self.hamiltonian.matrix_elements(
-            new_states, self._basis
-        ).to(self.device)
-
-        # Assemble new matrix
-        new_H = torch.zeros(new_size, new_size, device=self.device,
-                           dtype=self._matrix.dtype)
-        new_H[:old_size, :old_size] = self._matrix
-        new_H[:old_size, old_size:] = H_old_new
-        new_H[old_size:, :old_size] = H_new_old
-        new_H[old_size:, old_size:] = H_new_new
-
-        self._matrix = new_H
-        self._basis = new_basis
-        self._size = new_size
-
-    def get_energy(self, nqs, basis: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Compute energy E = <psi|H|psi> using cached matrix.
-
-        Args:
-            nqs: Neural quantum state
-            basis: Basis to use (defaults to cached basis)
-
-        Returns:
-            Energy expectation value
-        """
-        if basis is None:
-            basis = self._basis
-
-        if basis is None or self._matrix is None:
-            raise ValueError("Cache not initialized")
-
-        psi = nqs.psi(basis)
-        norm = torch.sqrt(torch.sum(torch.abs(psi)**2) + 1e-10)
-        psi_norm = psi / norm
-
-        if psi_norm.is_complex():
-            energy = torch.real(torch.conj(psi_norm) @ self._matrix @ psi_norm)
-        else:
-            energy = psi_norm @ self._matrix @ psi_norm
-
-        return energy
-
-
-class FlowNQSTrainer:
-    """
-    Trainer for co-training Normalizing Flow and Neural Quantum State.
-
-    The training alternates between:
-    1. Sampling configurations from the flow
-    2. Computing NQS probabilities and local energies
-    3. Updating flow parameters to sample high-probability regions
-    4. Updating NQS parameters to minimize energy
-
-    Includes GPU optimizations:
-    - Incremental Hamiltonian matrix caching
-    - O(1) basis deduplication via hash table
-    - Vectorized energy computation
-
-    Args:
-        flow: DiscreteFlowSampler instance
-        nqs: NeuralQuantumState instance
-        hamiltonian: Callable that computes H|x> for configurations
-        config: Training configuration
-        device: Torch device
-    """
-
-    def __init__(
-        self,
-        flow: DiscreteFlowSampler,
-        nqs: NeuralQuantumState,
-        hamiltonian: "Hamiltonian",
-        config: Optional[TrainingConfig] = None,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    ):
-        self.flow = flow.to(device)
-        self.nqs = nqs.to(device)
-        self.hamiltonian = hamiltonian
-        self.config = config or TrainingConfig()
+        self.config = config
         self.device = device
 
-        # Optimizers
-        self.flow_optimizer = optim.Adam(
-            self.flow.parameters(), lr=self.config.flow_lr
+        # Optimizers -- exclude log_temperature from gradient updates because
+        # temperature is controlled by the external annealing schedule.
+        # Including it would let AdamW fight the schedule each step.
+        flow_params = [p for n, p in flow.named_parameters() if 'log_temperature' not in n]
+        self.flow_optimizer = torch.optim.AdamW(
+            flow_params, lr=config.flow_lr, weight_decay=1e-5
         )
-        self.nqs_optimizer = optim.Adam(
-            self.nqs.parameters(), lr=self.config.nqs_lr
+        self.nqs_optimizer = torch.optim.AdamW(
+            nqs.parameters(), lr=config.nqs_lr, weight_decay=1e-5
         )
 
-        # History
+        # Schedulers
+        self.flow_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.flow_optimizer, T_max=config.num_epochs, eta_min=1e-6
+        )
+        self.nqs_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.nqs_optimizer, T_max=config.num_epochs, eta_min=1e-6
+        )
+
+        # Accumulated basis
+        self.accumulated_basis = None
+
+        # Connection cache for avoiding recomputation of Hamiltonian connections.
+        # Auto-scale max_cache_size to fit within UMA memory budget when the
+        # Hamiltonian provides orbital/electron counts.
+        self.connection_cache = None
+        if config.use_connection_cache:
+            num_sites = hamiltonian.num_sites
+            cache_size = config.max_cache_size
+            if hasattr(hamiltonian, "n_orbitals") and hasattr(hamiltonian, "n_alpha"):
+                safe_size = compute_max_cache_size(
+                    n_orbitals=hamiltonian.n_orbitals,
+                    n_alpha=hamiltonian.n_alpha,
+                    n_beta=hamiltonian.n_beta,
+                    num_sites=num_sites,
+                    memory_budget_mb=8192.0,  # 8 GB default budget
+                )
+                cache_size = min(cache_size, safe_size)
+            self.connection_cache = ConnectionCache(
+                num_sites=num_sites,
+                max_cache_size=cache_size,
+                device=device,
+            )
+
+        # torch.compile is disabled for NQS forward passes due to incompatibility
+        # with the encode_configuration method's dynamic control flow and the
+        # varying batch sizes used during local energy computation.
+        self._nqs_compiled = None
+
+        # Tracking
+        self.energy_ema = None
         self.history = {
-            "energies": [],
-            "ema_energies": [],
-            "flow_loss": [],
-            "nqs_loss": [],
-            "unique_ratio": [],
-            "epoch_times": [],
+            'energies': [],
+            'accumulated_energies': [],
+            'teacher_losses': [],
+            'physics_losses': [],
+            'entropy_values': [],
+            'unique_ratios': [],
+            'basis_sizes': [],
+            'cache_hit_rates': [],
         }
 
-        # Optimized data structures
-        self._basis_hash = GPUHashTable(device)
-        self._h_cache = IncrementalHamiltonianCache(
-            hamiltonian, device, self.config.max_cached_basis_size
-        )
+        # Early stopping tracking
+        self._best_energy = float('inf')
+        self._patience_counter = 0
 
-        # Accumulated basis tensor
-        self.accumulated_basis: Optional[torch.Tensor] = None
+        # Essential configurations (HF + singles + doubles) for molecular systems
+        self._essential_configs = None
+        if config.inject_essential_configs and hasattr(hamiltonian, 'n_alpha'):
+            self._essential_configs = self._generate_essential_configs()
 
-        # EMA energy tracking
-        self.ema_energy = None
-
-        # Epoch counter for periodic operations
-        self._epoch_counter = 0
-        self._last_accumulated_energy = None
-
-    def _update_accumulated_basis(self, unique_configs: torch.Tensor) -> int:
+    def _generate_essential_configs(self) -> torch.Tensor:
         """
-        Update accumulated basis with new configs using hash-based dedup.
+        Generate essential configurations: HF + singles + doubles.
 
-        Implements importance-based pruning when basis exceeds max size.
+        These configurations are CRITICAL for accurate ground state energy:
+        - HF: Has largest coefficient (~0.9) in ground state
+        - Singles: Important for orbital relaxation
+        - Doubles: Capture electron correlation (most important for chemical accuracy)
 
-        Returns number of new states added.
+        Without these, NF may explore wrong region of Hilbert space and
+        the subspace energy signal won't guide NF toward ground state.
+
+        Returns:
+            Tensor of essential configurations
         """
-        new_configs, n_added = self._basis_hash.add_batch(unique_configs)
+        config = self.config
+        n_orb = self.hamiltonian.n_orbitals
+        n_alpha = self.hamiltonian.n_alpha
+        n_beta = self.hamiltonian.n_beta
 
-        if n_added > 0:
-            if self.accumulated_basis is None:
-                self.accumulated_basis = new_configs
+        # Get HF state
+        hf_state = self.hamiltonian.get_hf_state()
+        essential = [hf_state.clone()]
+
+        # Get occupied and virtual orbitals
+        occ_alpha = list(range(n_alpha))
+        occ_beta = list(range(n_beta))
+        virt_alpha = list(range(n_alpha, n_orb))
+        virt_beta = list(range(n_beta, n_orb))
+
+        # Add single excitations
+        if config.include_singles_in_basis:
+            # Alpha singles
+            for i in occ_alpha:
+                for a in virt_alpha:
+                    new_config = hf_state.clone()
+                    new_config[i] = 0
+                    new_config[a] = 1
+                    essential.append(new_config)
+
+            # Beta singles
+            for i in occ_beta:
+                for a in virt_beta:
+                    new_config = hf_state.clone()
+                    new_config[i + n_orb] = 0
+                    new_config[a + n_orb] = 1
+                    essential.append(new_config)
+
+        # Add double excitations
+        if config.include_doubles_in_basis:
+            from itertools import combinations
+
+            # Proportional doubles allocation per type.
+            # alpha-beta doubles dominate correlation energy -- each type gets a fair
+            # share proportional to its total count, with alpha-beta guaranteed >= 50%.
+            max_doubles = 5000
+            from math import comb as _comb
+            n_aa_total = _comb(n_alpha, 2) * _comb(len(virt_alpha), 2)
+            n_bb_total = _comb(n_beta, 2) * _comb(len(virt_beta), 2)
+            n_ab_total = n_alpha * n_beta * len(virt_alpha) * len(virt_beta)
+            total_possible = n_aa_total + n_bb_total + n_ab_total
+
+            if total_possible <= max_doubles:
+                max_aa = n_aa_total
+                max_bb = n_bb_total
+                max_ab = n_ab_total
             else:
-                self.accumulated_basis = torch.cat(
-                    [self.accumulated_basis, new_configs], dim=0
-                )
+                ab_frac = max(0.5, n_ab_total / total_possible if total_possible > 0 else 0.5)
+                remaining_frac = 1.0 - ab_frac
+                aa_frac = remaining_frac * (n_aa_total / (n_aa_total + n_bb_total)) if (n_aa_total + n_bb_total) > 0 else 0
+                bb_frac = remaining_frac - aa_frac
+                max_ab = int(ab_frac * max_doubles)
+                max_aa = int(aa_frac * max_doubles)
+                max_bb = max_doubles - max_ab - max_aa
 
-        # Prune basis if too large
-        if (self.accumulated_basis is not None and
-            len(self.accumulated_basis) > self.config.max_accumulated_basis):
-            self._prune_basis()
+            # Alpha-alpha doubles
+            aa_count = 0
+            for i, j in combinations(occ_alpha, 2):
+                for a, b in combinations(virt_alpha, 2):
+                    if aa_count >= max_aa:
+                        break
+                    new_config = hf_state.clone()
+                    new_config[i] = 0
+                    new_config[j] = 0
+                    new_config[a] = 1
+                    new_config[b] = 1
+                    essential.append(new_config)
+                    aa_count += 1
+                if aa_count >= max_aa:
+                    break
 
-        return n_added
+            # Beta-beta doubles
+            bb_count = 0
+            for i, j in combinations(occ_beta, 2):
+                for a, b in combinations(virt_beta, 2):
+                    if bb_count >= max_bb:
+                        break
+                    new_config = hf_state.clone()
+                    new_config[i + n_orb] = 0
+                    new_config[j + n_orb] = 0
+                    new_config[a + n_orb] = 1
+                    new_config[b + n_orb] = 1
+                    essential.append(new_config)
+                    bb_count += 1
+                if bb_count >= max_bb:
+                    break
 
-    def _prune_basis(self):
+            # Alpha-beta doubles (most important for correlation)
+            ab_count = 0
+            for i in occ_alpha:
+                for j in occ_beta:
+                    for a in virt_alpha:
+                        for b in virt_beta:
+                            if ab_count >= max_ab:
+                                break
+                            new_config = hf_state.clone()
+                            new_config[i] = 0
+                            new_config[j + n_orb] = 0
+                            new_config[a] = 1
+                            new_config[b + n_orb] = 1
+                            essential.append(new_config)
+                            ab_count += 1
+                        if ab_count >= max_ab:
+                            break
+                    if ab_count >= max_ab:
+                        break
+                if ab_count >= max_ab:
+                    break
+
+        # Stack and remove duplicates
+        essential_tensor = torch.stack(essential).to(self.device)
+        essential_tensor = torch.unique(essential_tensor, dim=0)
+
+        n_singles = len([c for c in essential if torch.sum(torch.abs(c - hf_state)) == 2])
+        n_doubles = len(essential_tensor) - n_singles - 1
+
+        print(f"Generated {len(essential_tensor)} essential configs: "
+              f"1 HF + {n_singles} singles + {n_doubles} doubles")
+
+        return essential_tensor
+
+    def _warmup_cache_with_hf_neighborhood(self):
         """
-        Prune accumulated basis to max size using importance sampling.
+        Pre-populate the connection cache with HF neighborhood configurations.
 
-        Keeps states with highest |psi|^2 values.
+        This dramatically improves cache hit rate because:
+        1. HF and nearby excitations are the most physically important configs
+        2. During early training, the flow explores configs near HF
+        3. Pre-computing these avoids expensive on-the-fly computation
         """
-        if self.accumulated_basis is None:
+        if self.connection_cache is None:
             return
 
-        max_size = self.config.max_accumulated_basis
-        current_size = len(self.accumulated_basis)
-
-        if current_size <= max_size:
+        if not hasattr(self.hamiltonian, 'n_alpha'):
+            # Not a molecular Hamiltonian
             return
 
-        # Compute importance weights |psi|^2
-        with torch.no_grad():
-            log_amp = self.nqs.log_amplitude(self.accumulated_basis)
-            log_prob = 2 * log_amp
-            probs = torch.exp(log_prob - log_prob.max())  # Numerical stability
+        config = self.config
+        n_orb = self.hamiltonian.n_orbitals
+        n_alpha = self.hamiltonian.n_alpha
+        n_beta = self.hamiltonian.n_beta
 
-        # Keep top max_size states by importance
-        _, top_indices = torch.topk(probs, max_size)
-        top_indices = top_indices.sort().values  # Maintain order
+        print("Warming up connection cache with HF neighborhood...")
 
-        # Update accumulated basis
-        self.accumulated_basis = self.accumulated_basis[top_indices]
+        # Get HF state
+        hf_state = self.hamiltonian.get_hf_state()
 
-        # Rebuild hash table with pruned basis
-        self._basis_hash = GPUHashTable(self.device)
-        self._basis_hash.add_batch(self.accumulated_basis)
+        # Collect configurations to pre-cache
+        configs_to_cache = [hf_state]
 
-        # Invalidate cache - force rebuild
-        self._h_cache = IncrementalHamiltonianCache(
-            self.hamiltonian, self.device, self.config.max_cached_basis_size
-        )
+        # Get occupied and virtual orbitals
+        occ_alpha = list(range(n_alpha))
+        occ_beta = list(range(n_beta))
+        virt_alpha = list(range(n_alpha, n_orb))
+        virt_beta = list(range(n_beta, n_orb))
 
-    def compute_energy_expectation(
-        self,
-        configs: torch.Tensor,
-        use_subspace: bool = True,
-    ) -> torch.Tensor:
-        """
-        Compute energy expectation <psi|H|psi> over sampled configurations.
+        # Add single excitations
+        if config.cache_warmup_excitation_level >= 1:
+            # Alpha singles
+            for i in occ_alpha:
+                for a in virt_alpha:
+                    new_config = hf_state.clone()
+                    new_config[i] = 0
+                    new_config[a] = 1
+                    configs_to_cache.append(new_config)
 
-        Uses cached Hamiltonian matrix when available for efficiency.
+            # Beta singles
+            for i in occ_beta:
+                for a in virt_beta:
+                    new_config = hf_state.clone()
+                    new_config[i + n_orb] = 0
+                    new_config[a + n_orb] = 1
+                    configs_to_cache.append(new_config)
 
-        Args:
-            configs: Unique configurations, shape (n_configs, num_sites)
-            use_subspace: Whether to use subspace energy calculation
+        # Add double excitations
+        if config.cache_warmup_excitation_level >= 2:
+            from itertools import combinations
 
-        Returns:
-            Energy expectation value
-        """
-        # Try to use cached matrix
-        if (self.config.cache_hamiltonian and
-            self._h_cache.matrix is not None and
-            len(configs) == self._h_cache.size):
-            try:
-                return self._h_cache.get_energy(self.nqs, configs)
-            except:
-                pass
+            # Alpha-alpha doubles
+            for i, j in combinations(occ_alpha, 2):
+                for a, b in combinations(virt_alpha, 2):
+                    new_config = hf_state.clone()
+                    new_config[i] = 0
+                    new_config[j] = 0
+                    new_config[a] = 1
+                    new_config[b] = 1
+                    configs_to_cache.append(new_config)
 
-        # Fallback: compute directly
-        if hasattr(self.hamiltonian, 'matrix_elements_fast'):
-            H_matrix = self.hamiltonian.matrix_elements_fast(configs)
-        else:
-            H_matrix = self.hamiltonian.matrix_elements(configs.cpu(), configs.cpu())
-            H_matrix = H_matrix.to(self.device)
+            # Beta-beta doubles
+            for i, j in combinations(occ_beta, 2):
+                for a, b in combinations(virt_beta, 2):
+                    new_config = hf_state.clone()
+                    new_config[i + n_orb] = 0
+                    new_config[j + n_orb] = 0
+                    new_config[a + n_orb] = 1
+                    new_config[b + n_orb] = 1
+                    configs_to_cache.append(new_config)
 
-        psi = self.nqs.psi(configs)
-        psi = psi / torch.sqrt(torch.sum(torch.abs(psi)**2) + 1e-10)
+            # Alpha-beta doubles (most numerous)
+            for i in occ_alpha:
+                for j in occ_beta:
+                    for a in virt_alpha:
+                        for b in virt_beta:
+                            new_config = hf_state.clone()
+                            new_config[i] = 0
+                            new_config[j + n_orb] = 0
+                            new_config[a] = 1
+                            new_config[b + n_orb] = 1
+                            configs_to_cache.append(new_config)
 
-        if psi.is_complex():
-            energy = torch.real(torch.conj(psi) @ H_matrix @ psi)
-        else:
-            energy = psi @ H_matrix @ psi
+        # Stack and remove duplicates
+        configs_tensor = torch.stack(configs_to_cache).to(self.device)
+        configs_tensor = torch.unique(configs_tensor, dim=0)
 
-        return energy
+        n_warmup = len(configs_tensor)
+        print(f"  Pre-caching {n_warmup} HF neighborhood configurations...")
 
-    def compute_nqs_probabilities(
-        self, configs: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute normalized NQS probabilities p_theta(x) = |psi_theta(x)|^2 / Z.
+        # Cache connections for all configs (in batches to avoid memory issues)
+        batch_size = 500
+        cached = 0
 
-        Args:
-            configs: Configurations, shape (n_configs, num_sites)
+        for start in range(0, n_warmup, batch_size):
+            end = min(start + batch_size, n_warmup)
+            batch = configs_tensor[start:end]
 
-        Returns:
-            Normalized probabilities, shape (n_configs,)
-        """
-        log_amp = self.nqs.log_amplitude(configs)
-        log_prob = 2 * log_amp
-        log_Z = torch.logsumexp(log_prob, dim=0)
-        prob = torch.exp(log_prob - log_Z)
-        return prob
+            for cfg in batch:
+                connected, elements = self.hamiltonian.get_connections(cfg)
+                self.connection_cache.put(cfg, connected, elements)
+                cached += 1
 
-    def compute_flow_loss(
-        self,
-        configs: torch.Tensor,
-        nqs_probs: torch.Tensor,
-        energy: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute NF loss: cross-entropy weighted by energy with entropy regularization.
+        print(f"  Cached {cached} configurations ({self.connection_cache.stats()['size']} entries)")
 
-        L_phi = -|E| / |S| * sum_x p_theta(x) log(p_phi(x)) - beta * H(p_phi)
+    def train(self) -> Dict[str, list]:
+        """Run physics-guided training loop."""
+        config = self.config
 
-        Args:
-            configs: Unique configurations
-            nqs_probs: NQS probabilities p_theta(x)
-            energy: Current energy estimate
+        print(f"Starting physics-guided NF-NQS training")
+        print(f"  Teacher weight: {config.teacher_weight}")
+        print(f"  Physics weight: {config.physics_weight}")
+        print(f"  Entropy weight: {config.entropy_weight}")
+        if config.use_connection_cache:
+            print(f"  Connection cache: enabled (max {config.max_cache_size} entries)")
 
-        Returns:
-            Flow loss value
-        """
-        n_configs = configs.shape[0]
+        # Warm up cache with HF neighborhood before training
+        if config.use_connection_cache and config.cache_warmup:
+            self._warmup_cache_with_hf_neighborhood()
 
-        flow_probs = self.flow.estimate_discrete_prob(configs)
-        log_flow_probs = torch.log(flow_probs + 1e-10)
-
-        # Cross-entropy loss weighted by NQS probability
-        cross_entropy = -torch.sum(nqs_probs * log_flow_probs)
-        loss = torch.abs(energy) * cross_entropy / n_configs
-
-        # Entropy regularization to prevent premature collapse
-        entropy = -torch.sum(flow_probs * log_flow_probs)
-        loss = loss - self.config.entropy_weight * entropy
-
-        return loss
-
-    def train_step(self) -> Dict[str, float]:
-        """
-        Perform one training step with GPU optimizations.
-
-        Returns:
-            Dictionary with loss values and metrics
-        """
-        total_flow_loss = 0.0
-        total_nqs_loss = 0.0
-        total_energy = 0.0
-        total_unique_ratio = 0.0
-
-        for batch_idx in range(self.config.num_batches):
-            # Sample configurations from flow
-            all_configs, unique_configs = self.flow.sample(
-                self.config.samples_per_batch
-            )
-            unique_configs = unique_configs.to(self.device)
-
-            n_unique = unique_configs.shape[0]
-            unique_ratio = n_unique / self.config.samples_per_batch
-            total_unique_ratio += unique_ratio
-
-            # Update accumulated basis with hash-based dedup
-            n_added = self._update_accumulated_basis(unique_configs)
-
-            # Update cached Hamiltonian if basis grew
-            if n_added > 0 and self.config.cache_hamiltonian:
-                self._h_cache.update(self.accumulated_basis)
-
-            # Compute NQS probabilities
-            nqs_probs = self.compute_nqs_probabilities(unique_configs)
-
-            # Compute energy - use accumulated basis periodically for efficiency
-            use_accumulated = (
-                self.config.use_accumulated_energy and
-                self.accumulated_basis is not None and
-                (self._epoch_counter % self.config.accumulated_energy_interval == 0 or
-                 self._last_accumulated_energy is None)
-            )
-
-            if use_accumulated:
-                energy = self.compute_energy_expectation(
-                    self.accumulated_basis,
-                    use_subspace=not self.config.use_local_energy
-                )
-                self._last_accumulated_energy = energy.item()
-            elif self._last_accumulated_energy is not None:
-                # Use cached accumulated energy, but compute batch energy for gradient
-                energy = self.compute_energy_expectation(
-                    unique_configs,
-                    use_subspace=not self.config.use_local_energy
-                )
-            else:
-                energy = self.compute_energy_expectation(
-                    unique_configs,
-                    use_subspace=not self.config.use_local_energy
-                )
-            total_energy += energy.item()
-
-            # Update EMA energy
-            if self.ema_energy is None:
-                self.ema_energy = energy.item()
-            else:
-                self.ema_energy = (
-                    self.config.ema_decay * self.ema_energy +
-                    (1 - self.config.ema_decay) * energy.item()
-                )
-
-            # Compute flow loss
-            flow_loss = self.compute_flow_loss(unique_configs, nqs_probs, energy)
-            total_flow_loss += flow_loss.item()
-
-            # Update flow
-            self.flow_optimizer.zero_grad()
-            flow_loss.backward(retain_graph=True)
-            torch.nn.utils.clip_grad_norm_(
-                self.flow.parameters(), self.config.grad_clip
-            )
-            self.flow_optimizer.step()
-
-            # Update NQS with energy as loss
-            nqs_loss = energy
-            total_nqs_loss += nqs_loss.item()
-
-            self.nqs_optimizer.zero_grad()
-            nqs_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.nqs.parameters(), self.config.grad_clip
-            )
-            self.nqs_optimizer.step()
-
-        return {
-            "flow_loss": total_flow_loss / self.config.num_batches,
-            "nqs_loss": total_nqs_loss / self.config.num_batches,
-            "energy": total_energy / self.config.num_batches,
-            "ema_energy": self.ema_energy,
-            "unique_ratio": total_unique_ratio / self.config.num_batches,
-        }
-
-    def train(
-        self,
-        num_epochs: Optional[int] = None,
-        callback: Optional[Callable[[int, Dict], None]] = None,
-    ) -> Dict[str, list]:
-        """
-        Run full training loop.
-
-        Args:
-            num_epochs: Number of training epochs (overrides config)
-            callback: Optional callback called after each epoch
-
-        Returns:
-            Training history dictionary
-        """
-        if num_epochs is None:
-            num_epochs = self.config.num_epochs
-
-        pbar = tqdm(range(num_epochs), desc="Training NF-NQS")
+        pbar = tqdm(range(config.num_epochs), desc="Training")
 
         for epoch in pbar:
-            epoch_start = time.time()
-            self._epoch_counter = epoch
-            metrics = self.train_step()
-            epoch_time = time.time() - epoch_start
+            # Temperature annealing for particle-conserving flow (exponential decay)
+            # T(e) = T_final + (T_init - T_final) * exp(-rate * e)
+            # Rate chosen so T ~ T_final + 0.01*(T_init-T_final) at decay_epochs
+            if hasattr(self.flow, 'set_temperature'):
+                decay_rate = math.log(100) / max(config.temperature_decay_epochs, 1)
+                temperature = (
+                    config.final_temperature
+                    + (config.initial_temperature - config.final_temperature)
+                    * math.exp(-decay_rate * epoch)
+                )
+                self.flow.set_temperature(temperature)
 
-            # Record history
-            self.history["energies"].append(metrics["energy"])
-            self.history["ema_energies"].append(metrics["ema_energy"])
-            self.history["flow_loss"].append(metrics["flow_loss"])
-            self.history["nqs_loss"].append(metrics["nqs_loss"])
-            self.history["unique_ratio"].append(metrics["unique_ratio"])
-            self.history["epoch_times"].append(epoch_time)
+            # Training step
+            metrics = self._train_epoch(epoch)
 
-            # Update progress bar
-            basis_size = len(self.accumulated_basis) if self.accumulated_basis is not None else 0
-            pbar.set_postfix({
-                "E": f"{metrics['energy']:.4f}",
-                "EMA": f"{metrics['ema_energy']:.4f}",
-                "unique": f"{metrics['unique_ratio']:.2f}",
-                "basis": basis_size,
-            })
+            # Update history
+            self.history['energies'].append(metrics['energy'])
+            self.history['teacher_losses'].append(metrics['teacher_loss'])
+            self.history['physics_losses'].append(metrics['physics_loss'])
+            self.history['entropy_values'].append(metrics['entropy'])
+            self.history['unique_ratios'].append(metrics['unique_ratio'])
 
-            # Callback
-            if callback is not None:
-                callback(epoch, metrics)
+            if 'accumulated_energy' in metrics:
+                self.history['accumulated_energies'].append(metrics['accumulated_energy'])
+            if self.accumulated_basis is not None:
+                self.history['basis_sizes'].append(len(self.accumulated_basis))
+
+            # Track cache hit rate
+            cache_hit_rate = 0.0
+            if self.connection_cache is not None:
+                cache_hit_rate = self.connection_cache.hit_rate
+                self.history['cache_hit_rates'].append(cache_hit_rate)
+
+            # Update schedulers
+            self.flow_scheduler.step()
+            self.nqs_scheduler.step()
+
+            # Progress bar update with cache hit rate
+            postfix = {
+                'E': f"{metrics['energy']:.4f}",
+                'unique': f"{metrics['unique_ratio']:.2f}",
+                'T_loss': f"{metrics['teacher_loss']:.4f}",
+            }
+            if self.connection_cache is not None:
+                postfix['cache'] = f"{cache_hit_rate:.0%}"
+            pbar.set_postfix(postfix)
 
             # Check convergence
-            if epoch >= self.config.min_epochs and metrics["unique_ratio"] < self.config.convergence_threshold:
-                print(f"\nConverged at epoch {epoch}: unique ratio = {metrics['unique_ratio']:.2f}, "
-                      f"EMA energy = {metrics['ema_energy']:.4f}")
+            if epoch >= config.min_epochs:
+                if metrics['unique_ratio'] < config.convergence_threshold:
+                    print(f"\nConverged at epoch {epoch}: unique_ratio={metrics['unique_ratio']:.3f}")
+                    if self.connection_cache is not None:
+                        stats = self.connection_cache.stats()
+                        print(f"Cache stats: {stats['hits']} hits, {stats['misses']} misses, "
+                              f"{stats['hit_rate']:.1%} hit rate, {stats['size']} entries")
+                    break
+
+            # Early stopping on energy plateau
+            current_energy = metrics['energy']
+            if current_energy < self._best_energy - config.early_stopping_threshold:
+                self._best_energy = current_energy
+                self._patience_counter = 0
+            else:
+                self._patience_counter += 1
+
+            if self._patience_counter >= config.early_stopping_patience and epoch >= config.min_epochs:
+                print(f"\nEarly stopping at epoch {epoch}: no energy improvement for "
+                      f"{config.early_stopping_patience} epochs (best: {self._best_energy:.6f} Ha)")
+                if self.connection_cache is not None:
+                    stats = self.connection_cache.stats()
+                    print(f"Cache stats: {stats['hits']} hits, {stats['misses']} misses, "
+                          f"{stats['hit_rate']:.1%} hit rate, {stats['size']} entries")
                 break
 
-        # Print timing summary
-        if len(self.history["epoch_times"]) > 0:
-            avg_time = np.mean(self.history["epoch_times"])
-            total_time = np.sum(self.history["epoch_times"])
-            print(f"\nTraining complete: {len(self.history['epoch_times'])} epochs, "
-                  f"avg {avg_time:.3f}s/epoch, total {total_time:.1f}s")
+        # Print final cache stats
+        if self.connection_cache is not None:
+            stats = self.connection_cache.stats()
+            print(f"\nFinal cache stats: {stats['hits']} hits, {stats['misses']} misses, "
+                  f"{stats['hit_rate']:.1%} hit rate, {stats['size']} entries")
 
         return self.history
 
-    def extract_basis(self, n_samples: int = 10000) -> torch.Tensor:
-        """
-        Extract basis states from the trained flow.
+    def _train_epoch(self, epoch: int) -> Dict[str, float]:
+        """Single training epoch."""
+        config = self.config
+        self.flow.train()
+        self.nqs.train()
 
-        Uses accumulated basis from training if available (preferred),
-        otherwise samples fresh from the frozen flow.
+        total_metrics = {
+            'energy': 0.0,
+            'teacher_loss': 0.0,
+            'physics_loss': 0.0,
+            'entropy': 0.0,
+            'unique_ratio': 0.0,
+        }
 
-        Args:
-            n_samples: Number of samples to draw (only used if no accumulated basis)
-
-        Returns:
-            Unique configurations forming the basis
-        """
-        self.flow.eval()
-
-        if self.accumulated_basis is not None and len(self.accumulated_basis) > 0:
-            print(f"Using accumulated basis from training: {len(self.accumulated_basis)} states")
-            return self.accumulated_basis
-
-        with torch.no_grad():
-            _, unique_configs = self.flow.sample(n_samples)
-
-        return unique_configs
-
-    def save_checkpoint(self, path: str):
-        """Save model checkpoints and training state."""
-        torch.save({
-            "flow_state_dict": self.flow.state_dict(),
-            "nqs_state_dict": self.nqs.state_dict(),
-            "flow_optimizer": self.flow_optimizer.state_dict(),
-            "nqs_optimizer": self.nqs_optimizer.state_dict(),
-            "history": self.history,
-            "config": self.config,
-        }, path)
-
-    def load_checkpoint(self, path: str):
-        """Load model checkpoints and training state."""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.flow.load_state_dict(checkpoint["flow_state_dict"])
-        self.nqs.load_state_dict(checkpoint["nqs_state_dict"])
-        self.flow_optimizer.load_state_dict(checkpoint["flow_optimizer"])
-        self.nqs_optimizer.load_state_dict(checkpoint["nqs_optimizer"])
-        self.history = checkpoint["history"]
-
-
-class InferenceNQSTrainer:
-    """
-    Trainer for the inference phase after flow convergence.
-
-    After the flow has converged, we freeze it and train a fresh NQS
-    to accurately learn the amplitudes in the discovered subspace.
-    """
-
-    def __init__(
-        self,
-        flow: DiscreteFlowSampler,
-        nqs: NeuralQuantumState,
-        hamiltonian: "Hamiltonian",
-        lr: float = 1e-3,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    ):
-        self.flow = flow.to(device)
-        self.flow.eval()  # Freeze flow
-        self.nqs = nqs.to(device)
-        self.hamiltonian = hamiltonian
-        self.device = device
-
-        self.optimizer = optim.Adam(self.nqs.parameters(), lr=lr)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, factor=0.5, patience=20
-        )
-
-    def train(
-        self,
-        num_iters: int = 2000,
-        n_samples: int = 5000,
-    ) -> Dict[str, list]:
-        """
-        Train NQS on fixed subspace from flow.
-
-        Args:
-            num_iters: Number of training iterations
-            n_samples: Number of samples per iteration
-
-        Returns:
-            Training history
-        """
-        history = {"energies": []}
-
-        # Sample fixed basis from frozen flow
-        with torch.no_grad():
-            _, basis = self.flow.sample(n_samples)
-        basis = basis.to(self.device)
-
-        # Precompute Hamiltonian matrix
-        if hasattr(self.hamiltonian, 'matrix_elements_fast'):
-            H_matrix = self.hamiltonian.matrix_elements_fast(basis)
-        else:
-            H_matrix = self.hamiltonian.matrix_elements(basis.cpu(), basis.cpu())
-            H_matrix = H_matrix.to(self.device)
-
-        pbar = tqdm(range(num_iters), desc="Inference NQS Training")
-
-        for iteration in pbar:
-            psi = self.nqs.psi(basis)
-            psi_norm = psi / torch.sqrt(torch.sum(torch.abs(psi)**2) + 1e-10)
-
-            if psi.is_complex():
-                energy = torch.real(torch.conj(psi_norm) @ H_matrix @ psi_norm)
+        for batch_idx in range(config.num_batches):
+            # Sample from flow
+            if hasattr(self.flow, 'sample_with_probs'):
+                configs, log_probs, unique_configs = self.flow.sample_with_probs(
+                    config.samples_per_batch
+                )
             else:
-                energy = psi_norm @ H_matrix @ psi_norm
+                log_probs, unique_configs = self.flow.sample(config.samples_per_batch)
+                configs = unique_configs
 
-            self.optimizer.zero_grad()
-            energy.backward()
-            self.optimizer.step()
-            self.scheduler.step(energy)
+            n_unique = len(unique_configs)
+            unique_ratio = n_unique / config.samples_per_batch
 
-            history["energies"].append(energy.item())
-            pbar.set_postfix({"E": f"{energy.item():.6f}"})
+            # Compute NQS probabilities
+            with torch.no_grad():
+                nqs_log_amp = self.nqs.log_amplitude(unique_configs.float())
+                nqs_probs = torch.exp(2 * nqs_log_amp)  # |psi|^2 = exp(2*log|psi|)
+                nqs_probs = nqs_probs / nqs_probs.sum()
 
-        return history
+            # Compute energy using paper's subspace diagonalization method
+            # This is the CORRECT approach per paper Section 3.2-3.3
+            if config.use_subspace_energy:
+                # OPTIMIZATION: Compute subspace energy at specified interval
+                # (reduces O(n^3) diagonalization overhead for large systems)
+                compute_subspace_this_epoch = (
+                    epoch % config.subspace_energy_interval == 0 or
+                    epoch == 0 or  # Always compute first epoch
+                    not hasattr(self, '_cached_subspace_energy')
+                )
+
+                if compute_subspace_this_epoch:
+                    energy = self._compute_subspace_energy(unique_configs, nqs_probs)
+                    self._cached_subspace_energy = energy
+                else:
+                    energy = self._cached_subspace_energy
+
+                # Still compute local energies for REINFORCE gradient (NQS training)
+                local_energies = self._compute_local_energies(
+                    unique_configs,
+                    nqs_chunk_size=config.nqs_chunk_size,
+                )
+            else:
+                # Legacy mode: use local energy (not paper's approach)
+                local_energies = self._compute_local_energies(
+                    unique_configs,
+                    nqs_chunk_size=config.nqs_chunk_size,
+                )
+                energy = (local_energies * nqs_probs).sum()
+
+            # Update accumulated basis
+            self._update_accumulated_basis(unique_configs)
+
+            # Compute flow loss with mixed objectives
+            flow_loss, loss_components = self._compute_flow_loss(
+                configs, unique_configs, nqs_probs, local_energies, energy
+            )
+
+            # NQS loss (minimize energy)
+            nqs_loss = self._compute_nqs_loss(unique_configs, nqs_probs, local_energies)
+
+            # Backward pass
+            self.flow_optimizer.zero_grad()
+            self.nqs_optimizer.zero_grad()
+
+            flow_loss.backward(retain_graph=True)
+            nqs_loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.flow.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.nqs.parameters(), max_norm=1.0)
+
+            self.flow_optimizer.step()
+            self.nqs_optimizer.step()
+
+            # Accumulate metrics
+            total_metrics['energy'] += energy.item()
+            total_metrics['teacher_loss'] += loss_components['teacher'].item()
+            total_metrics['physics_loss'] += loss_components['physics'].item()
+            total_metrics['entropy'] += loss_components['entropy'].item()
+            total_metrics['unique_ratio'] += unique_ratio
+
+        # Average metrics
+        for key in total_metrics:
+            total_metrics[key] /= config.num_batches
+
+        # Update EMA
+        if self.energy_ema is None:
+            self.energy_ema = total_metrics['energy']
+        else:
+            self.energy_ema = (config.ema_decay * self.energy_ema +
+                             (1 - config.ema_decay) * total_metrics['energy'])
+        total_metrics['energy_ema'] = self.energy_ema
+
+        # Compute accumulated energy periodically
+        if (config.use_accumulated_energy and
+            epoch % config.accumulated_energy_interval == 0 and
+            self.accumulated_basis is not None):
+            acc_energy = self._compute_accumulated_energy()
+            total_metrics['accumulated_energy'] = acc_energy
+
+        return total_metrics
+
+    def _compute_subspace_energy(
+        self,
+        configs: torch.Tensor,
+        nqs_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute energy by diagonalizing H in sampled subspace (paper's method).
+
+        From paper Section 3.2-3.3:
+        "Energy is computed by diagonalizing H restricted to the sampled subspace S"
+
+        CRITICAL FIX: Always include essential configurations (HF + singles + doubles)
+        in the subspace. Without this, the NF may explore a region of Hilbert space
+        that doesn't include HF, leading to a poor energy signal that doesn't guide
+        the NF toward the ground state.
+
+        Args:
+            configs: (n_configs, num_sites) sampled configurations
+            nqs_probs: (n_configs,) NQS probabilities for each config
+
+        Returns:
+            Ground state energy in the subspace (scalar tensor)
+        """
+        config = self.config
+        n_configs = len(configs)
+
+        # CRITICAL: Merge with essential configs (HF + singles + doubles)
+        # This ensures the subspace always contains the ground state region
+        if self._essential_configs is not None:
+            configs = torch.cat([self._essential_configs, configs], dim=0)
+            configs = torch.unique(configs, dim=0)
+            n_configs = len(configs)
+
+        # For large bases, select top-N by NQS probability to keep computation tractable
+        # But ALWAYS keep essential configs (HF + singles + doubles)
+        if n_configs > config.max_subspace_diag_size:
+            if self._essential_configs is not None:
+                n_essential = len(self._essential_configs)
+
+                if n_essential >= config.max_subspace_diag_size:
+                    # Essential configs alone exceed limit - select most important ones
+                    # Always keep HF (index 0), then select by lowest diagonal energy.
+                    with torch.no_grad():
+                        diag_energies = self.hamiltonian.diagonal_elements_batch(
+                            self._essential_configs
+                        )
+                    n_select = config.max_subspace_diag_size - 1
+                    _, top_idx = torch.topk(diag_energies[1:], min(n_select, len(diag_energies) - 1), largest=False)
+                    selected_essential = torch.cat([
+                        self._essential_configs[:1],  # HF
+                        self._essential_configs[1:][top_idx],
+                    ], dim=0)
+                    configs = selected_essential
+                else:
+                    # Essential configs fit within limit - add best NF configs for the remainder
+                    max_sampled = config.max_subspace_diag_size - n_essential
+
+                    # Compute NQS probs for all configs to select best sampled ones
+                    with torch.no_grad():
+                        all_log_amp = self.nqs.log_amplitude(configs.float())
+                        all_probs = torch.exp(2 * all_log_amp)
+
+                    # Identify which configs are NOT in essential set using integer encoding
+                    try:
+                        from ..utils.config_hash import config_integer_hash
+                    except ImportError:
+                        from utils.config_hash import config_integer_hash
+
+                    all_ints = config_integer_hash(configs)
+                    ess_ints = config_integer_hash(self._essential_configs)
+                    ess_set = set(ess_ints)
+
+                    # Mask for non-essential configs
+                    non_ess_mask = torch.tensor(
+                        [x not in ess_set for x in all_ints],
+                        device=configs.device, dtype=torch.bool,
+                    )
+
+                    if non_ess_mask.any() and max_sampled > 0:
+                        non_ess_probs = all_probs[non_ess_mask]
+                        non_ess_configs = configs[non_ess_mask]
+                        k = min(max_sampled, len(non_ess_probs))
+                        _, top_indices = torch.topk(non_ess_probs, k)
+                        sampled_configs = non_ess_configs[top_indices]
+                        configs = torch.cat([self._essential_configs, sampled_configs], dim=0)
+                        configs = torch.unique(configs, dim=0)
+                    else:
+                        configs = self._essential_configs
+            else:
+                _, top_indices = torch.topk(nqs_probs, config.max_subspace_diag_size)
+                configs = configs[top_indices]
+
+            n_configs = len(configs)
+
+        with torch.no_grad():
+            # Build subspace Hamiltonian H_ij = <x_i|H|x_j>
+            H_subspace = self.hamiltonian.matrix_elements(configs, configs)
+
+            # Ensure Hermitian symmetry
+            H_subspace = 0.5 * (H_subspace + H_subspace.T)
+
+            # Use float64 for numerical stability
+            H_sub = H_subspace.double()
+
+            # Diagonalize to get ground state energy
+            eigenvalues = torch.linalg.eigvalsh(H_sub)
+            E_ground = eigenvalues[0]
+
+        return E_ground
+
+    def _compute_local_energies(
+        self,
+        configs: torch.Tensor,
+        nqs_chunk_size: int = 16384,
+        diagonal_only: bool = False,
+    ) -> torch.Tensor:
+        """
+        Compute local energies E_loc(x) = <x|H|psi>/<x|psi>.
+
+        Args:
+            configs: (n_configs, num_sites) basis configurations
+            nqs_chunk_size: Maximum batch size for NQS evaluation (default 16384)
+            diagonal_only: If True, only compute diagonal elements (fast warmup mode)
+
+        Returns:
+            (n_configs,) local energies
+        """
+        n_configs = len(configs)
+
+        with torch.no_grad():
+            # Step 1: Get diagonal elements (already vectorized and efficient)
+            diag = self.hamiltonian.diagonal_elements_batch(configs).to(self.device)
+
+            # Fast path: diagonal-only mode
+            if diagonal_only:
+                return diag
+
+            # Step 2: Get ALL connections (may be on Hamiltonian's device, move to trainer's)
+            all_connected, all_elements, all_orig_indices = self._get_connections_batch(configs)
+            all_connected = all_connected.to(self.device)
+            all_elements = all_elements.to(self.device)
+            all_orig_indices = all_orig_indices.to(self.device)
+
+            # If no off-diagonal connections, return diagonal energies
+            if len(all_connected) == 0:
+                return diag
+
+            total_connections = len(all_connected)
+
+            # Use compiled NQS if available for faster forward passes
+            nqs_forward = self._nqs_compiled if self._nqs_compiled is not None else self.nqs.log_amplitude
+
+            # Step 3: Evaluate NQS on original configs (single batch)
+            log_psi_orig = nqs_forward(configs.float()).clone()
+
+            # Step 4: Evaluate NQS on ALL connected configs in large chunks
+            log_psi_connected = torch.empty(total_connections, device=self.device, dtype=torch.float64)
+
+            for start in range(0, total_connections, nqs_chunk_size):
+                end = min(start + nqs_chunk_size, total_connections)
+                log_psi_connected[start:end] = nqs_forward(
+                    all_connected[start:end].float()
+                ).clone()
+
+            # Step 5: Compute amplitude ratios psi(connected)/psi(original)
+            log_psi_orig_expanded = log_psi_orig[all_orig_indices]
+            ratios = torch.exp(log_psi_connected - log_psi_orig_expanded)
+
+            # Step 6: Compute weighted contributions
+            weighted = all_elements * ratios
+
+            # Step 7: Accumulate off-diagonal contributions using scatter_add
+            off_diag = torch.zeros(n_configs, dtype=weighted.dtype, device=self.device)
+            off_diag.scatter_add_(0, all_orig_indices, weighted)
+
+            # Step 8: Total local energy = diagonal + off-diagonal
+            local_energies = diag + off_diag
+
+            # Handle complex values if present
+            if torch.is_complex(local_energies):
+                local_energies = local_energies.real
+
+        return local_energies
+
+    def _get_connections_batch(
+        self, configs: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get all connections for a batch of configurations."""
+        config = self.config
+
+        # Determine if we should use the cache
+        use_cache = False
+        if self.connection_cache is not None:
+            # Use cache if: hit rate is reasonable (>0.1), OR cache was just warmed up
+            # (no queries yet), OR cache is still small.
+            total_queries = self.connection_cache.hits + self.connection_cache.misses
+            use_cache = (
+                total_queries < 100 or  # Not enough data to judge hit rate yet
+                self.connection_cache.hit_rate > 0.1 or  # Hit rate is decent
+                len(self.connection_cache) < 1000  # Cache is small, overhead is low
+            )
+
+        if use_cache and self.connection_cache is not None:
+            return self.connection_cache.get_batch(configs, self.hamiltonian)
+        elif hasattr(self.hamiltonian, 'get_connections_vectorized_batch'):
+            # Vectorized batch path: 30-70x faster than sequential on GPU
+            return self.hamiltonian.get_connections_vectorized_batch(configs)
+        elif (config.use_parallel_connections and
+              hasattr(self.hamiltonian, 'get_connections_parallel')):
+            return self.hamiltonian.get_connections_parallel(
+                configs, max_workers=config.parallel_workers
+            )
+        else:
+            # Fallback: collect connections serially
+            all_connected = []
+            all_elements = []
+            all_orig_indices = []
+
+            for i in range(len(configs)):
+                connected, elements = self.hamiltonian.get_connections(configs[i])
+                n_conn = len(connected)
+                if n_conn > 0:
+                    all_connected.append(connected)
+                    all_elements.append(elements)
+                    all_orig_indices.append(
+                        torch.full((n_conn,), i, dtype=torch.long, device=self.device)
+                    )
+
+            if all_connected:
+                return (
+                    torch.cat(all_connected, dim=0),
+                    torch.cat(all_elements, dim=0),
+                    torch.cat(all_orig_indices, dim=0)
+                )
+            return (
+                torch.empty(0, configs.shape[1], device=self.device),
+                torch.empty(0, device=self.device),
+                torch.empty(0, dtype=torch.long, device=self.device)
+            )
+
+    def _compute_flow_loss(
+        self,
+        all_configs: torch.Tensor,
+        unique_configs: torch.Tensor,
+        nqs_probs: torch.Tensor,
+        local_energies: torch.Tensor,
+        energy: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute mixed-objective flow loss.
+
+        L = w_t * L_teacher + w_p * L_physics - w_e * H(flow)
+
+        Teacher loss: Cross-entropy between flow and NQS distributions
+        Physics loss: Encourage sampling low-energy configurations
+        Entropy: Maintain exploration diversity
+        """
+        config = self.config
+
+        # Get flow log-probabilities directly (avoids exp->log round-trip precision loss).
+        log_flow_probs_raw = self.flow.log_prob(unique_configs)
+
+        # Batch re-normalization for ParticleConservingFlowSampler
+        log_Z = torch.logsumexp(log_flow_probs_raw, dim=0)
+        log_flow_probs = log_flow_probs_raw - log_Z
+        flow_probs = torch.exp(log_flow_probs)
+
+        # === Teacher Loss ===
+        # KL(NQS || Flow) = sum p_nqs * (log p_nqs - log p_flow)
+        teacher_loss = -torch.sum(nqs_probs.detach() * log_flow_probs)
+
+        # === Physics Loss ===
+        # Encourage flow to sample low-energy configurations
+        if config.use_energy_baseline:
+            # Subtract baseline for variance reduction
+            energy_deviation = local_energies - energy.detach()
+        else:
+            energy_deviation = local_energies
+
+        # Physics loss = E_flow[E_loc] (minimize expected energy under flow)
+        physics_loss = (flow_probs * energy_deviation.detach()).sum()
+
+        # === Entropy Bonus ===
+        # H(flow) = -sum p_flow * log p_flow
+        entropy = -torch.sum(flow_probs * log_flow_probs)
+
+        # Combined loss: entropy is a regularizer independent of energy scale,
+        # so it must NOT be multiplied by |E|/batch_size. Only teacher and physics
+        # losses scale with energy magnitude (paper Eq. 16).
+        batch_size = len(all_configs)
+        energy_scale = torch.abs(energy.detach()) / batch_size
+
+        # Scale teacher + physics by energy magnitude
+        scaled_loss = (
+            config.teacher_weight * teacher_loss +
+            config.physics_weight * physics_loss
+        ) * energy_scale
+
+        # Entropy is added separately, unscaled -- it's a pure regularizer
+        total_loss = scaled_loss - config.entropy_weight * entropy
+
+        components = {
+            'teacher': teacher_loss,
+            'physics': physics_loss,
+            'entropy': entropy,
+        }
+
+        return total_loss, components
+
+    def _compute_nqs_loss(
+        self,
+        configs: torch.Tensor,
+        probs: torch.Tensor,
+        local_energies: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute NQS loss (energy minimization).
+
+        Uses variance-reduced estimator:
+        L = <E_loc> + lambda * Var(E_loc)
+        """
+        # Recompute with gradients
+        log_amp = self.nqs.log_amplitude(configs.float())
+        # log_probs = 2 * log_amp computes log(|psi|^2).
+        # This follows the standard VMC gradient formula:
+        # d<E>/dtheta = 2 * Re[<(E_loc - <E>) * d(log psi)/dtheta>]
+        log_probs = 2 * log_amp  # log(|psi|^2) = 2 * log|psi|
+
+        # REINFORCE-style gradient
+        energy = (local_energies.detach() * probs.detach()).sum()
+        centered_energies = local_energies.detach() - energy
+
+        # Policy gradient loss
+        loss = (centered_energies * log_probs * probs.detach()).sum()
+
+        return loss
+
+    def _update_accumulated_basis(self, new_configs: torch.Tensor):
+        """
+        Add new configurations to accumulated basis.
+
+        Uses hash-based deduplication for O(n) complexity instead of
+        torch.unique which is O(n log n).
+
+        CRITICAL: Always includes essential configs (HF + singles + doubles)
+        to ensure the accumulated basis contains the ground state region.
+        """
+        device = new_configs.device
+        num_sites = new_configs.shape[1]
+        max_size = self.config.max_accumulated_basis
+
+        # CRITICAL: Always include essential configs first
+        if self._essential_configs is not None and self.accumulated_basis is None:
+            # First call: initialize with essential configs
+            new_configs = torch.cat([self._essential_configs, new_configs], dim=0)
+
+        # Use overflow-safe integer hash for fast deduplication
+        try:
+            from ..utils.config_hash import config_integer_hash
+        except ImportError:
+            from utils.config_hash import config_integer_hash
+
+        if self.accumulated_basis is None:
+            # First batch: just deduplicate new_configs
+            keys = config_integer_hash(new_configs)
+            seen = {}
+            unique_indices = []
+            for i, k in enumerate(keys):
+                if k not in seen:
+                    seen[k] = True
+                    unique_indices.append(i)
+            self.accumulated_basis = new_configs[unique_indices]
+        else:
+            # Compute keys for existing basis
+            existing_keys = config_integer_hash(self.accumulated_basis)
+            existing_set = set(existing_keys)
+
+            # Find new unique configs
+            new_keys = config_integer_hash(new_configs)
+            new_unique_indices = []
+            for i, k in enumerate(new_keys):
+                if k not in existing_set:
+                    existing_set.add(k)
+                    new_unique_indices.append(i)
+
+            # Append new unique configs
+            if new_unique_indices:
+                self.accumulated_basis = torch.cat([
+                    self.accumulated_basis,
+                    new_configs[new_unique_indices]
+                ], dim=0)
+
+        # Prune if too large - keep essential configs + random subset of the rest
+        if len(self.accumulated_basis) > max_size:
+            if self._essential_configs is not None:
+                # CRITICAL: Always preserve essential configs (HF + singles + doubles)
+                n_essential = len(self._essential_configs)
+                ess_ints = set(config_integer_hash(self._essential_configs))
+                acc_ints = config_integer_hash(self.accumulated_basis)
+
+                essential_mask = torch.tensor(
+                    [k in ess_ints for k in acc_ints], dtype=torch.bool, device=device
+                )
+                non_essential_mask = ~essential_mask
+
+                essential_part = self.accumulated_basis[essential_mask]
+                non_essential_part = self.accumulated_basis[non_essential_mask]
+
+                # Fill remaining budget with random non-essential configs
+                remaining_budget = max_size - len(essential_part)
+                if remaining_budget > 0 and len(non_essential_part) > 0:
+                    n_keep = min(remaining_budget, len(non_essential_part))
+                    rand_idx = torch.randperm(len(non_essential_part), device=device)[:n_keep]
+                    self.accumulated_basis = torch.cat([essential_part, non_essential_part[rand_idx]], dim=0)
+                else:
+                    self.accumulated_basis = essential_part[:max_size]
+            else:
+                indices = torch.randperm(len(self.accumulated_basis), device=device)[:max_size]
+                self.accumulated_basis = self.accumulated_basis[indices]
+
+    def _compute_accumulated_energy(self) -> float:
+        """
+        Compute energy in accumulated basis via diagonalization.
+
+        Uses direct sparse construction for large bases (>3000 configs)
+        to avoid O(n^2) dense matrix allocation.
+        """
+        if self.accumulated_basis is None or len(self.accumulated_basis) == 0:
+            return float('inf')
+
+        n_basis = len(self.accumulated_basis)
+
+        with torch.no_grad():
+            # Direct sparse path for large bases -- avoids dense n*n allocation.
+            SPARSE_ACCUM_THRESHOLD = 3000
+            if n_basis > SPARSE_ACCUM_THRESHOLD and hasattr(self.hamiltonian, 'get_sparse_matrix_elements'):
+                from scipy.sparse import coo_matrix, diags
+                from scipy.sparse.linalg import eigsh
+                import gc
+
+                basis = self.accumulated_basis
+                try:
+                    rows, cols, vals = self.hamiltonian.get_sparse_matrix_elements(basis)
+                    rows_np = rows.cpu().numpy()
+                    cols_np = cols.cpu().numpy()
+                    vals_np = vals.cpu().numpy().astype(np.float64)
+                    # Free GPU tensors immediately
+                    del rows, cols, vals
+
+                    H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n_basis, n_basis))
+                    del rows_np, cols_np, vals_np
+                    diag_np = self.hamiltonian.diagonal_elements_batch(basis).cpu().numpy().astype(np.float64)
+                    H_csr = H_coo.tocsr()
+                    del H_coo
+                    H_csr = 0.5 * (H_csr + H_csr.T)
+                    H_csr = H_csr + diags(diag_np, 0, shape=(n_basis, n_basis), format='csr')
+                    del diag_np
+
+                    eigenvalues, _ = eigsh(H_csr, k=1, which='SA', tol=1e-6)
+                    return float(eigenvalues[0])
+                finally:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+            # Dense path for small bases
+            H_matrix = self.hamiltonian.matrix_elements(
+                self.accumulated_basis, self.accumulated_basis
+            )
+            H_np = H_matrix.cpu().numpy().astype(np.float64)
+            del H_matrix
+
+            # Ensure Hermitian
+            H_np = 0.5 * (H_np + H_np.T)
+
+            # Use sparse eigensolver for medium matrices
+            if n_basis > 500:
+                try:
+                    from scipy.sparse import csr_matrix
+                    from scipy.sparse.linalg import eigsh
+                    H_sparse = csr_matrix(H_np)
+                    del H_np
+                    eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-6)
+                    return float(eigenvalues[0])
+                except Exception as e:
+                    print(f"WARNING: sparse eigsh failed in _compute_accumulated_energy ({e}), falling back to dense")
+
+            # Dense diagonalization for small matrices
+            eigenvalues, _ = np.linalg.eigh(H_np)
+            return float(eigenvalues[0])
+
+
+def create_physics_guided_trainer(
+    flow: nn.Module,
+    nqs: nn.Module,
+    hamiltonian: Any,
+    device: str = "cuda",
+    teacher_weight: float = 1.0,
+    physics_weight: float = 0.1,
+    entropy_weight: float = 0.05,
+    **kwargs,
+) -> PhysicsGuidedFlowTrainer:
+    """
+    Factory function to create physics-guided trainer.
+
+    Args:
+        flow: Normalizing flow model (ParticleConservingFlowSampler)
+        nqs: Neural quantum state model (DenseNQS)
+        hamiltonian: System Hamiltonian (MolecularHamiltonian)
+        device: Compute device
+        teacher_weight: Weight for teacher signal (match NQS)
+        physics_weight: Weight for physics signal (favor low energy)
+        entropy_weight: Weight for entropy bonus (exploration)
+        **kwargs: Additional config parameters
+
+    Returns:
+        Configured PhysicsGuidedFlowTrainer
+    """
+    config = PhysicsGuidedConfig(
+        teacher_weight=teacher_weight,
+        physics_weight=physics_weight,
+        entropy_weight=entropy_weight,
+        **kwargs,
+    )
+
+    return PhysicsGuidedFlowTrainer(
+        flow=flow,
+        nqs=nqs,
+        hamiltonian=hamiltonian,
+        config=config,
+        device=device,
+    )

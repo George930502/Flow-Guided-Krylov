@@ -15,6 +15,63 @@ import torch
 from typing import Dict, Tuple, Optional, List
 
 
+def compute_max_cache_size(
+    n_orbitals: int,
+    n_alpha: int,
+    n_beta: int,
+    num_sites: int = 0,
+    memory_budget_mb: float = 8192.0,
+) -> int:
+    """
+    Compute max ConnectionCache entries that fit within a memory budget.
+
+    At 52Q (n_orb=26, n_alpha=5, n_beta=5): each entry stores ~15,435
+    connections × (52 sites × 8 + 8) bytes = ~6.6 MB. The default 100K
+    entries would need 666 GB — far exceeding 128 GB UMA.
+
+    This function computes the combinatorial upper bound on connections
+    per config (singles + same-spin doubles + alpha-beta doubles) and
+    sizes the cache accordingly.
+
+    Args:
+        n_orbitals: Number of spatial orbitals
+        n_alpha: Number of alpha electrons
+        n_beta: Number of beta electrons
+        num_sites: Number of spin-orbital sites (default: 2 * n_orbitals)
+        memory_budget_mb: Target memory budget in MB (default 8192 = 8 GB)
+
+    Returns:
+        Maximum number of cache entries that fit within the budget.
+    """
+    from math import comb
+
+    if num_sites <= 0:
+        num_sites = 2 * n_orbitals
+
+    # Upper-bound connections per config (Slater-Condon rules)
+    singles = n_alpha * (n_orbitals - n_alpha) + n_beta * (n_orbitals - n_beta)
+    same_doubles = (
+        comb(n_alpha, 2) * comb(n_orbitals - n_alpha, 2)
+        + comb(n_beta, 2) * comb(n_orbitals - n_beta, 2)
+    )
+    ab_doubles = (
+        n_alpha * (n_orbitals - n_alpha) * n_beta * (n_orbitals - n_beta)
+    )
+    avg_conn = singles + same_doubles + ab_doubles
+
+    # Memory per entry: connected configs tensor + elements tensor + Python overhead
+    # connected: (n_conn, num_sites) int64 → n_conn * num_sites * 8
+    # elements:  (n_conn,) float64         → n_conn * 8
+    # Python dict/LRU overhead             → ~200 bytes per entry
+    bytes_per_entry = avg_conn * (num_sites * 8 + 8) + 200
+
+    budget_bytes = memory_budget_mb * 1024 * 1024
+    max_entries = int(budget_bytes / max(bytes_per_entry, 1))
+
+    # Floor at 100 entries (cache is still useful for HF + singles)
+    return max(100, max_entries)
+
+
 class ConnectionCache:
     """
     Cache for Hamiltonian connections using GPU-accelerated integer encoding.
@@ -44,19 +101,27 @@ class ConnectionCache:
         self.device = device
         self.bypass_threshold = bypass_threshold
 
-        # Powers of 2 for integer encoding - precomputed on GPU
-        # Always use float64 for CUDA compatibility (CUDA doesn't support
-        # matmul for int64 tensors). For num_sites <= 52, float64 has
-        # enough precision for exact integer representation.
-        self.powers_gpu = (2.0 ** torch.arange(
-            num_sites - 1, -1, -1, device=device, dtype=torch.float64
-        ))
-
-        # Also keep CPU version for single config encoding
-        self.powers_cpu = self.powers_gpu.cpu()
+        # Powers of 2 for integer encoding - precomputed on GPU.
+        # For num_sites <= 52, float64 matmul is exact (53-bit mantissa).
+        # For num_sites >= 53, use split encoding via config_integer_hash
+        # to avoid hash collisions from float64 precision loss.
+        self._use_split_hash = num_sites >= 53
+        if not self._use_split_hash:
+            # Float64 powers for CUDA matmul compatibility (CUDA doesn't
+            # support matmul for int64). Safe for num_sites <= 52 (53-bit mantissa).
+            # For 53-63 sites: float64 loses low bits but config_integer_hash
+            # is used as primary path in _encode_batch.
+            self.powers_gpu = (2.0 ** torch.arange(
+                num_sites - 1, -1, -1, device=device, dtype=torch.float64
+            ))
+            self.powers_cpu = self.powers_gpu.cpu()
+        else:
+            self.powers_gpu = None
+            self.powers_cpu = None
 
         # Cache storage: key -> (connected_configs, matrix_elements)
-        self._cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        # Keys are int (n_sites < 64) or tuple[int,int] (n_sites >= 64)
+        self._cache: Dict = {}
 
         # Access counter for LRU eviction
         self._access_count: Dict[int, int] = {}
@@ -71,8 +136,14 @@ class ConnectionCache:
         self._recent_total = 0
         self._bypass_check_interval = 100
 
-    def _encode_config(self, config: torch.Tensor) -> int:
-        """Encode a single configuration as integer (GPU-accelerated)."""
+    def _encode_config(self, config: torch.Tensor):
+        """Encode a single configuration as a hashable key (GPU-accelerated).
+
+        Returns int for num_sites < 64, or tuple[int,int] for num_sites >= 64.
+        """
+        if self._use_split_hash:
+            from .config_hash import config_integer_hash
+            return config_integer_hash(config.unsqueeze(0))[0]
         if config.device != self.powers_gpu.device:
             # Use CPU version if config is on CPU
             return int((config.double().cpu() * self.powers_cpu).sum().item())
@@ -85,20 +156,32 @@ class ConnectionCache:
 
         This is 10-50x faster than the CPU Python loop version.
 
-        Note: CUDA doesn't support matmul for Long (int64) tensors,
-        so we use double precision (powers_gpu is already float64).
+        Note: For num_sites >= 64, this falls through to _encode_batch
+        which uses config_integer_hash (returns list, not tensor).
 
         Args:
             configs: (n_configs, num_sites) tensor on GPU
 
         Returns:
-            (n_configs,) tensor of integer keys
+            (n_configs,) tensor of integer keys (only for num_sites < 64)
         """
+        if self._use_split_hash:
+            raise RuntimeError(
+                "Cannot use _encode_batch_gpu for num_sites >= 64; "
+                "use _encode_batch instead."
+            )
         configs_gpu = configs.to(self.device, dtype=torch.float64)
         return (configs_gpu @ self.powers_gpu).long()
 
-    def _encode_batch(self, configs: torch.Tensor) -> List[int]:
-        """Encode batch of configurations as integers (returns Python list)."""
+    def _encode_batch(self, configs: torch.Tensor) -> List:
+        """Encode batch of configurations as hashable keys (returns Python list).
+
+        Returns list of int for num_sites < 64, or list of tuple[int,int]
+        for num_sites >= 64.
+        """
+        if self._use_split_hash:
+            from .config_hash import config_integer_hash
+            return config_integer_hash(configs)
         keys_tensor = self._encode_batch_gpu(configs)
         return keys_tensor.tolist()
 
@@ -119,6 +202,7 @@ class ConnectionCache:
         if key in self._cache:
             self.hits += 1
             self._recent_hits += 1
+            self._recent_total += 1
             self._total_accesses += 1
             self._access_count[key] = self._total_accesses
             return self._cache[key]
@@ -180,8 +264,12 @@ class ConnectionCache:
         return connected, elements
 
     def should_bypass(self) -> bool:
-        """Check if cache should be bypassed due to low hit rate."""
-        self._recent_total += 1
+        """Check if cache should be bypassed due to low hit rate.
+
+        NOTE: Do NOT increment _recent_total here — it is already incremented
+        in get() on cache miss (line 152) and _recent_hits on cache hit (line 146).
+        Double-counting would inflate the denominator and trigger premature bypass.
+        """
         if self._recent_total >= self._bypass_check_interval:
             recent_hit_rate = self._recent_hits / self._recent_total
             # Reset counters
@@ -212,9 +300,8 @@ class ConnectionCache:
         n_configs = len(configs)
         device = self.device
 
-        # GPU-accelerated batch encoding (single matmul instead of Python loop)
-        keys_tensor = self._encode_batch_gpu(configs)
-        keys = keys_tensor.tolist()
+        # Batch encoding (overflow-safe for num_sites >= 64)
+        keys = self._encode_batch(configs)
 
         all_connected = []
         all_elements = []
@@ -266,9 +353,10 @@ class ConnectionCache:
                     all_elements.append(batch_elements)
                     all_indices.append(remapped_indices)
 
-                # Cache individual results
+                # Cache individual results (O(n) lookup via reverse map)
+                idx_to_local = {idx: local for local, idx in enumerate(configs_to_compute)}
                 for idx, key in configs_to_compute_indices:
-                    mask = batch_indices_long == configs_to_compute.index(idx)
+                    mask = batch_indices_long == idx_to_local[idx]
                     if mask.sum() > 0:
                         self._cache[key] = (
                             batch_connected[mask],
