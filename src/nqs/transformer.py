@@ -14,9 +14,10 @@ Key differences from the original Psiformer:
 - Second quantization (binary occupation strings) instead of first quantization
 - Autoregressive factorization over orbitals instead of electron coordinates
 - Separate alpha/beta channels with cross-attention for spin coupling
+- KV cache for O(n²) sampling instead of O(n³)
 
 References:
-- von Glehn et al. (2023) "A self-attention ansatz for ab-initio quantum chemistry" (Psiformer)
+- von Glehn et al. (2023) "A self-attention ansatz for ab-initio quantum chemistry"
 - Sharir et al. (2020) "Deep autoregressive models for the efficient variational simulation"
 - Barrett et al. (2022) "Autoregressive neural-network wavefunctions for ab initio quantum chemistry"
 """
@@ -25,7 +26,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 try:
     from .base import NeuralQuantumState
@@ -34,7 +35,7 @@ except ImportError:
 
 
 class CausalSelfAttention(nn.Module):
-    """Multi-head causal (masked) self-attention."""
+    """Multi-head causal (masked) self-attention with optional KV cache."""
 
     def __init__(self, embed_dim: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
@@ -46,30 +47,46 @@ class CausalSelfAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache: bool = False):
         B, T, C = x.shape
 
         qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, n_heads, T, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
+        # Append to KV cache if provided
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
+        new_kv = (k, v) if use_cache else None
+
         # Scaled dot-product attention
         attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
 
-        # Causal mask: prevent attending to future positions
-        if mask is None:
-            mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        # Causal mask (only needed for full-sequence forward, not cached single-step)
+        if past_kv is None and mask is None:
+            T_k = k.shape[2]
+            mask = torch.triu(torch.ones(T, T_k, device=x.device), diagonal=1).bool()
+        if mask is not None:
+            attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
 
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
         out = (attn @ v).transpose(1, 2).reshape(B, T, C)
-        return self.out_proj(out)
+        out = self.out_proj(out)
+
+        if use_cache:
+            return out, new_kv
+        return out
 
 
 class CrossAttention(nn.Module):
-    """Multi-head cross-attention (beta attending to alpha)."""
+    """Multi-head cross-attention (beta attending to alpha) with optional KV cache."""
 
     def __init__(self, embed_dim: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
@@ -82,25 +99,37 @@ class CrossAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, query: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(self, query: torch.Tensor, context: torch.Tensor,
+                cached_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache: bool = False):
         B, T_q, C = query.shape
-        T_k = context.shape[1]
 
         q = self.q_proj(query).reshape(B, T_q, self.n_heads, self.head_dim).transpose(1, 2)
-        kv = self.kv_proj(context).reshape(B, T_k, 2, self.n_heads, self.head_dim)
-        kv = kv.permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]
+
+        if cached_kv is not None:
+            k, v = cached_kv
+        else:
+            T_k = context.shape[1]
+            kv = self.kv_proj(context).reshape(B, T_k, 2, self.n_heads, self.head_dim)
+            kv = kv.permute(2, 0, 3, 1, 4)
+            k, v = kv[0], kv[1]
+
+        cross_kv = (k, v) if use_cache else None
 
         attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
         out = (attn @ v).transpose(1, 2).reshape(B, T_q, C)
-        return self.out_proj(out)
+        out = self.out_proj(out)
+
+        if use_cache:
+            return out, cross_kv
+        return out
 
 
 class TransformerBlock(nn.Module):
-    """Transformer block with causal self-attention + optional cross-attention."""
+    """Transformer block with causal self-attention + optional cross-attention + KV cache."""
 
     def __init__(self, embed_dim: int, n_heads: int, ffn_dim: int,
                  dropout: float = 0.0, has_cross_attn: bool = False):
@@ -122,16 +151,35 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Self-attention with residual
-        x = x + self.self_attn(self.ln1(x), mask)
+                mask: Optional[torch.Tensor] = None,
+                past_self_kv=None, past_cross_kv=None, use_cache=False):
 
-        # Cross-attention with residual (beta attending to alpha)
+        # Self-attention (with KV cache)
+        if use_cache:
+            sa_out, new_self_kv = self.self_attn(
+                self.ln1(x), mask, past_kv=past_self_kv, use_cache=True
+            )
+            x = x + sa_out
+        else:
+            x = x + self.self_attn(self.ln1(x), mask)
+            new_self_kv = None
+
+        # Cross-attention (with KV cache for context)
+        new_cross_kv = None
         if self.has_cross_attn and context is not None:
-            x = x + self.cross_attn(self.ln_cross(x), context)
+            if use_cache:
+                ca_out, new_cross_kv = self.cross_attn(
+                    self.ln_cross(x), context, cached_kv=past_cross_kv, use_cache=True
+                )
+                x = x + ca_out
+            else:
+                x = x + self.cross_attn(self.ln_cross(x), context)
 
-        # FFN with residual
+        # FFN
         x = x + self.ffn(self.ln2(x))
+
+        if use_cache:
+            return x, new_self_kv, new_cross_kv
         return x
 
 
@@ -145,7 +193,7 @@ class AutoregressiveTransformer(nn.Module):
       cross-attention to alpha (sees full alpha configuration)
 
     Sampling:
-    - Sequential: predict P(σ_i=1 | σ_{<i}) at each step
+    - KV-cached: O(n²) total attention (not O(n³))
     - Constrained: enforce exact particle number (n_alpha, n_beta)
     """
 
@@ -166,35 +214,28 @@ class AutoregressiveTransformer(nn.Module):
         self.n_beta = n_beta
         self.n_qubits = 2 * n_orbitals
         self.embed_dim = embed_dim
+        self.n_layers = n_layers
 
         if ffn_dim is None:
             ffn_dim = 4 * embed_dim
 
-        # Embeddings
-        # Occupation embedding: 0 or 1 -> embed_dim
         self.occ_embedding = nn.Embedding(2, embed_dim)
-        # Positional embedding for orbital index
         self.pos_embedding = nn.Embedding(n_orbitals, embed_dim)
-        # Start token (learned)
         self.start_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
 
-        # Alpha transformer (causal self-attention only)
         self.alpha_blocks = nn.ModuleList([
             TransformerBlock(embed_dim, n_heads, ffn_dim, dropout, has_cross_attn=False)
             for _ in range(n_layers)
         ])
 
-        # Beta transformer (causal self-attention + cross-attention to alpha)
         self.beta_blocks = nn.ModuleList([
             TransformerBlock(embed_dim, n_heads, ffn_dim, dropout, has_cross_attn=True)
             for _ in range(n_layers)
         ])
 
-        # Output heads: predict logit for occupation at each position
         self.alpha_head = nn.Linear(embed_dim, 1)
         self.beta_head = nn.Linear(embed_dim, 1)
 
-        # Layer norms before output
         self.alpha_ln = nn.LayerNorm(embed_dim)
         self.beta_ln = nn.LayerNorm(embed_dim)
 
@@ -206,48 +247,26 @@ class AutoregressiveTransformer(nn.Module):
                 nn.init.xavier_normal_(p, gain=0.02)
 
     def _alpha_logits(self, alpha_config: torch.Tensor) -> torch.Tensor:
-        """
-        Compute logits for alpha orbitals autoregressively.
-
-        Args:
-            alpha_config: (B, T) partial or full alpha config (0/1), T <= n_orbitals
-
-        Returns:
-            logits: (B, T) logit for P(σ_i=1) at each position
-        """
+        """Compute logits for alpha orbitals (full-sequence, no cache)."""
         B, T = alpha_config.shape
         device = alpha_config.device
 
-        # Embed occupations and add positional encoding
-        # Shift right: input at position i is the occupation at position i-1
-        # Position 0 gets the start token
-        occ_emb = self.occ_embedding(alpha_config.long())  # (B, T, embed_dim)
+        occ_emb = self.occ_embedding(alpha_config.long())
         pos_idx = torch.arange(T, device=device)
-        pos_emb = self.pos_embedding(pos_idx)  # (T, embed_dim)
+        pos_emb = self.pos_embedding(pos_idx)
 
-        # Shift: prepend start token, remove last
-        start = self.start_token.expand(B, -1, -1)  # (B, 1, embed_dim)
-        x = torch.cat([start, occ_emb[:, :-1, :]], dim=1) + pos_emb  # (B, T, embed_dim)
+        start = self.start_token.expand(B, -1, -1)
+        x = torch.cat([start, occ_emb[:, :-1, :]], dim=1) + pos_emb
 
-        # Causal transformer
         for block in self.alpha_blocks:
             x = block(x)
 
-        logits = self.alpha_head(self.alpha_ln(x)).squeeze(-1)  # (B, T)
+        logits = self.alpha_head(self.alpha_ln(x)).squeeze(-1)
         return logits
 
     def _beta_logits(self, beta_config: torch.Tensor,
                      alpha_context: torch.Tensor) -> torch.Tensor:
-        """
-        Compute logits for beta orbitals, conditioned on full alpha config.
-
-        Args:
-            beta_config: (B, T) partial or full beta config
-            alpha_context: (B, n_orbitals, embed_dim) alpha transformer output
-
-        Returns:
-            logits: (B, T)
-        """
+        """Compute logits for beta orbitals (full-sequence, no cache)."""
         B, T = beta_config.shape
         device = beta_config.device
 
@@ -258,7 +277,6 @@ class AutoregressiveTransformer(nn.Module):
         start = self.start_token.expand(B, -1, -1)
         x = torch.cat([start, occ_emb[:, :-1, :]], dim=1) + pos_emb
 
-        # Causal self-attention + cross-attention to alpha
         for block in self.beta_blocks:
             x = block(x, context=alpha_context)
 
@@ -266,7 +284,7 @@ class AutoregressiveTransformer(nn.Module):
         return logits
 
     def _get_alpha_context(self, alpha_config: torch.Tensor) -> torch.Tensor:
-        """Get alpha transformer hidden states for beta cross-attention."""
+        """Get alpha hidden states for beta cross-attention (bidirectional)."""
         B = alpha_config.shape[0]
         device = alpha_config.device
 
@@ -274,38 +292,24 @@ class AutoregressiveTransformer(nn.Module):
         pos_idx = torch.arange(self.n_orbitals, device=device)
         pos_emb = self.pos_embedding(pos_idx)
 
-        # For context, use bidirectional (no causal mask) since beta
-        # sees the FULL alpha configuration
         x = occ_emb + pos_emb
 
-        # Use alpha blocks but without causal mask
-        no_mask = torch.zeros(self.n_orbitals, self.n_orbitals,
-                              device=device).bool()
+        no_mask = torch.zeros(self.n_orbitals, self.n_orbitals, device=device).bool()
         for block in self.alpha_blocks:
             x = block(x, mask=no_mask)
 
-        return x  # (B, n_orbitals, embed_dim)
+        return x
 
     def log_prob(self, config: torch.Tensor) -> torch.Tensor:
-        """
-        Compute log P(config) for a batch of full configurations.
-
-        Args:
-            config: (B, 2*n_orbitals) binary occupation string
-
-        Returns:
-            log_prob: (B,)
-        """
+        """Compute log P(config) via teacher forcing (full-sequence, no cache)."""
         alpha = config[:, :self.n_orbitals]
         beta = config[:, self.n_orbitals:]
 
-        # Alpha log prob
-        alpha_logits = self._alpha_logits(alpha)  # (B, n_orbitals)
+        alpha_logits = self._alpha_logits(alpha)
         alpha_log_prob = -F.binary_cross_entropy_with_logits(
             alpha_logits, alpha.float(), reduction='none'
-        ).sum(dim=-1)  # (B,)
+        ).sum(dim=-1)
 
-        # Beta log prob (conditioned on alpha)
         alpha_context = self._get_alpha_context(alpha)
         beta_logits = self._beta_logits(beta, alpha_context)
         beta_log_prob = -F.binary_cross_entropy_with_logits(
@@ -318,64 +322,102 @@ class AutoregressiveTransformer(nn.Module):
     def sample(self, n_samples: int, hard: bool = True,
                temperature: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Autoregressively sample configurations with exact particle number.
+        KV-cached autoregressive sampling with exact particle number.
 
-        Args:
-            n_samples: number of samples
-            hard: ignored (always hard for autoregressive)
-            temperature: sampling temperature
-
-        Returns:
-            configs: (n_samples, 2*n_orbitals) binary configs
-            log_probs: (n_samples,) log probabilities
+        Each step processes only the new token, appending to cached K/V.
+        Total attention: O(n_layers * n_orb²) instead of O(n_layers * n_orb³).
         """
         device = next(self.parameters()).device
         n_orb = self.n_orbitals
+        B = n_samples
 
-        # Sample alpha orbitals
-        alpha = torch.zeros(n_samples, n_orb, device=device)
-        alpha_log_prob = torch.zeros(n_samples, device=device)
+        # ── Alpha channel (KV-cached) ──
+        alpha = torch.zeros(B, n_orb, device=device)
+        alpha_log_prob = torch.zeros(B, device=device)
+
+        # Initialize cache: one entry per layer
+        alpha_kv_cache = [None] * self.n_layers
 
         for i in range(n_orb):
-            # Get logit for position i
-            logits = self._alpha_logits(alpha[:, :i+1])  # (B, i+1)
-            logit_i = logits[:, i] / temperature
+            # Build input for this step only
+            if i == 0:
+                x = self.start_token.expand(B, -1, -1)  # (B, 1, embed)
+            else:
+                prev_occ = alpha[:, i - 1].long().unsqueeze(1)  # (B, 1)
+                x = self.occ_embedding(prev_occ)  # (B, 1, embed)
 
-            # Constrain: enforce exact n_alpha electrons
-            placed = alpha[:, :i].sum(dim=1)  # electrons already placed
-            remaining_slots = n_orb - i  # positions remaining (including current)
-            needed = self.n_alpha - placed  # electrons still needed
+            x = x + self.pos_embedding.weight[i].unsqueeze(0).unsqueeze(0)
 
-            # Must place: if needed == remaining_slots, force 1
+            # Forward through alpha blocks with KV cache
+            for layer_idx, block in enumerate(self.alpha_blocks):
+                x, new_self_kv, _ = block(
+                    x, past_self_kv=alpha_kv_cache[layer_idx], use_cache=True
+                )
+                alpha_kv_cache[layer_idx] = new_self_kv
+
+            logit_i = self.alpha_head(self.alpha_ln(x)).squeeze(-1).squeeze(-1)  # (B,)
+            logit_i = logit_i / temperature
+
+            # Particle conservation constraints
+            placed = alpha[:, :i].sum(dim=1)
+            remaining_slots = n_orb - i
+            needed = self.n_alpha - placed
+
             must_place = (needed >= remaining_slots)
-            # Cannot place: if already placed enough
             cannot_place = (placed >= self.n_alpha)
-
             logit_i = torch.where(must_place, torch.tensor(10.0, device=device), logit_i)
             logit_i = torch.where(cannot_place, torch.tensor(-10.0, device=device), logit_i)
 
-            # Sample
             prob_i = torch.sigmoid(logit_i)
             sample_i = torch.bernoulli(prob_i)
             alpha[:, i] = sample_i
 
-            # Accumulate log prob
             alpha_log_prob += torch.where(
-                sample_i == 1,
-                F.logsigmoid(logit_i),
-                F.logsigmoid(-logit_i),
+                sample_i == 1, F.logsigmoid(logit_i), F.logsigmoid(-logit_i),
             )
 
-        # Get alpha context for beta
+        # ── Alpha context for beta cross-attention (computed once) ──
         alpha_context = self._get_alpha_context(alpha)
 
-        # Sample beta orbitals
-        beta = torch.zeros(n_samples, n_orb, device=device)
-        beta_log_prob = torch.zeros(n_samples, device=device)
+        # Pre-compute cross-attention KV from alpha_context (reused every beta step)
+        cross_kv_cache = []
+        for block in self.beta_blocks:
+            if block.has_cross_attn:
+                _, cross_kv = block.cross_attn(
+                    # Dummy query just to extract KV from context
+                    torch.zeros(B, 1, self.embed_dim, device=device),
+                    alpha_context, use_cache=True,
+                )
+                cross_kv_cache.append(cross_kv)
+            else:
+                cross_kv_cache.append(None)
+
+        # ── Beta channel (KV-cached, with cross-attention KV pre-computed) ──
+        beta = torch.zeros(B, n_orb, device=device)
+        beta_log_prob = torch.zeros(B, device=device)
+
+        beta_self_kv_cache = [None] * self.n_layers
 
         for i in range(n_orb):
-            logits = self._beta_logits(beta[:, :i+1], alpha_context)
-            logit_i = logits[:, i] / temperature
+            if i == 0:
+                x = self.start_token.expand(B, -1, -1)
+            else:
+                prev_occ = beta[:, i - 1].long().unsqueeze(1)
+                x = self.occ_embedding(prev_occ)
+
+            x = x + self.pos_embedding.weight[i].unsqueeze(0).unsqueeze(0)
+
+            for layer_idx, block in enumerate(self.beta_blocks):
+                x, new_self_kv, _ = block(
+                    x, context=alpha_context,
+                    past_self_kv=beta_self_kv_cache[layer_idx],
+                    past_cross_kv=cross_kv_cache[layer_idx],
+                    use_cache=True,
+                )
+                beta_self_kv_cache[layer_idx] = new_self_kv
+
+            logit_i = self.beta_head(self.beta_ln(x)).squeeze(-1).squeeze(-1)
+            logit_i = logit_i / temperature
 
             placed = beta[:, :i].sum(dim=1)
             remaining_slots = n_orb - i
@@ -383,7 +425,6 @@ class AutoregressiveTransformer(nn.Module):
 
             must_place = (needed >= remaining_slots)
             cannot_place = (placed >= self.n_beta)
-
             logit_i = torch.where(must_place, torch.tensor(10.0, device=device), logit_i)
             logit_i = torch.where(cannot_place, torch.tensor(-10.0, device=device), logit_i)
 
@@ -392,9 +433,7 @@ class AutoregressiveTransformer(nn.Module):
             beta[:, i] = sample_i
 
             beta_log_prob += torch.where(
-                sample_i == 1,
-                F.logsigmoid(logit_i),
-                F.logsigmoid(-logit_i),
+                sample_i == 1, F.logsigmoid(logit_i), F.logsigmoid(-logit_i),
             )
 
         configs = torch.cat([alpha, beta], dim=1)
@@ -405,77 +444,56 @@ class AutoregressiveTransformer(nn.Module):
 
 class TransformerNQS(NeuralQuantumState):
     """
-    Transformer-based NQS for log-amplitude estimation.
-
-    Uses bidirectional self-attention (non-causal) to estimate log|ψ(x)|
-    for a given configuration. This is used as the "teacher" network
-    in physics-guided training.
+    Bidirectional Transformer NQS for log-amplitude estimation.
+    (Not autoregressive — used as a separate network for energy evaluation.)
     """
 
-    def __init__(
-        self,
-        num_sites: int,
-        embed_dim: int = 128,
-        n_heads: int = 4,
-        n_layers: int = 4,
-        ffn_dim: Optional[int] = None,
-        dropout: float = 0.0,
-    ):
-        super().__init__(num_sites, local_dim=2, complex_output=False)
+    def __init__(self, n_orbitals: int, embed_dim: int = 128,
+                 n_heads: int = 4, n_layers: int = 4,
+                 ffn_dim: Optional[int] = None, dropout: float = 0.0):
+        super().__init__()
+        self.n_orbitals = n_orbitals
+        self.n_sites = 2 * n_orbitals
 
         if ffn_dim is None:
             ffn_dim = 4 * embed_dim
 
-        self.embed_dim = embed_dim
         self.occ_embedding = nn.Embedding(2, embed_dim)
-        self.pos_embedding = nn.Embedding(num_sites, embed_dim)
+        self.pos_embedding = nn.Embedding(2 * n_orbitals, embed_dim)
 
-        # Bidirectional transformer (no causal mask)
         self.blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, n_heads, ffn_dim, dropout)
+            TransformerBlock(embed_dim, n_heads, ffn_dim, dropout, has_cross_attn=False)
             for _ in range(n_layers)
         ])
 
         self.ln = nn.LayerNorm(embed_dim)
-
-        # Pool over sites -> scalar log amplitude
         self.head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 2),
+            nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim // 2, 1),
-            nn.Tanh(),
+            nn.Linear(embed_dim, 1),
         )
 
-        self.log_amp_scale = nn.Parameter(torch.tensor(1.0))
+        self._init_weights()
 
-    def log_amplitude(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.encode_configuration(x)
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        B, T = x.shape
+    def _init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_normal_(p, gain=0.02)
 
-        device = next(self.parameters()).device
-        # Clamp to valid range [0, 1] then convert to long indices
-        x = x.clamp(0, 1).round().long().to(device)
+    def log_prob(self, config: torch.Tensor) -> torch.Tensor:
+        B = config.shape[0]
+        device = config.device
 
-        occ_emb = self.occ_embedding(x)
-        pos_idx = torch.arange(T, device=device)
+        occ_emb = self.occ_embedding(config.long())
+        pos_idx = torch.arange(self.n_sites, device=device)
         pos_emb = self.pos_embedding(pos_idx)
 
-        h = occ_emb + pos_emb
+        x = occ_emb + pos_emb
 
-        # Bidirectional: no causal mask
-        no_mask = torch.zeros(T, T, device=device).bool()
+        no_mask = torch.zeros(self.n_sites, self.n_sites, device=device).bool()
         for block in self.blocks:
-            h = block(h, mask=no_mask)
+            x = block(x, mask=no_mask)
 
-        h = self.ln(h)
-
-        # Mean pool over sites
-        pooled = h.mean(dim=1)  # (B, embed_dim)
-        out = self.head(pooled).squeeze(-1)  # (B,)
-
-        return self.log_amp_scale * out
-
-    def phase(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.zeros(x.shape[0], device=next(self.parameters()).device)
+        x = self.ln(x)
+        log_amp = self.head(x).squeeze(-1).sum(dim=-1)
+        return 2 * log_amp
