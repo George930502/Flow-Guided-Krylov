@@ -451,7 +451,7 @@ class TransformerNQS(NeuralQuantumState):
     def __init__(self, n_orbitals: int, embed_dim: int = 128,
                  n_heads: int = 4, n_layers: int = 4,
                  ffn_dim: Optional[int] = None, dropout: float = 0.0):
-        super().__init__()
+        super().__init__(num_sites=2 * n_orbitals, local_dim=2, complex_output=False)
         self.n_orbitals = n_orbitals
         self.n_sites = 2 * n_orbitals
 
@@ -479,6 +479,14 @@ class TransformerNQS(NeuralQuantumState):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_normal_(p, gain=0.02)
+
+    def log_amplitude(self, x: torch.Tensor) -> torch.Tensor:
+        """Log amplitude: 0.5 * log_prob(x)."""
+        return 0.5 * self.log_prob(x)
+
+    def phase(self, x: torch.Tensor) -> torch.Tensor:
+        """Phase is zero for real-valued NQS."""
+        return torch.zeros(x.shape[0], device=x.device)
 
     def log_prob(self, config: torch.Tensor) -> torch.Tensor:
         B = config.shape[0]

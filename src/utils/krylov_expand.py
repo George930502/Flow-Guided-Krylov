@@ -134,10 +134,11 @@ def _collect_connections(refs, hamiltonian, existing_keys):
         connected = connected.cpu().long()
         if elements is not None:
             elements_np = elements.detach().cpu().numpy()
-            assert len(elements_np) == len(connected), (
-                f"get_connections returned {len(connected)} configs but "
-                f"{len(elements_np)} elements"
-            )
+            if len(elements_np) != len(connected):
+                raise ValueError(
+                    f"get_connections returned {len(connected)} configs but "
+                    f"{len(elements_np)} elements"
+                )
         else:
             elements_np = np.ones(len(connected))
 

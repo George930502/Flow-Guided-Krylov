@@ -7,7 +7,6 @@ and get_combined_basis bug fix.
 import sys
 import os
 
-import numpy as np
 import pytest
 import torch
 from math import comb

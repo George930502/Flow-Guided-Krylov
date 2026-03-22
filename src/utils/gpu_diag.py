@@ -15,7 +15,6 @@ import warnings
 import numpy as np
 import torch
 
-from scipy.sparse import csr_matrix as scipy_csr
 from scipy.sparse.linalg import eigsh as scipy_eigsh
 
 try:
@@ -82,8 +81,8 @@ def compute_occupancies_flat(configs, v0):
         np.ndarray of shape (2*n_orb,) — flat orbital occupancies.
     """
     configs_np = np.asarray(configs, dtype=np.float64)
-    v0_np = np.asarray(v0, dtype=np.float64)
-    probs = v0_np ** 2
+    v0_np = np.asarray(v0)
+    probs = np.abs(v0_np) ** 2
     return (probs[:, None] * configs_np).sum(axis=0)
 
 

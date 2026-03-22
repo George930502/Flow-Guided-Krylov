@@ -327,7 +327,7 @@ def _update_nqs_from_sqd(nqs, optimizer, cumulative_bs, e0, eigvec,
             # ── PR #1: Use eigenvector |c_i|² as weights ──
             # This is the NQS-SC distillation approach: exact ground state
             # probabilities from diag, strictly better than diagonal energy proxy.
-            weights = torch.from_numpy(eigvec ** 2).float()
+            weights = torch.from_numpy(np.abs(eigvec) ** 2).float()
             weights = weights / weights.sum()
 
             # Advantage still uses diagonal energies for REINFORCE term

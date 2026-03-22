@@ -18,8 +18,13 @@ from itertools import combinations
 from utils.gpu_diag import gpu_solve_fermion
 from utils.format_utils import configs_to_ibm_format, ibm_format_to_configs
 
-# IBM's solve_fermion
-from qiskit_addon_sqd.fermion import solve_fermion
+# IBM's solve_fermion (optional dependency)
+try:
+    from qiskit_addon_sqd.fermion import solve_fermion
+    HAS_IBM = True
+except ImportError:
+    HAS_IBM = False
+    print("  NOTE: qiskit-addon-sqd not installed. Skipping IBM comparison.")
 
 
 def build_full_basis(H):
@@ -65,18 +70,20 @@ def benchmark_system(name, H, max_basis=None):
     print(f"{'='*60}")
 
     # ── IBM solve_fermion ──
-    t0 = time.perf_counter()
-    try:
-        e_ibm, sci_state, occ_ibm, spin_sq = solve_fermion(ibm_bs, hcore, eri, spin_sq=0)
-        e_ibm_total = e_ibm + nuclear_repulsion
-        t_ibm = time.perf_counter() - t0
-        ibm_ok = True
-    except Exception as ex:
-        e_ibm_total = None
-        t_ibm = time.perf_counter() - t0
-        occ_ibm = None
-        ibm_ok = False
-        print(f"  IBM solve_fermion FAILED: {ex}")
+    ibm_ok = False
+    e_ibm_total = None
+    t_ibm = 0
+    occ_ibm = None
+    if HAS_IBM:
+        t0 = time.perf_counter()
+        try:
+            e_ibm, sci_state, occ_ibm, spin_sq = solve_fermion(ibm_bs, hcore, eri, spin_sq=0)
+            e_ibm_total = e_ibm + nuclear_repulsion
+            t_ibm = time.perf_counter() - t0
+            ibm_ok = True
+        except Exception as ex:
+            t_ibm = time.perf_counter() - t0
+            print(f"  IBM solve_fermion FAILED: {ex}")
 
     # ── GPU solve_fermion ──
     t0 = time.perf_counter()
