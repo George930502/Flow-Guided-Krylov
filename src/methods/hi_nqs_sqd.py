@@ -133,6 +133,7 @@ def run_hi_nqs_sqd(hamiltonian, mol_info,
     converge_count = 0
     avg_occupancies = None
     best_eigvec = None  # Store eigenvector for NQS training
+    iteration = -1  # Initialized before loop for safe metadata access
 
     # Cumulative basis: IBM format (bool ndarray) for config recovery compatibility
     cumulative_bs = None
@@ -302,7 +303,7 @@ def run_hi_nqs_sqd(hamiltonian, mol_info,
         method="HI+NQS+SQD",
         converged=converged,
         metadata={
-            "iterations": iteration + 1 if "iteration" in dir() else 0,
+            "iterations": iteration + 1,
             "energy_history": energy_history,
             "basis_size_history": basis_size_history,
             "device": device,
@@ -371,8 +372,10 @@ def _update_nqs_from_sqd(nqs, optimizer, cumulative_bs, e0, eigvec,
         optimizer.step()
 
         del batch_configs, log_probs, loss
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+
+    # Free GPU memory after training loop (not per-step — empty_cache is expensive)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ── Legacy format conversion (kept for backward compatibility) ──

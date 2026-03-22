@@ -81,7 +81,7 @@ class TestPostKrylovMerge:
         e_krylov, _, _ = gpu_solve_fermion(krylov_basis, H)
         e_merged, _, _ = gpu_solve_fermion(merged, H)
 
-        # Variational principle: merged >= both
+        # Variational principle: merged (larger subspace) <= both subsets
         assert e_merged <= e_nqs + 1e-10, f"E_merged={e_merged:.8f} > E_nqs={e_nqs:.8f}"
         assert e_merged <= e_krylov + 1e-10, f"E_merged={e_merged:.8f} > E_krylov={e_krylov:.8f}"
 

@@ -56,8 +56,9 @@ def compute_occupancies(configs, v0, n_orb=None):
         This matches IBM's solve_fermion occupancy format.
     """
     configs_np = np.asarray(configs, dtype=np.float64)
-    v0_np = np.asarray(v0, dtype=np.float64)
-    probs = v0_np ** 2
+    v0_np = np.asarray(v0)
+    # Handle complex eigenvectors: |c_i|^2, not c_i^2
+    probs = np.abs(v0_np) ** 2
     occ_flat = (probs[:, None] * configs_np).sum(axis=0)
 
     if n_orb is None:
@@ -138,7 +139,7 @@ def gpu_solve_fermion(configs, hamiltonian, max_dense=MAX_DENSE_CONFIGS):
     H_np = 0.5 * (H_np + H_np.T)
 
     # ── Diagonalize ──
-    if n <= SPARSE_THRESHOLD:
+    if n <= min(SPARSE_THRESHOLD, max_dense):
         E0, v0 = _dense_diag(H_np)
     else:
         # Use Lanczos iterative solver (avoids O(n^3) dense diag)
@@ -181,15 +182,22 @@ def _iterative_diag(H_np):
     """
     n = H_np.shape[0]
 
-    # Try CuPy GPU Lanczos eigsh
+    # Try CuPy GPU: use dense eigh for moderate sizes, sparse eigsh for large
     if CUPY_AVAILABLE:
         try:
             H_gpu = cp.asarray(H_np)
-            H_sparse = cupy_csr(H_gpu)
-            eigenvalues, eigenvectors = cupy_eigsh(H_sparse, k=1, which="SA")
-            E0 = float(cp.asnumpy(eigenvalues[0]))
-            v0 = cp.asnumpy(eigenvectors[:, 0])
-            del H_gpu, H_sparse
+            if n <= 8000:
+                # Dense CuPy eigh (faster than CSR conversion for moderate matrices)
+                eigenvalues, eigenvectors = cp.linalg.eigh(H_gpu)
+                E0 = float(cp.asnumpy(eigenvalues[0]))
+                v0 = cp.asnumpy(eigenvectors[:, 0])
+            else:
+                # Large: use CuPy sparse eigsh (Lanczos)
+                H_sparse = cupy_csr(H_gpu)
+                eigenvalues, eigenvectors = cupy_eigsh(H_sparse, k=1, which="SA")
+                E0 = float(cp.asnumpy(eigenvalues[0]))
+                v0 = cp.asnumpy(eigenvectors[:, 0])
+            del H_gpu
             return E0, v0
         except Exception as e:
             warnings.warn(f"CuPy eigsh failed ({e}), falling back to SciPy")

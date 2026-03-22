@@ -84,6 +84,7 @@ class TestConfigsToIBMFormat:
         result_old = _configs_to_ibm_original(configs, n_orb, n_qubits)
         np.testing.assert_array_equal(result_new, result_old)
 
+    @pytest.mark.slow
     def test_large_batch_performance(self):
         """Vectorized should be >= 5x faster than original Python loop."""
         n_orb, n_qubits = 13, 26
@@ -154,6 +155,7 @@ class TestIBMFormatToConfigs:
         result_old = _ibm_to_configs_original(ibm, n_orb, n_qubits)
         torch.testing.assert_close(result_new, result_old)
 
+    @pytest.mark.slow
     def test_large_batch_performance(self):
         """Vectorized should be >= 5x faster than original Python loop."""
         n_orb, n_qubits = 13, 26

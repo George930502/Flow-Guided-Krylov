@@ -9,12 +9,17 @@ Usage in HI+NQS+SKQD pipeline:
 2. expand_basis_via_connections(basis, H) → expanded basis with H-connected configs
 3. Diagonalize expanded basis → better energy
 
-This is equivalent to one "hop" of Krylov expansion: H|basis⟩ discovers
-configs connected via Slater-Condon rules (singles + doubles).
+Performs 2-hop Krylov expansion: first hop discovers singles/doubles from
+seed configs, second hop expands from those to reach up to quadruples.
+Each hop uses Slater-Condon rules via hamiltonian.get_connections().
 """
+
+import logging
 
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def expand_basis_via_connections(
@@ -29,14 +34,17 @@ def expand_basis_via_connections(
     For each reference config in basis, computes get_connections() to find
     single/double excitations, then adds the highest-coupling new configs.
 
+    NOTE: The first n_ref configs in basis are used as references. For best
+    results, ensure basis is ordered with HF and low-energy configs first.
+
     Args:
-        basis: torch.Tensor (n_configs, 2*n_orb) — seed configurations.
+        basis: torch.Tensor or np.ndarray (n_configs, 2*n_orb) — seed configs.
         hamiltonian: MolecularHamiltonian with get_connections() method.
-        max_new: int — maximum new configs to add.
+        max_new: int — maximum new configs to add per hop.
         n_ref: int — number of reference configs to expand from.
                      If None, uses min(len(basis), 50).
-        coupling_rank: bool — if True, rank new configs by |H_ij| coupling
-                       strength and keep top max_new. If False, keep first found.
+        coupling_rank: bool — if True, rank new configs by max |H_ij| coupling
+                       strength across all references and keep top max_new.
 
     Returns:
         torch.Tensor (n_expanded, 2*n_orb) — expanded basis (seed + new).
@@ -53,25 +61,71 @@ def expand_basis_via_connections(
     basis = basis.cpu().long()
 
     n_seed = len(basis)
-    n_sites = basis.shape[1]
 
-    # Build set of existing configs for O(1) dedup
-    existing = {row.tobytes() for row in basis.numpy()}
+    # Build set of existing config keys for O(1) dedup
+    existing_keys = {row.tobytes() for row in basis.numpy()}
 
     if n_ref is None:
         n_ref = min(n_seed, 50)
 
-    # Select reference configs (first n_ref — typically HF + low-energy)
+    # Select reference configs (first n_ref — should be HF + low-energy)
     refs = basis[:n_ref]
 
-    # Discover connected configs
-    new_configs = []
-    new_couplings = []
+    # ── First hop: discover connected configs with max-coupling tracking ──
+    new_map, new_configs_map = _collect_connections(refs, hamiltonian, existing_keys)
+
+    if not new_map:
+        return basis
+
+    # Build tensors from the collected configs
+    keys_list = list(new_map.keys())
+    new_configs = [new_configs_map[k] for k in keys_list]
+    new_couplings = np.array([new_map[k] for k in keys_list])
+    new_tensor = torch.stack(new_configs)
+
+    # Rank by coupling strength and keep top max_new
+    new_tensor, new_couplings = _truncate_by_coupling(
+        new_tensor, new_couplings, max_new, coupling_rank
+    )
+
+    # Concatenate seed + first hop
+    expanded = torch.cat([basis, new_tensor], dim=0)
+
+    # ── Second hop: expand from first-hop configs (capped at 50 refs) ──
+    if len(new_tensor) > 0 and max_new > len(new_tensor):
+        remaining = max_new - len(new_tensor)
+        second_refs = new_tensor[:min(50, len(new_tensor))]
+        hop2_map, hop2_configs_map = _collect_connections(
+            second_refs, hamiltonian, existing_keys
+        )
+        if hop2_map:
+            keys2 = list(hop2_map.keys())
+            hop2_tensor = torch.stack([hop2_configs_map[k] for k in keys2])
+            hop2_couplings = np.array([hop2_map[k] for k in keys2])
+            hop2_tensor, _ = _truncate_by_coupling(
+                hop2_tensor, hop2_couplings, remaining, coupling_rank
+            )
+            if len(hop2_tensor) > 0:
+                expanded = torch.cat([expanded, hop2_tensor], dim=0)
+
+    return expanded
+
+
+def _collect_connections(refs, hamiltonian, existing_keys):
+    """Collect connected configs from references, tracking max coupling per config.
+
+    Returns:
+        new_map: dict[bytes → float] — config key → max |H_ij| coupling
+        new_configs_map: dict[bytes → Tensor] — config key → config tensor
+    """
+    new_map = {}  # key → max coupling
+    new_configs_map = {}  # key → config tensor
 
     for ref in refs:
         try:
             connected, elements = hamiltonian.get_connections(ref)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"get_connections failed: {e}")
             continue
 
         if connected is None or len(connected) == 0:
@@ -80,76 +134,36 @@ def expand_basis_via_connections(
         connected = connected.cpu().long()
         if elements is not None:
             elements_np = elements.detach().cpu().numpy()
+            assert len(elements_np) == len(connected), (
+                f"get_connections returned {len(connected)} configs but "
+                f"{len(elements_np)} elements"
+            )
         else:
             elements_np = np.ones(len(connected))
 
         for i in range(len(connected)):
             key = connected[i].numpy().tobytes()
-            if key not in existing:
-                existing.add(key)
-                new_configs.append(connected[i])
-                coupling = abs(float(elements_np[i])) if i < len(elements_np) else 0.0
-                new_couplings.append(coupling)
+            if key in existing_keys:
+                continue
+            coupling = abs(float(elements_np[i]))
 
-    if not new_configs:
-        return basis
+            # Track max coupling across all references (C3 fix)
+            if key not in new_map or coupling > new_map[key]:
+                new_map[key] = coupling
+                new_configs_map[key] = connected[i]
 
-    new_tensor = torch.stack(new_configs)
-    new_couplings_np = np.array(new_couplings)
+    # Add all newly discovered keys to existing set for cross-hop dedup
+    existing_keys.update(new_map.keys())
 
-    # Rank by coupling strength and keep top max_new
-    if coupling_rank and len(new_configs) > max_new:
-        top_idx = np.argsort(new_couplings_np)[::-1][:max_new].copy()
-        new_tensor = new_tensor[top_idx]
-    elif len(new_configs) > max_new:
-        new_tensor = new_tensor[:max_new]
-
-    # Concatenate seed + new
-    expanded = torch.cat([basis, new_tensor], dim=0)
-
-    # Multi-hop: expand again from new configs to discover 2-hop connections
-    # This finds configs reachable via 2 excitations (e.g., quadruples from HF)
-    if len(new_tensor) > 0 and max_new > len(new_tensor):
-        remaining = max_new - len(new_tensor)
-        second_hop = _single_hop(new_tensor, hamiltonian, existing, remaining, coupling_rank)
-        if len(second_hop) > 0:
-            expanded = torch.cat([expanded, second_hop], dim=0)
-
-    return expanded
+    return new_map, new_configs_map
 
 
-def _single_hop(refs, hamiltonian, existing, max_new, coupling_rank):
-    """One hop of connection expansion from refs, excluding existing."""
-    new_configs = []
-    new_couplings = []
-
-    for ref in refs:
-        try:
-            connected, elements = hamiltonian.get_connections(ref)
-        except Exception:
-            continue
-        if connected is None or len(connected) == 0:
-            continue
-
-        connected = connected.cpu().long()
-        elements_np = elements.detach().cpu().numpy() if elements is not None else np.ones(len(connected))
-
-        for i in range(len(connected)):
-            key = connected[i].numpy().tobytes()
-            if key not in existing:
-                existing.add(key)
-                new_configs.append(connected[i])
-                coupling = abs(float(elements_np[i])) if i < len(elements_np) else 0.0
-                new_couplings.append(coupling)
-
-    if not new_configs:
-        return torch.zeros(0, refs.shape[1], dtype=torch.long)
-
-    new_tensor = torch.stack(new_configs)
-    if coupling_rank and len(new_configs) > max_new:
-        top_idx = np.argsort(np.array(new_couplings))[::-1][:max_new].copy()
-        new_tensor = new_tensor[top_idx]
-    elif len(new_configs) > max_new:
-        new_tensor = new_tensor[:max_new]
-
-    return new_tensor
+def _truncate_by_coupling(tensor, couplings, max_new, coupling_rank):
+    """Keep top max_new configs by coupling strength."""
+    if len(tensor) <= max_new:
+        return tensor, couplings
+    if coupling_rank:
+        top_idx = np.argsort(couplings)[::-1][:max_new].copy()
+    else:
+        top_idx = np.arange(max_new)
+    return tensor[top_idx], couplings[top_idx]

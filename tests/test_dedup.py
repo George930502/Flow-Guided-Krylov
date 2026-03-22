@@ -58,6 +58,7 @@ class TestVectorizedDedup:
         result = vectorized_dedup(existing, new)
         assert len(result) == 2  # [0,1,0,0] and [0,0,1,0]
 
+    @pytest.mark.slow
     def test_large_batch_performance(self):
         """50K existing + 10K new should complete in reasonable time."""
         np.random.seed(0)

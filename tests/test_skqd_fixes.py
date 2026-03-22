@@ -145,9 +145,8 @@ class TestGetCombinedBasis:
             nf_set = {tuple(c.tolist()) for c in nf_basis}
             combined_set = {tuple(c.tolist()) for c in combined}
             assert nf_set.issubset(combined_set), "NF configs missing from combined basis"
-        except (RuntimeError, ValueError, AttributeError):
-            # If Krylov fails in an expected way (e.g., no subspace for small system),
-            # that's OK — the test is about the merge logic, not Krylov itself.
+        except RuntimeError:
+            # If Krylov fails (e.g., no subspace), that's expected for small systems.
             pytest.skip("Krylov step failed — test merge logic separately")
 
 
