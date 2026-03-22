@@ -152,17 +152,21 @@ def run_hi_nqs_skqd(hamiltonian, mol_info,
         # =====================================================
         krylov_t0 = time.time()
         hf_seed = hamiltonian.get_hf_state().cpu().unsqueeze(0)
-        krylov_configs = expand_basis_via_connections(
-            hf_seed, hamiltonian,
-            max_new=cfg.krylov_max_new,
-            n_ref=cfg.krylov_n_ref,
-        )
-
-        # Post-Krylov merge: union(NQS, Krylov)
-        merged = torch.unique(
-            torch.cat([cumulative_configs.cpu(), krylov_configs.cpu()], dim=0),
-            dim=0,
-        )
+        if cfg.krylov_max_new > 0:
+            krylov_configs = expand_basis_via_connections(
+                hf_seed, hamiltonian,
+                max_new=cfg.krylov_max_new,
+                n_ref=cfg.krylov_n_ref,
+            )
+            # Post-Krylov merge: union(NQS, Krylov)
+            merged = torch.unique(
+                torch.cat([cumulative_configs.cpu(), krylov_configs.cpu()], dim=0),
+                dim=0,
+            )
+        else:
+            # NQS-only mode: no Krylov expansion
+            krylov_configs = cumulative_configs[:0]  # empty
+            merged = cumulative_configs.cpu()
 
         # Enforce max size
         if cfg.max_basis_size > 0 and len(merged) > cfg.max_basis_size:

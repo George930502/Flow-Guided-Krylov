@@ -38,6 +38,10 @@ MAX_DENSE_CONFIGS = 10000
 # Use iterative (Lanczos) eigensolver above this; dense eigh below
 SPARSE_THRESHOLD = 3000
 
+# Use sparse H construction (get_sparse_matrix_elements) above this
+# matrix_elements_fast() refuses >10K configs, so we must use sparse path
+SPARSE_H_THRESHOLD = 8000
+
 
 def compute_occupancies(configs, v0, n_orb=None):
     """Compute orbital occupancies from eigenvector.
@@ -124,25 +128,24 @@ def gpu_solve_fermion(configs, hamiltonian, max_dense=MAX_DENSE_CONFIGS):
         occ = compute_occupancies(configs.numpy(), v0, n_orb)
         return e, v0, occ
 
-    # ── Build projected Hamiltonian (dense) ──
-    H_proj = hamiltonian.matrix_elements(configs, configs)
-    H_np = H_proj.detach().cpu().numpy()
+    # ── Build projected Hamiltonian ──
+    if n <= SPARSE_H_THRESHOLD:
+        # Dense H construction (fast for small-medium basis)
+        H_proj = hamiltonian.matrix_elements(configs, configs)
+        H_np = H_proj.detach().cpu().numpy()
+        if np.iscomplexobj(H_np):
+            H_np = H_np.real
+        H_np = H_np.astype(np.float64)
+        H_np = 0.5 * (H_np + H_np.T)
 
-    # Take real part (molecular Hamiltonians are real)
-    if np.iscomplexobj(H_np):
-        H_np = H_np.real
-
-    H_np = H_np.astype(np.float64)
-
-    # Symmetrize (numerical errors can break Hermiticity)
-    H_np = 0.5 * (H_np + H_np.T)
-
-    # ── Diagonalize ──
-    if n <= min(SPARSE_THRESHOLD, max_dense):
-        E0, v0 = _dense_diag(H_np)
+        # Diagonalize dense H
+        if n <= min(SPARSE_THRESHOLD, max_dense):
+            E0, v0 = _dense_diag(H_np)
+        else:
+            E0, v0 = _iterative_diag(H_np)
     else:
-        # Use Lanczos iterative solver (avoids O(n^3) dense diag)
-        E0, v0 = _iterative_diag(H_np)
+        # Sparse H construction for large basis (>SPARSE_H_THRESHOLD)
+        E0, v0 = _sparse_h_diag(configs, hamiltonian)
 
     # ── Compute occupancies in IBM-compatible format ──
     occ = compute_occupancies(configs.numpy(), v0, n_orb)
@@ -206,4 +209,48 @@ def _iterative_diag(H_np):
     matvec = lambda x: H_np @ x
     H_op = LinearOperator((n, n), matvec=matvec, dtype=H_np.dtype)
     eigenvalues, eigenvectors = scipy_eigsh(H_op, k=1, which="SA")
+    return float(eigenvalues[0]), eigenvectors[:, 0]
+
+
+def _sparse_h_diag(configs, hamiltonian):
+    """Build sparse H via get_sparse_matrix_elements() and diagonalize.
+
+    Used for large basis (>SPARSE_H_THRESHOLD) where dense H construction
+    would exceed memory limits. The sparse COO → CSR → eigsh path.
+    """
+    from scipy.sparse import coo_matrix
+
+    n = len(configs)
+    logger.info(f"Sparse H construction: {n} configs")
+
+    # Get sparse COO data: (row_indices, col_indices, values)
+    rows, cols, vals = hamiltonian.get_sparse_matrix_elements(configs)
+    rows_np = rows.detach().cpu().numpy()
+    cols_np = cols.detach().cpu().numpy()
+    vals_np = vals.detach().cpu().numpy()
+
+    # Take real part
+    if np.iscomplexobj(vals_np):
+        vals_np = vals_np.real
+    vals_np = vals_np.astype(np.float64)
+
+    # Build sparse CSR matrix
+    H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n, n))
+    H_csr = H_coo.tocsr()
+
+    # Add diagonal elements (get_sparse_matrix_elements returns off-diagonal only)
+    diag_e = hamiltonian.diagonal_elements_batch(configs)
+    if isinstance(diag_e, torch.Tensor):
+        diag_np = diag_e.detach().cpu().numpy().astype(np.float64)
+    else:
+        diag_np = np.asarray(diag_e, dtype=np.float64)
+
+    from scipy.sparse import diags
+    H_csr = H_csr + diags(diag_np, 0, shape=(n, n), format='csr')
+
+    # Symmetrize: H = 0.5 * (H + H^T)
+    H_csr = 0.5 * (H_csr + H_csr.T)
+
+    # Sparse eigsh
+    eigenvalues, eigenvectors = scipy_eigsh(H_csr, k=1, which="SA")
     return float(eigenvalues[0]), eigenvectors[:, 0]
