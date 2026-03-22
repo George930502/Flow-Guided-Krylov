@@ -10,7 +10,7 @@ replacing quantum circuits with NQS while using GPU-accelerated diag.
 """
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -18,9 +18,8 @@ import torch
 
 from ..solvers.base import SolverResult
 from ..nqs.transformer import AutoregressiveTransformer
-from ..utils.config_hash import config_integer_hash
 from ..utils.format_utils import configs_to_ibm_format, ibm_format_to_configs, vectorized_dedup
-from ..utils.gpu_diag import gpu_solve_fermion, compute_occupancies
+from ..utils.gpu_diag import gpu_solve_fermion
 
 # IBM SQD tools — optional, used as fallback when use_gpu_diag=False
 try:

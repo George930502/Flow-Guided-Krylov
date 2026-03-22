@@ -86,11 +86,8 @@ class TestSparseThreshold:
     @pytest.mark.molecular
     def test_sparse_threshold_is_reasonable(self):
         """Sparse threshold should be >= 1000 (not 100 like original)."""
-        # The SPARSE_THRESHOLD should be defined as a class attribute or constant
-        # Check that dense path is used for small matrices, sparse for large
-        # We verify this indirectly by checking the code uses a reasonable threshold
-        assert hasattr(SampleBasedKrylovDiagonalization, 'SPARSE_THRESHOLD') or True
-        # At minimum, the code should not crash on 5000+ configs
+        assert hasattr(SampleBasedKrylovDiagonalization, 'SPARSE_THRESHOLD')
+        assert SampleBasedKrylovDiagonalization.SPARSE_THRESHOLD >= 1000
 
 
 # ── Regularization Shift ──
@@ -148,9 +145,9 @@ class TestGetCombinedBasis:
             nf_set = {tuple(c.tolist()) for c in nf_basis}
             combined_set = {tuple(c.tolist()) for c in combined}
             assert nf_set.issubset(combined_set), "NF configs missing from combined basis"
-        except Exception:
-            # If Krylov fails (e.g., no subspace for small system), that's OK
-            # The test is about the merge logic, not Krylov itself
+        except (RuntimeError, ValueError, AttributeError):
+            # If Krylov fails in an expected way (e.g., no subspace for small system),
+            # that's OK — the test is about the merge logic, not Krylov itself.
             pytest.skip("Krylov step failed — test merge logic separately")
 
 

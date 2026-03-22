@@ -95,7 +95,10 @@ def gpu_solve_fermion(configs, hamiltonian, max_dense=MAX_DENSE_CONFIGS):
     Args:
         configs: torch.Tensor (n_configs, 2*n_orb) — configurations in our format.
         hamiltonian: MolecularHamiltonian with matrix_elements() method.
-        max_dense: int — above this, use iterative eigsh (OOM guard).
+        max_dense: int — above this, use iterative eigsh for diag (OOM guard).
+                   Note: H construction is always dense via matrix_elements().
+                   Sparse H construction requires get_sparse_matrix_elements()
+                   which is planned for PR #2 (SKQD integration).
 
     Returns:
         (energy, eigenvector, occupancies):
@@ -105,6 +108,8 @@ def gpu_solve_fermion(configs, hamiltonian, max_dense=MAX_DENSE_CONFIGS):
     """
     if isinstance(configs, np.ndarray):
         configs = torch.from_numpy(configs).long()
+    else:
+        configs = configs.detach().cpu().long()
 
     n = len(configs)
     n_orb = configs.shape[1] // 2
@@ -169,28 +174,29 @@ def _iterative_diag(H_np):
     """Iterative (Lanczos) diagonalization for large matrices.
 
     Uses CuPy GPU eigsh if available, else SciPy CPU eigsh.
-    Input is a dense matrix stored in CSR format for the iterative solver.
-    This avoids the O(n^3) cost of full dense diag — Lanczos is O(n * nnz * k).
-
-    Note: The projected Hamiltonian is typically dense (not sparse), but Lanczos
-    iterative methods are still faster than full eigh for finding only k=1 eigenvalue.
+    The projected Hamiltonian is typically dense (not truly sparse), but
+    Lanczos iterative solvers are faster than O(n^3) full eigh when only
+    k=1 eigenvalue is needed. We use a LinearOperator to avoid CSR
+    conversion overhead for dense matrices.
     """
     n = H_np.shape[0]
 
     # Try CuPy GPU Lanczos eigsh
     if CUPY_AVAILABLE:
         try:
-            # Build CSR on CPU first, transfer only non-zero data (O4 optimization)
-            H_scipy_csr = scipy_csr(H_np)
-            H_gpu_csr = cupy_csr(H_scipy_csr)
-            eigenvalues, eigenvectors = cupy_eigsh(H_gpu_csr, k=1, which="SA")
+            H_gpu = cp.asarray(H_np)
+            H_sparse = cupy_csr(H_gpu)
+            eigenvalues, eigenvectors = cupy_eigsh(H_sparse, k=1, which="SA")
             E0 = float(cp.asnumpy(eigenvalues[0]))
             v0 = cp.asnumpy(eigenvectors[:, 0])
+            del H_gpu, H_sparse
             return E0, v0
         except Exception as e:
             warnings.warn(f"CuPy eigsh failed ({e}), falling back to SciPy")
 
-    # SciPy CPU Lanczos eigsh
-    H_sparse = scipy_csr(H_np)
-    eigenvalues, eigenvectors = scipy_eigsh(H_sparse, k=1, which="SA")
+    # SciPy CPU Lanczos eigsh via LinearOperator (avoids CSR conversion overhead)
+    from scipy.sparse.linalg import LinearOperator
+    matvec = lambda x: H_np @ x
+    H_op = LinearOperator((n, n), matvec=matvec, dtype=H_np.dtype)
+    eigenvalues, eigenvectors = scipy_eigsh(H_op, k=1, which="SA")
     return float(eigenvalues[0]), eigenvectors[:, 0]

@@ -85,14 +85,21 @@ class TestConfigsToIBMFormat:
         np.testing.assert_array_equal(result_new, result_old)
 
     def test_large_batch_performance(self):
-        """10K configs x 26Q should take < 0.1s."""
+        """Vectorized should be >= 5x faster than original Python loop."""
         n_orb, n_qubits = 13, 26
         np.random.seed(0)
         configs = np.random.randint(0, 2, size=(10000, n_qubits))
-        start = time.perf_counter()
+
+        start_orig = time.perf_counter()
+        _configs_to_ibm_original(configs, n_orb, n_qubits)
+        t_orig = time.perf_counter() - start_orig
+
+        start_vec = time.perf_counter()
         configs_to_ibm_format(configs, n_orb, n_qubits)
-        elapsed = time.perf_counter() - start
-        assert elapsed < 0.1, f"Took {elapsed:.3f}s, expected < 0.1s"
+        t_vec = time.perf_counter() - start_vec
+
+        speedup = t_orig / max(t_vec, 1e-9)
+        assert speedup >= 5.0, f"Speedup {speedup:.1f}x < 5x (orig={t_orig:.3f}s, vec={t_vec:.3f}s)"
 
     def test_empty_input(self):
         """Empty configs → empty array."""
@@ -148,14 +155,21 @@ class TestIBMFormatToConfigs:
         torch.testing.assert_close(result_new, result_old)
 
     def test_large_batch_performance(self):
-        """10K configs x 26Q should take < 0.1s."""
+        """Vectorized should be >= 5x faster than original Python loop."""
         n_orb, n_qubits = 13, 26
         np.random.seed(0)
         ibm = np.random.randint(0, 2, size=(10000, n_qubits)).astype(bool)
-        start = time.perf_counter()
+
+        start_orig = time.perf_counter()
+        _ibm_to_configs_original(ibm, n_orb, n_qubits)
+        t_orig = time.perf_counter() - start_orig
+
+        start_vec = time.perf_counter()
         ibm_format_to_configs(ibm, n_orb, n_qubits)
-        elapsed = time.perf_counter() - start
-        assert elapsed < 0.1, f"Took {elapsed:.3f}s, expected < 0.1s"
+        t_vec = time.perf_counter() - start_vec
+
+        speedup = t_orig / max(t_vec, 1e-9)
+        assert speedup >= 5.0, f"Speedup {speedup:.1f}x < 5x (orig={t_orig:.3f}s, vec={t_vec:.3f}s)"
 
     def test_empty_input(self):
         """Empty IBM matrix → empty tensor."""

@@ -69,7 +69,8 @@ def ibm_format_to_configs(bs_matrix, n_orb, n_qubits):
 def vectorized_dedup(existing_bs, new_bs):
     """Return rows in new_bs that are not in existing_bs (and unique within new_bs).
 
-    Uses numpy void-view hashing for O(n) amortized dedup — no Python loops.
+    Step 1 (intra-new dedup) uses np.unique with void-view — fully vectorized.
+    Step 2 (cross-dedup vs existing) uses a Python set of bytes for O(1) lookup.
 
     Args:
         existing_bs: (n_existing, n_cols) bool ndarray, or None if empty.

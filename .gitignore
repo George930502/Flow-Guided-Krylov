@@ -12,3 +12,4 @@ results/*.csv
 .cache/
 *.swp
 *.swo
+.venv/
