@@ -89,6 +89,12 @@ class SampleBasedKrylovDiagonalization:
         initial_state: Optional initial state (default: Néel state)
     """
 
+    # OOM guard: skip full subspace enumeration if n_valid exceeds this
+    MAX_FULL_SUBSPACE_SIZE = 15000
+
+    # Use sparse eigensolver for matrices above this size
+    SPARSE_THRESHOLD = 3000
+
     def __init__(
         self,
         hamiltonian: Hamiltonian,
@@ -148,6 +154,16 @@ class SampleBasedKrylovDiagonalization:
         n_beta = self.hamiltonian.n_beta
 
         n_valid = comb(n_orb, n_alpha) * comb(n_orb, n_beta)
+
+        # OOM guard: skip enumeration for large config spaces
+        if n_valid > self.MAX_FULL_SUBSPACE_SIZE:
+            print(f"[SKQD] Skipping full subspace setup: {n_valid:,} configs "
+                  f"> MAX_FULL_SUBSPACE_SIZE={self.MAX_FULL_SUBSPACE_SIZE:,}. "
+                  f"Use NF-guided mode for large systems.")
+            self._subspace_basis = None
+            self._subspace_index_map = None
+            return
+
         print(f"Setting up particle-conserving subspace: {n_valid:,} configs "
               f"(vs {self.hamiltonian.hilbert_dim:,} full Hilbert space)")
 
@@ -744,14 +760,27 @@ class SampleBasedKrylovDiagonalization:
             if cond > 1e12:
                 print(f"WARNING: Ill-conditioned Hamiltonian (cond={cond:.2e})")
                 print("Using SVD-based solver for numerical stability")
-                return self._svd_ground_state(H_np, return_eigenvector)
+                result = self._svd_ground_state(H_np, return_eigenvector)
+                # Subtract regularization shift (C2 fix: SVD path was missing this)
+                if regularization > 0:
+                    if return_eigenvector:
+                        return result[0] - regularization, result[1]
+                    else:
+                        return result[0] - regularization, result[1]
+                return result
         except np.linalg.LinAlgError:
             print("WARNING: Could not compute condition number, using SVD")
-            return self._svd_ground_state(H_np, return_eigenvector)
+            result = self._svd_ground_state(H_np, return_eigenvector)
+            if regularization > 0:
+                if return_eigenvector:
+                    return result[0] - regularization, result[1]
+                else:
+                    return result[0] - regularization, result[1]
+            return result
 
-        # Use sparse eigensolver for efficiency (as specified in AGENTs.md)
-        # For small matrices, dense is actually faster
-        if n < 100:
+        # Use sparse eigensolver for efficiency
+        # SPARSE_THRESHOLD = 3000: GPU-aware threshold (not 100)
+        if n < self.SPARSE_THRESHOLD:
             # Small matrix: use dense solver
             eigenvalues, eigenvectors = np.linalg.eigh(H_np)
             E0 = float(eigenvalues[0])
@@ -800,6 +829,10 @@ class SampleBasedKrylovDiagonalization:
                 eigenvalues, eigenvectors = np.linalg.eigh(H_np)
                 E0 = float(eigenvalues[0])
                 v0 = eigenvectors[:, 0] if return_eigenvector else None
+
+        # Subtract regularization shift (was added to H but shifts ALL eigenvalues)
+        if regularization > 0:
+            E0 = E0 - regularization
 
         if return_eigenvector:
             return E0, torch.from_numpy(v0) if v0 is not None else None
