@@ -2,11 +2,11 @@
 HI+NQS+SQD: Iterative self-consistent NQS-SQD loop — GPU accelerated.
 
 NQS (Transformer autoregressive): torch on CUDA → sample configs
-SQD (IBM qiskit-addon-sqd): solve_fermion → diagonalize + config recovery
-Feedback: |Φ⟩ and E₀ from SQD update NQS weights via backprop
+SQD backend: GPU diag (default) or IBM solve_fermion (fallback)
+Feedback: eigenvector |c_i|² from diag updates NQS weights via backprop
 
 This is the classical analog of HI-VQE (Pellow-Jarman et al., 2025),
-replacing quantum circuits with NQS while using the SAME SQD backend.
+replacing quantum circuits with NQS while using GPU-accelerated diag.
 """
 
 import time
@@ -18,11 +18,16 @@ import torch
 
 from ..solvers.base import SolverResult
 from ..nqs.transformer import AutoregressiveTransformer
-from ..utils.config_hash import config_integer_hash
+from ..utils.format_utils import configs_to_ibm_format, ibm_format_to_configs, vectorized_dedup
+from ..utils.gpu_diag import gpu_solve_fermion
 
-# IBM's SQD tools — same as HI-VQE uses
-from qiskit_addon_sqd.fermion import solve_fermion
-from qiskit_addon_sqd.configuration_recovery import recover_configurations
+# IBM SQD tools — optional, used as fallback when use_gpu_diag=False
+try:
+    from qiskit_addon_sqd.fermion import solve_fermion
+    from qiskit_addon_sqd.configuration_recovery import recover_configurations
+    IBM_SQD_AVAILABLE = True
+except ImportError:
+    IBM_SQD_AVAILABLE = False
 
 
 @dataclass
@@ -36,7 +41,7 @@ class HINQSSQDConfig:
     n_samples: int = 5000
     max_basis_size: int = 0  # 0 = no limit
 
-    # SQD batching (same as HI-VQE)
+    # SQD batching (only used when use_gpu_diag=False)
     num_batches: int = 5
     samples_per_batch: int = 0   # 0 = auto
 
@@ -56,10 +61,16 @@ class HINQSSQDConfig:
     initial_temperature: float = 1.0
     final_temperature: float = 0.3
 
+    # GPU diag (PR #1): replaces IBM solve_fermion with sparse eigsh
+    use_gpu_diag: bool = True
+
+    # Eigenvector weights: use |c_i|² instead of softmax(-H_ii) for NQS training
+    use_eigvec_weights: bool = True
+
 
 def run_hi_nqs_sqd(hamiltonian, mol_info,
                    config: Optional[HINQSSQDConfig] = None) -> SolverResult:
-    """Run HI+NQS+SQD: NQS sampling (GPU) + IBM SQD (solve_fermion)."""
+    """Run HI+NQS+SQD: NQS sampling (GPU) + diagonalization."""
     t0 = time.time()
     cfg = config or HINQSSQDConfig()
 
@@ -70,11 +81,17 @@ def run_hi_nqs_sqd(hamiltonian, mol_info,
     n_beta = hamiltonian.n_beta
     n_qubits = 2 * n_orb
 
-    # Molecular integrals for IBM's solve_fermion
+    # Molecular integrals (needed for IBM fallback and config recovery)
     integrals = hamiltonian.integrals
     hcore = np.asarray(integrals.h1e, dtype=np.float64)
     eri = np.asarray(integrals.h2e, dtype=np.float64)
     nuclear_repulsion = float(integrals.nuclear_repulsion)
+
+    # Validate GPU diag availability
+    if not cfg.use_gpu_diag and not IBM_SQD_AVAILABLE:
+        print("    WARNING: use_gpu_diag=False but qiskit-addon-sqd not installed. "
+              "Falling back to GPU diag.")
+        cfg.use_gpu_diag = True
 
     # Auto-scale transformer
     if n_orb <= 5:
@@ -90,7 +107,6 @@ def run_hi_nqs_sqd(hamiltonian, mol_info,
     else:
         embed, heads, layers = 256, 8, 10
 
-    # Create transformer on GPU
     nqs = AutoregressiveTransformer(
         n_orbitals=n_orb, n_alpha=n_alpha, n_beta=n_beta,
         embed_dim=embed, n_heads=heads, n_layers=layers,
@@ -99,10 +115,11 @@ def run_hi_nqs_sqd(hamiltonian, mol_info,
     optimizer = torch.optim.Adam(nqs.parameters(), lr=cfg.nf_lr)
 
     n_params = sum(p.numel() for p in nqs.parameters())
-    print(f"    HI+NQS+SQD (GPU={device}): arch={embed}/{heads}/{layers}, "
+    diag_mode = "GPU-diag" if cfg.use_gpu_diag else "IBM-SQD"
+    print(f"    HI+NQS+SQD ({diag_mode}, device={device}): arch={embed}/{heads}/{layers}, "
           f"params={n_params:,}, samples={cfg.n_samples}")
 
-    # Auto batch size
+    # Auto batch size (only for IBM SQD mode)
     samples_per_batch = cfg.samples_per_batch
     if samples_per_batch <= 0:
         samples_per_batch = max(50, cfg.n_samples // cfg.num_batches)
@@ -115,10 +132,11 @@ def run_hi_nqs_sqd(hamiltonian, mol_info,
     converged = False
     converge_count = 0
     avg_occupancies = None
+    best_eigvec = None  # Store eigenvector for NQS training
+    iteration = -1  # Initialized before loop for safe metadata access
 
-    # Cumulative bitstring matrix for IBM SQD (grows each iteration)
+    # Cumulative basis: IBM format (bool ndarray) for config recovery compatibility
     cumulative_bs = None
-    cumulative_hashes = set()
 
     for iteration in range(cfg.max_iterations):
         iter_t0 = time.time()
@@ -136,51 +154,41 @@ def run_hi_nqs_sqd(hamiltonian, mol_info,
             configs_gpu, _ = nqs.sample(cfg.n_samples, temperature=temperature)
             configs_cpu = configs_gpu.long().cpu()
 
-            # Filter particle number (should be all valid for autoregressive)
             alpha_counts = configs_cpu[:, :n_orb].sum(dim=1)
             beta_counts = configs_cpu[:, n_orb:].sum(dim=1)
             valid = (alpha_counts == n_alpha) & (beta_counts == n_beta)
             new_configs = configs_cpu[valid]
         sample_time = time.time() - sample_t0
 
-        # Convert to IBM bitstring format and add to cumulative set
+        # ── Vectorized format conversion + dedup (PR #1) ──
         n_new = 0
         if len(new_configs) > 0:
             new_unique = torch.unique(new_configs, dim=0)
-            new_bs = _configs_to_ibm_format(new_unique, n_orb, n_qubits)
+            new_bs = configs_to_ibm_format(new_unique, n_orb, n_qubits)
 
-            # Dedup against cumulative
-            truly_new = []
-            for i in range(len(new_bs)):
-                h = tuple(new_bs[i].tolist())
-                if h not in cumulative_hashes:
-                    truly_new.append(new_bs[i])
-                    cumulative_hashes.add(h)
+            truly_new = vectorized_dedup(cumulative_bs, new_bs)
 
-            if truly_new:
-                new_batch = np.stack(truly_new)
+            if len(truly_new) > 0:
                 if cumulative_bs is None:
-                    cumulative_bs = new_batch
+                    cumulative_bs = truly_new
                 else:
-                    cumulative_bs = np.concatenate([cumulative_bs, new_batch], axis=0)
+                    cumulative_bs = np.concatenate([cumulative_bs, truly_new], axis=0)
                 n_new = len(truly_new)
 
         # Add HF if not present
         if cumulative_bs is None:
             hf = hamiltonian.get_hf_state()
-            hf_bs = _configs_to_ibm_format(hf.unsqueeze(0), n_orb, n_qubits)
+            hf_bs = configs_to_ibm_format(hf.unsqueeze(0), n_orb, n_qubits)
             cumulative_bs = hf_bs
-            cumulative_hashes.add(tuple(hf_bs[0].tolist()))
 
         # Enforce max size (0 = no limit)
         if cfg.max_basis_size > 0 and len(cumulative_bs) > cfg.max_basis_size:
             cumulative_bs = cumulative_bs[-cfg.max_basis_size:]
-            cumulative_hashes = {tuple(row.tolist()) for row in cumulative_bs}
 
         # =====================================================
         # Step 2: Configuration recovery (IBM's qiskit-addon-sqd)
         # =====================================================
-        if cfg.configuration_recovery and avg_occupancies is not None:
+        if cfg.configuration_recovery and avg_occupancies is not None and IBM_SQD_AVAILABLE:
             try:
                 probs = np.ones(len(cumulative_bs)) / len(cumulative_bs)
                 cumulative_bs, probs = recover_configurations(
@@ -194,45 +202,59 @@ def run_hi_nqs_sqd(hamiltonian, mol_info,
                 pass
 
         # =====================================================
-        # Step 3: SQD diagonalization (IBM's solve_fermion)
+        # Step 3: Diagonalization
         # =====================================================
         sqd_t0 = time.time()
-        batch_energies = []
-        batch_occs = []
-        batch_states = []
-        batch_size = min(samples_per_batch, len(cumulative_bs))
 
-        for b in range(cfg.num_batches):
-            if len(cumulative_bs) <= batch_size:
-                batch = cumulative_bs
-            else:
-                idx = np.random.choice(len(cumulative_bs), size=batch_size, replace=False)
-                batch = cumulative_bs[idx]
-
-            if len(batch) < 2:
-                continue
-
+        if cfg.use_gpu_diag:
+            # ── GPU diag: single full-basis diag (no batching needed) ──
+            configs_tensor = ibm_format_to_configs(cumulative_bs, n_orb, n_qubits)
             try:
-                e, sci_state, occ, spin_sq = solve_fermion(
-                    batch, hcore, eri, spin_sq=0,
-                )
-                e_total = e + nuclear_repulsion
-                batch_energies.append(e_total)
-                batch_occs.append(occ)
-                batch_states.append(sci_state)
-            except Exception:
+                e0, eigvec, avg_occupancies = gpu_solve_fermion(configs_tensor, hamiltonian)
+                best_eigvec = eigvec
+            except Exception as ex:
+                print(f"    Iter {iteration:>3d}: GPU diag failed ({ex})")
+                sqd_time = time.time() - sqd_t0
                 continue
+        else:
+            # ── IBM solve_fermion: 5-batch mode (original) ──
+            batch_energies = []
+            batch_occs = []
+            batch_states = []
+            batch_size = min(samples_per_batch, len(cumulative_bs))
+
+            for b in range(cfg.num_batches):
+                if len(cumulative_bs) <= batch_size:
+                    batch = cumulative_bs
+                else:
+                    idx = np.random.choice(len(cumulative_bs), size=batch_size, replace=False)
+                    batch = cumulative_bs[idx]
+
+                if len(batch) < 2:
+                    continue
+
+                try:
+                    e, sci_state, occ, spin_sq = solve_fermion(
+                        batch, hcore, eri, spin_sq=0,
+                    )
+                    e_total = e + nuclear_repulsion
+                    batch_energies.append(e_total)
+                    batch_occs.append(occ)
+                    batch_states.append(sci_state)
+                except Exception:
+                    continue
+
+            if not batch_energies:
+                print(f"    Iter {iteration:>3d}: SQD failed (0/{cfg.num_batches} batches)")
+                sqd_time = time.time() - sqd_t0
+                continue
+
+            best_batch_idx = int(np.argmin(batch_energies))
+            e0 = batch_energies[best_batch_idx]
+            avg_occupancies = batch_occs[best_batch_idx]
+            best_eigvec = None  # IBM mode: no eigenvector available
 
         sqd_time = time.time() - sqd_t0
-
-        if not batch_energies:
-            print(f"    Iter {iteration:>3d}: SQD failed (0/{cfg.num_batches} batches)")
-            continue
-
-        # Best energy across batches
-        best_batch_idx = int(np.argmin(batch_energies))
-        e0 = batch_energies[best_batch_idx]
-        avg_occupancies = batch_occs[best_batch_idx]
 
         if e0 < best_energy:
             best_energy = e0
@@ -241,16 +263,12 @@ def run_hi_nqs_sqd(hamiltonian, mol_info,
         basis_size_history.append(len(cumulative_bs))
 
         # =====================================================
-        # Step 4: Update NQS on GPU using SQD results
+        # Step 4: Update NQS on GPU using diag results
         # =====================================================
         update_t0 = time.time()
 
-        # Get eigenvector coefficients from solve_fermion result
-        # Use occupancies as proxy for wavefunction importance
-        # Train NQS to sample configs that lower energy
         _update_nqs_from_sqd(
-            nqs, optimizer, cumulative_bs, e0,
-            hcore, eri, nuclear_repulsion,
+            nqs, optimizer, cumulative_bs, e0, best_eigvec,
             hamiltonian, cfg, device, n_orb, n_qubits,
         )
         update_time = time.time() - update_t0
@@ -270,7 +288,7 @@ def run_hi_nqs_sqd(hamiltonian, mol_info,
         print(f"    Iter {iteration:>3d}: E={e0:.10f}, "
               f"basis={len(cumulative_bs):>6d}(+{n_new}), "
               f"ΔE={delta_e:.2e}, "
-              f"t={iter_time:.1f}s [sample={sample_time:.1f} sqd={sqd_time:.1f} update={update_time:.1f}]")
+              f"t={iter_time:.1f}s [sample={sample_time:.1f} diag={sqd_time:.1f} update={update_time:.1f}]")
 
         if converge_count >= cfg.convergence_window:
             converged = True
@@ -285,38 +303,49 @@ def run_hi_nqs_sqd(hamiltonian, mol_info,
         method="HI+NQS+SQD",
         converged=converged,
         metadata={
-            "iterations": iteration + 1 if "iteration" in dir() else 0,
+            "iterations": iteration + 1,
             "energy_history": energy_history,
             "basis_size_history": basis_size_history,
             "device": device,
+            "diag_mode": "gpu_diag" if cfg.use_gpu_diag else "ibm_sqd",
         },
     )
 
 
-def _update_nqs_from_sqd(nqs, optimizer, cumulative_bs, e0,
-                         hcore, eri, nuclear_repulsion,
+def _update_nqs_from_sqd(nqs, optimizer, cumulative_bs, e0, eigvec,
                          hamiltonian, cfg, device, n_orb, n_qubits):
-    """Update NQS using SQD energy feedback with mini-batching.
+    """Update NQS using diag feedback with mini-batching.
 
-    Uses mini-batches to avoid GPU OOM when cumulative basis is large.
+    When eigvec is available (GPU diag mode), uses |c_i|² as weights.
+    Otherwise falls back to softmax(-diagonal_energy) weights.
     """
-    configs = _ibm_format_to_configs(cumulative_bs, n_orb, n_qubits)
+    configs = ibm_format_to_configs(cumulative_bs, n_orb, n_qubits)
     n_total = len(configs)
 
-    # Compute diagonal energies on CPU (always fits)
     with torch.no_grad():
-        diag_e = hamiltonian.diagonal_elements_batch(configs)
-        diag_e_t = torch.tensor(np.asarray(diag_e, dtype=np.float64), dtype=torch.float32)
-        advantage = diag_e_t - e0
-        weights = torch.softmax(-advantage / max(abs(e0) * 0.01, 0.1), dim=0)
+        if cfg.use_eigvec_weights and eigvec is not None:
+            # ── PR #1: Use eigenvector |c_i|² as weights ──
+            # This is the NQS-SC distillation approach: exact ground state
+            # probabilities from diag, strictly better than diagonal energy proxy.
+            weights = torch.from_numpy(np.abs(eigvec) ** 2).float()
+            weights = weights / weights.sum()
 
-    # Mini-batch size: keep GPU memory usage bounded
+            # Advantage still uses diagonal energies for REINFORCE term
+            diag_e = hamiltonian.diagonal_elements_batch(configs)
+            diag_e_t = torch.tensor(np.asarray(diag_e, dtype=np.float64), dtype=torch.float32)
+            advantage = diag_e_t - e0
+        else:
+            # ── Original: softmax(-advantage) weights ──
+            diag_e = hamiltonian.diagonal_elements_batch(configs)
+            diag_e_t = torch.tensor(np.asarray(diag_e, dtype=np.float64), dtype=torch.float32)
+            advantage = diag_e_t - e0
+            weights = torch.softmax(-advantage / max(abs(e0) * 0.01, 0.1), dim=0)
+
     max_batch = min(5000, n_total)
 
     for step in range(cfg.nf_steps):
         optimizer.zero_grad()
 
-        # Random mini-batch
         if n_total > max_batch:
             idx = torch.randperm(n_total)[:max_batch]
             batch_configs = configs[idx].float().to(device)
@@ -342,34 +371,27 @@ def _update_nqs_from_sqd(nqs, optimizer, cumulative_bs, e0,
         torch.nn.utils.clip_grad_norm_(nqs.parameters(), max_norm=1.0)
         optimizer.step()
 
-        # Free GPU memory
         del batch_configs, log_probs, loss
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
+    # Free GPU memory after training loop (not per-step — empty_cache is expensive)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+# ── Legacy format conversion (kept for backward compatibility) ──
+# New code should use utils.format_utils directly.
 
 def _configs_to_ibm_format(configs, n_orb, n_qubits):
     """Convert our config tensors to IBM bitstring matrix (bool array).
 
-    Our format: [α₀, α₁, ..., α_{n-1}, β₀, β₁, ..., β_{n-1}]
-    IBM format: columns [N..N/2] = spin-up, [N/2..0] = spin-down
+    DEPRECATED: Use utils.format_utils.configs_to_ibm_format instead.
     """
-    n = len(configs)
-    bs = np.zeros((n, n_qubits), dtype=bool)
-    for s in range(n):
-        c = configs[s]
-        for j in range(n_orb):
-            bs[s, n_orb - 1 - j] = bool(c[j])
-            bs[s, n_qubits - 1 - j] = bool(c[j + n_orb])
-    return bs
+    return configs_to_ibm_format(configs, n_orb, n_qubits)
 
 
 def _ibm_format_to_configs(bs_matrix, n_orb, n_qubits):
-    """Convert IBM bitstring matrix back to our config tensor format."""
-    n = len(bs_matrix)
-    configs = torch.zeros(n, n_qubits, dtype=torch.long)
-    for s in range(n):
-        for j in range(n_orb):
-            configs[s, j] = int(bs_matrix[s, n_orb - 1 - j])
-            configs[s, j + n_orb] = int(bs_matrix[s, n_qubits - 1 - j])
-    return configs
+    """Convert IBM bitstring matrix back to our config tensor format.
+
+    DEPRECATED: Use utils.format_utils.ibm_format_to_configs instead.
+    """
+    return ibm_format_to_configs(bs_matrix, n_orb, n_qubits)
